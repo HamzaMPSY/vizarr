@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./backend/.env.example
+    environment:
+      OCI_CONFIG_PROFILE: "prof"
+      OCI_CONFIG_FILE: "${HOME}/.oci/config"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    depends_on:
+      - redis
+    ports:
+      - "${API_PORT:-8001}:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/tests:/app/tests
+      - ${HOME}/.oci:${HOME}/.oci:ro
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
+        NPM_CONFIG_STRICT_SSL: ${NPM_CONFIG_STRICT_SSL:-true}
+        NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-1}
+    environment:
+      VITE_PROXY_TARGET: "http://backend:8000"
+    command: ["sh", "-lc", "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 5173"]
+    ports:
+      - "${APP_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - vizarr_frontend_node_modules:/app/node_modules
+
+volumes:
+  vizarr_frontend_node_modules:

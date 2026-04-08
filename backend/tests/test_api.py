@@ -1,0 +1,36 @@
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+client = TestClient(app)
+
+
+def test_healthcheck() -> None:
+    response = client.get("/api/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_list_datasets() -> None:
+    response = client.get("/api/datasets")
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == "demo-global"
+
+
+def test_list_variables() -> None:
+    response = client.get("/api/datasets/demo-global/variables")
+    assert response.status_code == 200
+    payload = response.json()
+    ids = {item["id"] for item in payload}
+    assert ids == {"temperature", "precipitation"}
+
+
+def test_get_tile() -> None:
+    response = client.get("/api/tiles/demo-global/temperature/1/1/1")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/webp"
+    assert response.headers["x-cache-status"] in {"MISS", "HIT"}
+    assert len(response.content) > 100

@@ -1,0 +1,31 @@
+{
+  "name": "vizarr-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "vite build",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.1.14",
+    "@deck.gl/geo-layers": "^9.1.14",
+    "@deck.gl/layers": "^9.1.14",
+    "@deck.gl/react": "^9.1.14",
+    "@tanstack/react-query": "^5.90.5",
+    "maplibre-gl": "^5.9.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-map-gl": "^8.0.4",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.24",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}
+

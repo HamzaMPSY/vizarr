@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+backend/.env
+.env
+.env.compose.oracle

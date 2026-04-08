@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+    env_file:
+      - ./backend/.env.example
+    depends_on:
+      - redis
+    expose:
+      - "8000"
+    ports:
+      - "${API_PORT:-8001}:8000"
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
+        NPM_CONFIG_STRICT_SSL: ${NPM_CONFIG_STRICT_SSL:-true}
+        NODE_TLS_REJECT_UNAUTHORIZED: ${NODE_TLS_REJECT_UNAUTHORIZED:-1}
+    expose:
+      - "80"
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - backend
+      - frontend
+    ports:
+      - "${APP_PORT:-8000}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
