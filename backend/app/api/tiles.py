@@ -25,6 +25,22 @@ async def get_tile(
     vmax: float | None = None,
 ) -> Response:
     settings = request.app.state.settings
+    planner = request.app.state.planner
+    tile_plan = planner.plan_tile_request(
+        collection_id=dataset_id,
+        style=colormap,
+        z=z,
+        x=x,
+        y=y,
+        time_index=time_index,
+        params={
+            "variable": variable,
+            "colormap": colormap,
+            "vmin": vmin,
+            "vmax": vmax,
+            "band_count": 1,
+        },
+    )
     if settings.storage_backend == "oci_zarr":
         catalog = get_or_build_catalog(request.app)
         entry = catalog.get(dataset_id)
@@ -61,6 +77,9 @@ async def get_tile(
                     "X-Cache-Status": "HIT",
                     "X-Data-Vmin": str(vmin if vmin is not None else selected_variable.stats.p02),
                     "X-Data-Vmax": str(vmax if vmax is not None else selected_variable.stats.p98),
+                    "X-Request-Class": tile_plan.request_class,
+                    "X-Execution-Path": tile_plan.execution_path,
+                    "X-Representation": tile_plan.chosen_representation,
                 },
             )
 
@@ -85,6 +104,9 @@ async def get_tile(
                 "X-Cache-Status": "MISS",
                 "X-Data-Vmin": str(actual_vmin),
                 "X-Data-Vmax": str(actual_vmax),
+                "X-Request-Class": tile_plan.request_class,
+                "X-Execution-Path": tile_plan.execution_path,
+                "X-Representation": tile_plan.chosen_representation,
             },
         )
 
@@ -122,6 +144,9 @@ async def get_tile(
                 "X-Cache-Status": "HIT",
                 "X-Data-Vmin": str(vmin if vmin is not None else vmin_value),
                 "X-Data-Vmax": str(vmax if vmax is not None else vmax_value),
+                "X-Request-Class": tile_plan.request_class,
+                "X-Execution-Path": tile_plan.execution_path,
+                "X-Representation": tile_plan.chosen_representation,
             },
         )
 
@@ -146,5 +171,8 @@ async def get_tile(
             "X-Cache-Status": "MISS",
             "X-Data-Vmin": str(actual_vmin),
             "X-Data-Vmax": str(actual_vmax),
+            "X-Request-Class": tile_plan.request_class,
+            "X-Execution-Path": tile_plan.execution_path,
+            "X-Representation": tile_plan.chosen_representation,
         },
     )

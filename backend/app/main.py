@@ -6,18 +6,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import router as api_router
 from app.config import get_settings
+from app.core.cache import CacheClient
 from app.core.cache import connect_cache
 from app.core.dataset_catalog import warm_catalog_index
 from app.core.datasets import build_registry
 from app.core.datasets import build_registry_from_dataset
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.zarr_reader import open_oci_zarr_dataset
+from app.services.export_jobs import ExportJobStore
+from app.services.planner import PlannerService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.settings = settings
+    app.state.planner = PlannerService(settings)
+    app.state.export_job_store = ExportJobStore()
     app.state.storage_connector = None
     app.state.dataset_catalog = None
     app.state.dataset_manifest = None
@@ -65,3 +70,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router, prefix="/api")
+app.state.settings = settings
+app.state.planner = PlannerService(settings)
+app.state.export_job_store = ExportJobStore()
+app.state.storage_connector = None
+app.state.dataset_catalog = None
+app.state.dataset_manifest = None
+app.state.cache = CacheClient(client=None, ttl=settings.tile_cache_ttl)
+if settings.storage_backend == "oci_zarr":
+    dataset_id = settings.oci_dataset_id or settings.oci_bucket or "oci-zarr"
+    dataset_name = settings.oci_dataset_name or dataset_id
+    dataset_description = (
+        settings.oci_dataset_description
+        or f"OCI Object Storage browser for {settings.oci_bucket}/{settings.oci_prefix}"
+    )
+    app.state.registry = build_registry_from_dataset(
+        dataset=xr.Dataset(),
+        dataset_id=dataset_id,
+        dataset_name=dataset_name,
+        dataset_description=dataset_description,
+    )
+else:
+    app.state.registry = build_registry()

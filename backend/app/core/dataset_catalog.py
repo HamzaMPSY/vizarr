@@ -13,6 +13,7 @@ from app.core.zarr_v3 import load_1d_numeric_array
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
 from app.core.zarr_v3 import parse_array_metadata
+from app.core.zarr_v3 import read_consolidated_metadata
 from app.core.zarr_v3 import read_store_metadata
 from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta
 
@@ -222,6 +223,22 @@ def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float,
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
 
 
+def _read_dataset_metadata(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+) -> tuple[dict, dict]:
+    store_metadata, metadata = read_consolidated_metadata(
+        connector=connector,
+        store_path=store_path,
+    )
+    if metadata:
+        return store_metadata, metadata
+    return read_store_metadata(
+        connector=connector,
+        store_path=store_path,
+    )
+
+
 def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector) -> dict[str, CatalogEntry]:
     stores = connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
     catalog: dict[str, CatalogEntry] = {}
@@ -233,7 +250,7 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             continue
 
         try:
-            _, metadata = read_store_metadata(
+            _, metadata = _read_dataset_metadata(
                 connector=connector,
                 store_path=store.path,
             )
@@ -287,7 +304,7 @@ def warm_catalog_index(app) -> dict[str, CatalogEntry]:
 
 def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
     if entry.data_array_meta is None or entry.x_meta is None or entry.y_meta is None or not entry.band_names:
-        _, metadata = read_store_metadata(
+        _, metadata = _read_dataset_metadata(
             connector=connector,
             store_path=entry.path,
         )

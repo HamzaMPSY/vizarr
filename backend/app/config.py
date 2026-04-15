@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     tile_cache_ttl: int = 3600
     colormap_default: str = "viridis"
+    planner_version: str = "v1"
+    browse_enabled_styles: str = "ndvi-default,rgb-default"
+    interactive_max_clip_bands: int = 4
+    interactive_max_clip_days: int = 31
     default_dataset_id: str = "demo-global"
     default_time_index: int = 0
     storage_backend: str = "synthetic"
