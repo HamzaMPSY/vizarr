@@ -13,7 +13,7 @@ from app.core.zarr_v3 import load_1d_numeric_array
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
 from app.core.zarr_v3 import parse_array_metadata
-from app.core.zarr_v3 import read_consolidated_metadata
+from app.core.zarr_v3 import read_store_metadata
 from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta
 
 
@@ -39,6 +39,7 @@ class CatalogEntry:
     zarr_format: int
     consolidated: bool
     data_array_name: str
+    band_array_name: str
     band_names: list[str]
     band_indices: dict[str, int]
     data_array_meta: ZarrV3ArrayMetadata | None = None
@@ -65,6 +66,28 @@ def _build_label(raw_label: str) -> tuple[str, str]:
 
 def _default_band_names(count: int) -> list[str]:
     return [f"B{index}" for index in range(1, count + 1)]
+
+
+def _select_projected_array_names(metadata: dict[str, dict]) -> tuple[str, str]:
+    candidates: list[tuple[str, str]] = []
+    for array_name, node in metadata.items():
+        shape = node.get("shape")
+        dimension_names = tuple(node.get("dimension_names", []))
+        if not isinstance(shape, list) or len(shape) != 4:
+            continue
+        if "x" not in dimension_names or "y" not in dimension_names or "time" not in dimension_names:
+            continue
+
+        non_spatial_dims = [name for name in dimension_names if name not in {"time", "x", "y"}]
+        if len(non_spatial_dims) != 1:
+            continue
+        candidates.append((array_name, non_spatial_dims[0]))
+
+    if not candidates:
+        raise ValueError("Dataset does not expose a supported projected 4D array with dims time/*/y/x")
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0]
 
 
 def _build_variable_meta(
@@ -209,6 +232,16 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
         if not store.path.endswith(".zarr"):
             continue
 
+        try:
+            _, metadata = read_store_metadata(
+                connector=connector,
+                store_path=store.path,
+            )
+            data_array_name, band_array_name = _select_projected_array_names(metadata)
+        except Exception as exc:
+            logger.warning("Skipping unsupported dataset store %s: %s", store.path, exc)
+            continue
+
         dataset_id = _encode_dataset_id(store.path)
         dataset_name = store.path.split("/")[-1]
         dataset_description = f"OCI Zarr store at {store.path}"
@@ -224,7 +257,8 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             ),
             zarr_format=store.zarr_format,
             consolidated=store.consolidated,
-            data_array_name="bands",
+            data_array_name=data_array_name,
+            band_array_name=band_array_name,
             band_names=[],
             band_indices={},
         )
@@ -232,37 +266,68 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
     return catalog
 
 
-def ensure_catalog_entry_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
+def build_dataset_manifest(catalog: dict[str, CatalogEntry]) -> list[DatasetMeta]:
+    return [entry.meta.model_copy(deep=True) for entry in catalog.values()]
+
+
+def warm_catalog_index(app) -> dict[str, CatalogEntry]:
+    settings = app.state.settings
+    connector = app.state.storage_connector
+    if connector is None:
+        app.state.dataset_catalog = {}
+        app.state.dataset_manifest = []
+        return {}
+
+    catalog = build_catalog_index(settings=settings, connector=connector)
+    app.state.dataset_catalog = catalog
+    app.state.dataset_manifest = build_dataset_manifest(catalog)
+    logger.info("Built OCI dataset manifest with %d dataset(s)", len(app.state.dataset_manifest))
+    return catalog
+
+
+def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
     if entry.data_array_meta is None or entry.x_meta is None or entry.y_meta is None or not entry.band_names:
-        _, metadata = read_consolidated_metadata(
+        _, metadata = read_store_metadata(
             connector=connector,
             store_path=entry.path,
         )
-        if "bands" not in metadata or "band" not in metadata:
-            raise ValueError(f"Dataset {entry.id} does not expose a Landsat-style bands array")
+        data_array_name, band_array_name = _select_projected_array_names(metadata)
+        if band_array_name not in metadata:
+            raise ValueError(f"Dataset {entry.id} is missing band coordinate array '{band_array_name}'")
+        if "x" not in metadata or "y" not in metadata:
+            raise ValueError(f"Dataset {entry.id} is missing x/y coordinate arrays")
 
-        entry.data_array_meta = parse_array_metadata(metadata["bands"])
-        band_meta = parse_array_metadata(metadata["band"])
+        entry.data_array_name = data_array_name
+        entry.band_array_name = band_array_name
+        entry.data_array_meta = parse_array_metadata(metadata[data_array_name])
+        band_meta = parse_array_metadata(metadata[band_array_name])
         entry.x_meta = parse_array_metadata(metadata["x"])
         entry.y_meta = parse_array_metadata(metadata["y"])
         spatial_ref_attrs = metadata.get("spatial_ref", {}).get("attributes", {})
         entry.crs_wkt = spatial_ref_attrs.get("crs_wkt")
         entry.geo_transform = _parse_geo_transform(spatial_ref_attrs.get("GeoTransform"))
 
+        encoded_band_labels = entry.data_array_meta.attributes.get("band_labels")
+        if not isinstance(encoded_band_labels, list):
+            encoded_band_labels = None
+
         try:
             entry.band_names = load_fixed_length_utf32_labels(
                 connector=connector,
                 store_path=entry.path,
-                array_name="band",
+                array_name=band_array_name,
                 metadata=band_meta,
             )
-        except FileNotFoundError:
-            entry.band_names = _default_band_names(int(metadata["band"]["shape"][0]))
+        except (FileNotFoundError, ValueError):
+            if encoded_band_labels:
+                entry.band_names = [str(label) for label in encoded_band_labels]
+            else:
+                entry.band_names = _default_band_names(int(metadata[band_array_name]["shape"][0]))
 
         if not entry.band_names:
-            entry.band_names = _default_band_names(int(metadata["band"]["shape"][0]))
+            entry.band_names = _default_band_names(int(metadata[band_array_name]["shape"][0]))
 
-        time_steps = int(metadata["bands"]["shape"][0]) if metadata["bands"]["shape"] else 1
+        time_steps = int(metadata[data_array_name]["shape"][0]) if metadata[data_array_name]["shape"] else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
         stats_samples = [
             _sample_band_stats(connector, entry, band_index)
@@ -273,6 +338,12 @@ def ensure_catalog_entry_ready(entry: CatalogEntry, connector: OCIObjectStorageC
             stats_samples=stats_samples,
             time_steps=time_steps,
         )
+
+    return entry
+
+
+def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
+    ensure_catalog_entry_metadata_ready(entry, connector)
 
     if entry.x_values is None:
         if entry.x_meta is None:
@@ -308,16 +379,13 @@ def ensure_catalog_entry_ready(entry: CatalogEntry, connector: OCIObjectStorageC
     return entry
 
 
+def ensure_catalog_entry_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
+    return ensure_catalog_entry_bounds_ready(entry, connector)
+
+
 def get_or_build_catalog(app) -> dict[str, CatalogEntry]:
     existing = getattr(app.state, "dataset_catalog", None)
     if existing:
         return existing
 
-    settings = app.state.settings
-    connector = app.state.storage_connector
-    if connector is None:
-        return {}
-
-    catalog = build_catalog_index(settings=settings, connector=connector)
-    app.state.dataset_catalog = catalog
-    return catalog
+    return warm_catalog_index(app)

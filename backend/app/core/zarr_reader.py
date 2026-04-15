@@ -1,3 +1,5 @@
+import json
+
 import xarray as xr
 
 from app.config import Settings
@@ -33,9 +35,14 @@ def open_dataset_from_path(
     zarr_uri = zarr_path
     mapper_path = zarr_uri.removeprefix("oci://")
     mapper = filesystem.get_mapper(mapper_path)
+    open_kwargs = _build_open_zarr_kwargs(
+        connector=connector,
+        zarr_path=zarr_path,
+        consolidated=consolidated,
+    )
     return xr.open_zarr(
         mapper,
-        consolidated=consolidated,
+        **open_kwargs,
     )
 
 
@@ -43,6 +50,41 @@ def read_store_json(
     connector: OCIObjectStorageConnector,
     object_path: str,
 ) -> str:
-    filesystem = connector.get_filesystem()
-    resolved = object_path.removeprefix("oci://")
-    return filesystem.cat_file(resolved).decode("utf-8")
+    return connector.read_text(object_path, use_cache=True)
+
+
+def _read_root_zarr_json(
+    connector: OCIObjectStorageConnector,
+    zarr_path: str,
+) -> dict | None:
+    object_path = zarr_path.rstrip("/") + "/zarr.json"
+    try:
+        raw = read_store_json(connector=connector, object_path=object_path)
+    except FileNotFoundError:
+        return None
+    return json.loads(raw)
+
+
+def _build_open_zarr_kwargs(
+    connector: OCIObjectStorageConnector,
+    zarr_path: str,
+    consolidated: bool,
+) -> dict:
+    root_metadata = _read_root_zarr_json(connector=connector, zarr_path=zarr_path)
+    if root_metadata is None:
+        return {
+            "consolidated": consolidated,
+        }
+
+    zarr_format = int(root_metadata.get("zarr_format", 0))
+    if zarr_format != 3:
+        return {
+            "consolidated": consolidated,
+        }
+
+    has_consolidated_metadata = "consolidated_metadata" in root_metadata
+    return {
+        "consolidated": consolidated and has_consolidated_metadata,
+        "zarr_version": 3,
+        "zarr_format": 3,
+    }

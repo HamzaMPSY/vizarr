@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import router as api_router
 from app.config import get_settings
 from app.core.cache import connect_cache
+from app.core.dataset_catalog import warm_catalog_index
 from app.core.datasets import build_registry
 from app.core.datasets import build_registry_from_dataset
 from app.core.oci_object_storage import OCIObjectStorageConnector
@@ -19,6 +20,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.storage_connector = None
     app.state.dataset_catalog = None
+    app.state.dataset_manifest = None
     if settings.storage_backend == "oci_zarr":
         connector = OCIObjectStorageConnector(settings)
         app.state.storage_connector = connector
@@ -44,6 +46,8 @@ async def lifespan(app: FastAPI):
                 dataset_name=dataset_name,
                 dataset_description=dataset_description,
             )
+        if not settings.oci_zarr_path:
+            warm_catalog_index(app)
     else:
         app.state.registry = build_registry()
     app.state.cache = await connect_cache(settings.redis_url, settings.tile_cache_ttl)

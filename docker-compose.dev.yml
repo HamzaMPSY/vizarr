@@ -3,7 +3,10 @@ services:
     build:
       context: ./backend
     env_file:
-      - ./backend/.env.example
+      - path: ./backend/.env
+        required: false
+      - path: ./backend/.env.example
+        required: false
     environment:
       OCI_CONFIG_PROFILE: "prof"
       OCI_CONFIG_FILE: "${HOME}/.oci/config"

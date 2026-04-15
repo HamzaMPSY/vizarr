@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 import numpy as np
 from pyproj import CRS, Transformer
@@ -11,6 +12,7 @@ from app.core.zarr_v3 import load_4d_window
 
 
 WEB_MERCATOR_HALF_WORLD = 20037508.342789244
+WEB_MERCATOR_RADIUS = WEB_MERCATOR_HALF_WORLD / math.pi
 TILE_SIZE = 256
 
 
@@ -36,6 +38,27 @@ def _tile_pixel_centers(
     return np.meshgrid(xs, ys)
 
 
+def _tile_pixel_center_axes(
+    bbox: tuple[float, float, float, float],
+    tile_size: int = TILE_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    west, south, east, north = bbox
+    pixel_width = (east - west) / tile_size
+    pixel_height = (north - south) / tile_size
+
+    xs = west + (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_width
+    ys = north - (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_height
+    return xs, ys
+
+
+def _web_mercator_x_to_lon(xs: np.ndarray) -> np.ndarray:
+    return np.degrees(xs / WEB_MERCATOR_RADIUS)
+
+
+def _web_mercator_y_to_lat(ys: np.ndarray) -> np.ndarray:
+    return np.degrees(np.arctan(np.sinh(ys / WEB_MERCATOR_RADIUS)))
+
+
 def _fractional_indices_from_geotransform(
     geo_transform: tuple[float, float, float, float, float, float],
     xs: np.ndarray,
@@ -59,6 +82,22 @@ def _fractional_indices_from_geotransform(
     cols = pixel_coordinates[0].reshape(xs.shape) - 0.5
     rows = pixel_coordinates[1].reshape(xs.shape) - 0.5
     return cols, rows
+
+
+def _fractional_indices_from_north_up_geotransform_axes(
+    geo_transform: tuple[float, float, float, float, float, float],
+    lon_values: np.ndarray,
+    lat_values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    origin_x, pixel_width, rot_x, origin_y, rot_y, pixel_height = geo_transform
+    if not math.isclose(rot_x, 0.0) or not math.isclose(rot_y, 0.0):
+        return None
+    if math.isclose(pixel_width, 0.0) or math.isclose(pixel_height, 0.0):
+        return None
+
+    x_idx = ((lon_values - origin_x) / pixel_width) - 0.5
+    y_idx = ((lat_values - origin_y) / pixel_height) - 0.5
+    return x_idx, y_idx
 
 
 def _coordinate_to_fractional_index(values: np.ndarray, coordinates: np.ndarray) -> np.ndarray:
@@ -107,11 +146,39 @@ def _bilinear_sample(data: np.ndarray, y_idx: np.ndarray, x_idx: np.ndarray) -> 
     bottom_left = data[y1, x0]
     bottom_right = data[y1, x1]
 
-    top = top_left * (1.0 - wx) + top_right * wx
-    bottom = bottom_left * (1.0 - wx) + bottom_right * wx
-    sampled = top * (1.0 - wy) + bottom * wy
+    weights_top_left = (1.0 - wx) * (1.0 - wy)
+    weights_top_right = wx * (1.0 - wy)
+    weights_bottom_left = (1.0 - wx) * wy
+    weights_bottom_right = wx * wy
 
-    result[valid] = sampled.astype(np.float32)
+    stacked_values = np.stack(
+        [top_left, top_right, bottom_left, bottom_right],
+        axis=0,
+    ).astype(np.float32)
+    stacked_weights = np.stack(
+        [
+            weights_top_left,
+            weights_top_right,
+            weights_bottom_left,
+            weights_bottom_right,
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    finite_neighbors = np.isfinite(stacked_values)
+    weighted_sum = np.sum(
+        np.where(finite_neighbors, stacked_values * stacked_weights, 0.0),
+        axis=0,
+    )
+    weight_sum = np.sum(
+        np.where(finite_neighbors, stacked_weights, 0.0),
+        axis=0,
+    )
+    sampled = np.full(weight_sum.shape, np.nan, dtype=np.float32)
+    non_zero = weight_sum > 0
+    sampled[non_zero] = (weighted_sum[non_zero] / weight_sum[non_zero]).astype(np.float32)
+
+    result[valid] = sampled
     return result
 
 
@@ -187,6 +254,44 @@ def _source_window_bounds_from_indices(
     return x_min, x_max, y_min, y_max
 
 
+def _source_window_bounds_from_axis_indices(
+    x_idx: np.ndarray,
+    y_idx: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int] | None:
+    finite_x = np.isfinite(x_idx) & (x_idx >= 0) & (x_idx <= width - 1)
+    finite_y = np.isfinite(y_idx) & (y_idx >= 0) & (y_idx <= height - 1)
+    if not np.any(finite_x) or not np.any(finite_y):
+        return None
+
+    x_min = max(int(np.floor(np.nanmin(x_idx[finite_x]))) - 1, 0)
+    x_max = min(int(np.ceil(np.nanmax(x_idx[finite_x]))) + 2, width)
+    y_min = max(int(np.floor(np.nanmin(y_idx[finite_y]))) - 1, 0)
+    y_max = min(int(np.ceil(np.nanmax(y_idx[finite_y]))) + 2, height)
+    if x_min >= x_max or y_min >= y_max:
+        return None
+    return x_min, x_max, y_min, y_max
+
+
+@lru_cache(maxsize=16)
+def _transformer_from_mercator(target_crs_repr: str) -> Transformer:
+    target_crs = CRS.from_user_input(target_crs_repr)
+    return Transformer.from_crs("EPSG:3857", target_crs, always_xy=True)
+
+
+def _is_fast_latlon_entry(entry: CatalogEntry) -> bool:
+    if entry.geo_transform is None:
+        return False
+    origin_x, pixel_width, rot_x, origin_y, rot_y, pixel_height = entry.geo_transform
+    if math.isclose(pixel_width, 0.0) or math.isclose(pixel_height, 0.0):
+        return False
+    if not math.isclose(rot_x, 0.0) or not math.isclose(rot_y, 0.0):
+        return False
+    source_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
+    return source_crs == CRS.from_epsg(4326)
+
+
 def _resolve_display_range(
     data: np.ndarray,
     fallback_vmin: float,
@@ -244,35 +349,55 @@ def generate_projected_band_tile(
 
     band_index = entry.band_indices[variable]
     web_bbox = _xyz_to_web_mercator_bbox(z, x, y)
-    mercator_xs, mercator_ys = _tile_pixel_centers(web_bbox)
-    target_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
-    transformer = Transformer.from_crs("EPSG:3857", target_crs, always_xy=True)
-    source_xs, source_ys = transformer.transform(
-        mercator_xs,
-        mercator_ys,
-    )
-
-    affine_indices = (
-        _fractional_indices_from_geotransform(entry.geo_transform, source_xs, source_ys)
-        if entry.geo_transform is not None
-        else None
-    )
-    if affine_indices is not None:
-        x_idx_full, y_idx_full = affine_indices
-        window_bounds = _source_window_bounds_from_indices(
-            x_idx=x_idx_full,
-            y_idx=y_idx_full,
+    if _is_fast_latlon_entry(entry):
+        mercator_x_axis, mercator_y_axis = _tile_pixel_center_axes(web_bbox)
+        lon_values = _web_mercator_x_to_lon(mercator_x_axis)
+        lat_values = _web_mercator_y_to_lat(mercator_y_axis)
+        affine_axes = _fractional_indices_from_north_up_geotransform_axes(
+            entry.geo_transform,
+            lon_values=lon_values,
+            lat_values=lat_values,
+        )
+        assert affine_axes is not None
+        x_idx_axis, y_idx_axis = affine_axes
+        x_idx_full = np.broadcast_to(x_idx_axis[np.newaxis, :], (TILE_SIZE, TILE_SIZE))
+        y_idx_full = np.broadcast_to(y_idx_axis[:, np.newaxis], (TILE_SIZE, TILE_SIZE))
+        window_bounds = _source_window_bounds_from_axis_indices(
+            x_idx=x_idx_axis,
+            y_idx=y_idx_axis,
             width=len(x_values),
             height=len(y_values),
         )
+        source_xs = source_ys = None
     else:
-        x_idx_full = y_idx_full = None
-        window_bounds = _source_window_bounds(
-            x_values=x_values,
-            y_values=y_values,
-            xs=source_xs,
-            ys=source_ys,
+        mercator_xs, mercator_ys = _tile_pixel_centers(web_bbox)
+        target_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
+        transformer = _transformer_from_mercator(target_crs.to_wkt())
+        source_xs, source_ys = transformer.transform(
+            mercator_xs,
+            mercator_ys,
         )
+        affine_indices = (
+            _fractional_indices_from_geotransform(entry.geo_transform, source_xs, source_ys)
+            if entry.geo_transform is not None
+            else None
+        )
+        if affine_indices is not None:
+            x_idx_full, y_idx_full = affine_indices
+            window_bounds = _source_window_bounds_from_indices(
+                x_idx=x_idx_full,
+                y_idx=y_idx_full,
+                width=len(x_values),
+                height=len(y_values),
+            )
+        else:
+            x_idx_full = y_idx_full = None
+            window_bounds = _source_window_bounds(
+                x_values=x_values,
+                y_values=y_values,
+                xs=source_xs,
+                ys=source_ys,
+            )
 
     if window_bounds is None:
         empty = np.full((TILE_SIZE, TILE_SIZE), np.nan, dtype=np.float32)
@@ -306,6 +431,8 @@ def generate_projected_band_tile(
         x_idx = x_idx_full - x_start
         y_idx = y_idx_full - y_start
     else:
+        assert source_xs is not None
+        assert source_ys is not None
         x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
         y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
     reprojected = _bilinear_sample(

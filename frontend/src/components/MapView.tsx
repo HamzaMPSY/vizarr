@@ -11,18 +11,20 @@ import { useMapStore } from "../store/mapStore";
 const BASE_STYLE: StyleSpecification = {
   version: 8,
   sources: {
-    osm: {
+    esri: {
       type: "raster",
-      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+      tiles: [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+      ],
       tileSize: 256,
-      attribution: "© OpenStreetMap contributors"
+      attribution: "Tiles © Esri"
     }
   },
   layers: [
     {
-      id: "osm",
+      id: "esri",
       type: "raster",
-      source: "osm"
+      source: "esri"
     }
   ]
 };

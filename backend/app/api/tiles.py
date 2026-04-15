@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
 from app.core.cache import build_tile_cache_key
+from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import get_or_build_catalog
 from app.core.projected_tile_generator import generate_projected_band_tile
 from app.core.tile_generator import generate_tile
@@ -29,6 +30,10 @@ async def get_tile(
         entry = catalog.get(dataset_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
+        try:
+            ensure_catalog_entry_metadata_ready(entry, request.app.state.storage_connector)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if variable not in entry.band_indices:
             raise HTTPException(status_code=404, detail="Variable not found")
 

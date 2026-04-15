@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 
+from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.dataset_catalog import get_or_build_catalog
 from app.models.dataset import DatasetMeta, VariableMeta
@@ -12,6 +13,9 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 async def list_datasets(request: Request) -> list[DatasetMeta]:
     settings = request.app.state.settings
     if settings.storage_backend == "oci_zarr":
+        manifest = getattr(request.app.state, "dataset_manifest", None)
+        if manifest is not None:
+            return manifest
         catalog = get_or_build_catalog(request.app)
         return [entry.meta for entry in catalog.values()]
     return [request.app.state.registry.meta]
@@ -25,7 +29,10 @@ async def get_dataset(dataset_id: str, request: Request) -> DatasetMeta:
         entry = catalog.get(dataset_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        ensure_catalog_entry_ready(entry, request.app.state.storage_connector)
+        try:
+            ensure_catalog_entry_ready(entry, request.app.state.storage_connector)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return entry.meta
     meta = request.app.state.registry.meta
     if dataset_id != meta.id:
@@ -41,7 +48,10 @@ async def list_variables(dataset_id: str, request: Request) -> list[VariableMeta
         entry = catalog.get(dataset_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
-        ensure_catalog_entry_ready(entry, request.app.state.storage_connector)
+        try:
+            ensure_catalog_entry_metadata_ready(entry, request.app.state.storage_connector)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return entry.meta.variables
     meta = request.app.state.registry.meta
     if dataset_id != meta.id:
