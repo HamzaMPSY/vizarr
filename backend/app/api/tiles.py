@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
+from app.core.browse_tiles import BrowseTileResult
 from app.core.browse_tiles import generate_browse_tile
 from app.core.cache import build_tile_cache_key
 from app.core.dataset_catalog import ensure_catalog_entry_ready
@@ -70,6 +71,8 @@ async def get_tile(
                 "colormap": colormap,
                 "vmin": vmin,
                 "vmax": vmax,
+                "representation": tile_plan.chosen_representation,
+                "planner_version": settings.planner_version,
             }
         )
         cached = await request.app.state.cache.get(cache_key)
@@ -102,36 +105,52 @@ async def get_tile(
             vmin,
             vmax,
         )
+        actual_representation = tile_plan.chosen_representation
+        browse_source: str | None = None
         if tile_plan.chosen_representation == "browse":
-            tile_generator = generate_browse_tile
-            tile_args = (
-                settings,
-                request.app.state.storage_connector,
-                entry,
-                variable,
-                z,
-                x,
-                y,
-                time_index,
-                colormap,
-                vmin,
-                vmax,
-            )
+            try:
+                browse_result = await run_in_threadpool(
+                    generate_browse_tile,
+                    settings,
+                    request.app.state.storage_connector,
+                    entry,
+                    variable,
+                    z,
+                    x,
+                    y,
+                    time_index,
+                    colormap,
+                    vmin,
+                    vmax,
+                )
+                if not isinstance(browse_result, BrowseTileResult):
+                    raise TypeError("Browse tile generation returned an unexpected result")
+                tile_bytes = browse_result.tile_bytes
+                actual_vmin, actual_vmax = browse_result.display_range
+                browse_source = browse_result.source
+            except FileNotFoundError:
+                actual_representation = "serving"
+                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
+        else:
+            tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
 
-        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
-        await request.app.state.cache.set(cache_key, tile_bytes)
+        if actual_representation == tile_plan.chosen_representation:
+            await request.app.state.cache.set(cache_key, tile_bytes)
+        headers = {
+            "Cache-Control": "public, max-age=3600",
+            "X-Cache-Status": "MISS",
+            "X-Data-Vmin": str(actual_vmin),
+            "X-Data-Vmax": str(actual_vmax),
+            "X-Request-Class": tile_plan.request_class,
+            "X-Execution-Path": tile_plan.execution_path,
+            "X-Representation": actual_representation,
+        }
+        if browse_source is not None:
+            headers["X-Browse-Source"] = browse_source
         return Response(
             tile_bytes,
             media_type="image/webp",
-            headers={
-                "Cache-Control": "public, max-age=3600",
-                "X-Cache-Status": "MISS",
-                "X-Data-Vmin": str(actual_vmin),
-                "X-Data-Vmax": str(actual_vmax),
-                "X-Request-Class": tile_plan.request_class,
-                "X-Execution-Path": tile_plan.execution_path,
-                "X-Representation": tile_plan.chosen_representation,
-            },
+            headers=headers,
         )
 
     registry = request.app.state.registry
@@ -152,6 +171,8 @@ async def get_tile(
             "colormap": colormap,
             "vmin": vmin,
             "vmax": vmax,
+            "representation": tile_plan.chosen_representation,
+            "planner_version": settings.planner_version,
         }
     )
 

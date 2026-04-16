@@ -43,19 +43,31 @@ def browse_manifest_contains_overview(
     variable: str,
     time_index: int,
 ) -> bool:
+    return browse_manifest_overview_path(manifest, variable=variable, time_index=time_index) is not None
+
+
+def browse_manifest_overview_path(
+    manifest: dict[str, Any] | None,
+    *,
+    variable: str,
+    time_index: int,
+) -> str | None:
     if manifest is None:
-        return False
+        return None
     variables = manifest.get("variables")
     if not isinstance(variables, dict):
-        return False
+        return None
     variable_entry = variables.get(variable)
     if not isinstance(variable_entry, dict):
-        return False
+        return None
     overviews = variable_entry.get("overviews")
     if not isinstance(overviews, dict):
-        return False
+        return None
     overview_entry = overviews.get(str(time_index))
-    return isinstance(overview_entry, dict) and isinstance(overview_entry.get("path"), str)
+    if not isinstance(overview_entry, dict):
+        return None
+    path = overview_entry.get("path")
+    return path if isinstance(path, str) else None
 
 
 def build_browse_manifest(

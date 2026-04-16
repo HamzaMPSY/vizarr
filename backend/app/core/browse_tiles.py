@@ -2,6 +2,8 @@ import hashlib
 import logging
 import math
 from collections import OrderedDict
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from threading import Thread
@@ -9,6 +11,12 @@ from threading import Thread
 import numpy as np
 
 from app.config import Settings
+from app.core.browse_artifacts import browse_manifest_contains_overview
+from app.core.browse_artifacts import browse_manifest_overview_path
+from app.core.browse_artifacts import browse_overview_object_path
+from app.core.browse_artifacts import build_browse_manifest
+from app.core.browse_artifacts import read_browse_manifest
+from app.core.browse_artifacts import write_browse_manifest
 from app.core.colormap import encode_tile
 from app.core.dataset_catalog import CatalogEntry
 from app.core.projected_tile_generator import (
@@ -29,6 +37,13 @@ _BUILD_LOCKS: dict[str, Lock] = {}
 _BUILD_LOCKS_LOCK = Lock()
 
 
+@dataclass(frozen=True)
+class BrowseTileResult:
+    tile_bytes: bytes
+    display_range: tuple[float, float]
+    source: str
+
+
 def generate_browse_tile(
     settings: Settings,
     connector: OCIObjectStorageConnector,
@@ -41,8 +56,8 @@ def generate_browse_tile(
     colormap: str,
     vmin: float | None,
     vmax: float | None,
-) -> tuple[bytes, tuple[float, float]]:
-    overview, overview_bbox = get_or_create_browse_overview(
+) -> BrowseTileResult:
+    overview, overview_bbox, source = get_or_create_browse_overview(
         settings=settings,
         connector=connector,
         entry=entry,
@@ -57,7 +72,11 @@ def generate_browse_tile(
         height=256,
     )
     actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, tile_data, vmin, vmax)
-    return encode_tile(tile_data, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)
+    return BrowseTileResult(
+        tile_bytes=encode_tile(tile_data, colormap, actual_vmin, actual_vmax),
+        display_range=(actual_vmin, actual_vmax),
+        source=source,
+    )
 
 
 def prewarm_browse_overviews(
@@ -74,7 +93,13 @@ def prewarm_browse_overviews(
         if not all_variables:
             variables = variables[:1]
         for variable in variables:
-            if browse_overview_exists(settings=settings, entry=entry, variable=variable, time_index=0):
+            if browse_overview_exists(
+                settings=settings,
+                connector=connector,
+                entry=entry,
+                variable=variable,
+                time_index=0,
+            ):
                 continue
             get_or_create_browse_overview(
                 settings=settings,
@@ -106,6 +131,7 @@ def start_background_browse_prewarm(
 def browse_overview_exists(
     *,
     settings: Settings,
+    connector: OCIObjectStorageConnector,
     entry: CatalogEntry,
     variable: str,
     time_index: int,
@@ -113,7 +139,10 @@ def browse_overview_exists(
     cache_path = _overview_cache_path(settings, entry, variable, time_index)
     if cache_path.exists():
         return True
-    return _overview_cache_get(str(cache_path)) is not None
+    if _overview_cache_get(str(cache_path)) is not None:
+        return True
+    manifest = read_browse_manifest(connector, settings, entry)
+    return browse_manifest_contains_overview(manifest, variable=variable, time_index=time_index)
 
 
 def _run_background_browse_prewarm(
@@ -140,28 +169,55 @@ def get_or_create_browse_overview(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
-) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+) -> tuple[np.ndarray, tuple[float, float, float, float], str]:
     cache_path = _overview_cache_path(settings, entry, variable, time_index)
     cache_key = str(cache_path)
 
     cached = _overview_cache_get(cache_key)
     if cached is not None:
-        return cached
+        return cached[0], cached[1], "memory"
 
     if cache_path.exists():
         loaded = _load_overview(cache_path)
         _overview_cache_set(cache_key, loaded)
-        return loaded
+        return loaded[0], loaded[1], "local"
+
+    manifest = read_browse_manifest(connector, settings, entry)
+    overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
+    if overview_path is not None:
+        loaded = _load_overview_from_object_storage(
+            connector=connector,
+            object_path=overview_path,
+            cache_path=cache_path,
+        )
+        _overview_cache_set(cache_key, loaded)
+        return loaded[0], loaded[1], "oci"
 
     build_lock = _build_lock(cache_key)
     with build_lock:
         cached = _overview_cache_get(cache_key)
         if cached is not None:
-            return cached
+            return cached[0], cached[1], "memory"
         if cache_path.exists():
             loaded = _load_overview(cache_path)
             _overview_cache_set(cache_key, loaded)
-            return loaded
+            return loaded[0], loaded[1], "local"
+
+        manifest = read_browse_manifest(connector, settings, entry)
+        overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
+        if overview_path is not None:
+            loaded = _load_overview_from_object_storage(
+                connector=connector,
+                object_path=overview_path,
+                cache_path=cache_path,
+            )
+            _overview_cache_set(cache_key, loaded)
+            return loaded[0], loaded[1], "oci"
+
+        if not settings.browse_dev_fallback_enabled:
+            raise FileNotFoundError(
+                f"No durable browse overview is available for dataset={entry.id} variable={variable} time_index={time_index}"
+            )
 
         built = _build_overview(
             settings=settings,
@@ -177,7 +233,76 @@ def get_or_create_browse_overview(
             bbox=np.asarray(built[1], dtype=np.float64),
         )
         _overview_cache_set(cache_key, built)
-        return built
+        return built[0], built[1], "generated"
+
+
+def build_and_store_browse_overviews(
+    *,
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    variables: list[str],
+    time_indices: list[int],
+    overwrite: bool = False,
+) -> dict[str, object]:
+    manifest = read_browse_manifest(connector, settings, entry, use_cache=False) or build_browse_manifest(
+        settings,
+        entry,
+        {},
+    )
+    variables_payload = dict(manifest.get("variables", {}))
+    generated = 0
+    reused = 0
+
+    for variable in variables:
+        variable_payload = dict(variables_payload.get(variable, {}))
+        overviews = dict(variable_payload.get("overviews", {}))
+        for time_index in time_indices:
+            object_path = browse_overview_object_path(settings, entry, variable, time_index)
+            exists = connector.object_exists(object_path)
+            if exists and not overwrite:
+                reused += 1
+                overviews.setdefault(str(time_index), {"path": object_path})
+                continue
+
+            built = _build_overview(
+                settings=settings,
+                connector=connector,
+                entry=entry,
+                variable=variable,
+                time_index=time_index,
+            )
+            connector.write_bytes(
+                object_path,
+                _serialize_overview(*built),
+                content_type="application/octet-stream",
+            )
+            cache_path = _overview_cache_path(settings, entry, variable, time_index)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                cache_path,
+                data=built[0],
+                bbox=np.asarray(built[1], dtype=np.float64),
+            )
+            _overview_cache_set(str(cache_path), built)
+            overviews[str(time_index)] = {
+                "path": object_path,
+                "bbox": [float(value) for value in built[1]],
+            }
+            generated += 1
+
+        variable_payload["overviews"] = overviews
+        variables_payload[variable] = variable_payload
+
+    manifest = build_browse_manifest(settings, entry, variables_payload)
+    manifest_path = write_browse_manifest(connector, settings, entry, manifest)
+    return {
+        "manifest_path": manifest_path,
+        "generated": generated,
+        "reused": reused,
+        "variables": variables,
+        "time_indices": time_indices,
+    }
 
 
 def _build_overview(
@@ -270,6 +395,19 @@ def _load_overview(path: Path) -> tuple[np.ndarray, tuple[float, float, float, f
     return data, bbox
 
 
+def _load_overview_from_object_storage(
+    *,
+    connector: OCIObjectStorageConnector,
+    object_path: str,
+    cache_path: Path,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    payload = connector.read_bytes(object_path, use_cache=True)
+    loaded = _deserialize_overview(payload)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(payload)
+    return loaded
+
+
 def _overview_cache_get(
     key: str,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
@@ -299,3 +437,23 @@ def _build_lock(key: str) -> Lock:
             lock = Lock()
             _BUILD_LOCKS[key] = lock
         return lock
+
+
+def _serialize_overview(
+    data: np.ndarray,
+    bbox: tuple[float, float, float, float],
+) -> bytes:
+    payload = BytesIO()
+    np.savez_compressed(
+        payload,
+        data=data,
+        bbox=np.asarray(bbox, dtype=np.float64),
+    )
+    return payload.getvalue()
+
+
+def _deserialize_overview(payload: bytes) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    with np.load(BytesIO(payload), allow_pickle=False) as data:
+        array = data["data"].astype(np.float32, copy=False)
+        bbox = tuple(float(value) for value in data["bbox"].tolist())
+    return array, bbox

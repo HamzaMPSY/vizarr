@@ -100,7 +100,7 @@ class OCIObjectStorageConnector:
         *,
         use_cache: bool = True,
     ) -> str:
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         if use_cache:
             with self._text_cache_lock:
                 if resolved in self._text_cache:
@@ -125,7 +125,7 @@ class OCIObjectStorageConnector:
         *,
         use_cache: bool = False,
     ) -> bytes:
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         if use_cache:
             with self._bytes_cache_lock:
                 if resolved in self._bytes_cache:
@@ -202,7 +202,7 @@ class OCIObjectStorageConnector:
         end: int | None = None,
         use_cache: bool = False,
     ) -> bytes:
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         cache_key = f"{resolved}::{start if start is not None else ''}:{end if end is not None else ''}"
         if use_cache:
             with self._bytes_cache_lock:
@@ -234,7 +234,7 @@ class OCIObjectStorageConnector:
         if length <= 0:
             return b""
 
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         cache_key = f"{resolved}::tail:{length}"
         if use_cache:
             with self._bytes_cache_lock:
@@ -266,9 +266,24 @@ class OCIObjectStorageConnector:
         bucket_prefix = f"{self._settings.oci_bucket}@{self.namespace}/"
         if resolved.startswith(bucket_prefix):
             return resolved[len(bucket_prefix) :]
+        bucket_name_prefix = f"{self._settings.oci_bucket}/"
+        if resolved.startswith(bucket_name_prefix):
+            return resolved[len(bucket_name_prefix) :]
         if "/" in resolved and "@" in resolved.split("/", 1)[0]:
             return resolved.split("/", 1)[1]
         return resolved
+
+    def _filesystem_path(self, object_path: str) -> str:
+        resolved = object_path.removeprefix("oci://").lstrip("/")
+        bucket_prefix = f"{self._settings.oci_bucket}@{self.namespace}/"
+        if resolved.startswith(bucket_prefix):
+            return resolved
+        bucket_name_prefix = f"{self._settings.oci_bucket}/"
+        if resolved.startswith(bucket_name_prefix):
+            return f"{bucket_prefix}{resolved[len(bucket_name_prefix):]}"
+        if "/" in resolved and "@" in resolved.split("/", 1)[0]:
+            return resolved
+        return f"{bucket_prefix}{resolved}"
 
     def _evict_cached_object(self, resolved_path: str) -> None:
         with self._text_cache_lock:

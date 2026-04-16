@@ -79,9 +79,9 @@ def test_read_text_uses_connector_cache() -> None:
     first = connector.read_text("bucket/path.json", use_cache=True)
     second = connector.read_text("bucket/path.json", use_cache=True)
 
-    assert first == "payload:bucket/path.json"
+    assert first == "payload:bucket@namespace/path.json"
     assert second == first
-    assert filesystem.calls == ["bucket/path.json"]
+    assert filesystem.calls == ["bucket@namespace/path.json"]
 
 
 def test_read_bytes_uses_connector_cache() -> None:
@@ -91,9 +91,9 @@ def test_read_bytes_uses_connector_cache() -> None:
     first = connector.read_bytes("bucket/chunk", use_cache=True)
     second = connector.read_bytes("bucket/chunk", use_cache=True)
 
-    assert first == b"payload:bucket/chunk"
+    assert first == b"payload:bucket@namespace/chunk"
     assert second == first
-    assert filesystem.calls == ["bucket/chunk"]
+    assert filesystem.calls == ["bucket@namespace/chunk"]
 
 
 def test_write_bytes_evicts_cached_reads_and_writes_to_object_storage() -> None:

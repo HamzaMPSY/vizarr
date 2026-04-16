@@ -1,3 +1,5 @@
+from app.config import Settings
+from app.core.browse_artifacts import browse_artifact_root
 from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import get_or_build_catalog
 from app.core.datasets import DatasetRegistry
@@ -19,6 +21,7 @@ def build_index_records(app) -> list[CubeIndexRecord]:
         for entry in catalog.values():
             records.extend(
                 _records_from_catalog_entry(
+                    settings=settings,
                     entry=entry,
                     browse_styles=browse_styles,
                     version=settings.planner_version,
@@ -55,6 +58,7 @@ def _records_from_registry(
 
 def _records_from_catalog_entry(
     *,
+    settings: Settings,
     entry: CatalogEntry,
     browse_styles: list[str],
     version: str,
@@ -64,7 +68,7 @@ def _records_from_catalog_entry(
         meta=entry.meta,
         source_path=entry.path,
         serving_path=f"{entry.path}#serving",
-        browse_path_root=f"{entry.path}#browse",
+        browse_path_root=browse_artifact_root(settings, entry),
         browse_styles=browse_styles,
         version=version,
         crs=entry.crs_wkt,

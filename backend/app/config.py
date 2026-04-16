@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     oci_zarr_path: str = ""
     oci_zarr_consolidated: bool = True
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
 @lru_cache
