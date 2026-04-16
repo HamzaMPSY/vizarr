@@ -67,6 +67,7 @@ class ConversionConfig:
     source_crs: str | None = None
     x_snap_origin: float | None = None
     y_snap_origin: float | None = None
+    preserve_points: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,14 @@ def _parse_args() -> argparse.Namespace:
         default="first",
         choices=("first", "mode"),
         help="How to combine string/categorical values when multiple rows land in the same grid cell. Default: first.",
+    )
+    parser.add_argument(
+        "--preserve-points",
+        action="store_true",
+        help=(
+            "Infer or clamp x/y resolutions to the finest observed regular coordinate step before writing Zarr. "
+            "Use this for source cubes when distinct point rows should not be merged by a coarse snap grid."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -796,6 +805,68 @@ def _snap_to_resolution(series: pd.Series, resolution: float, origin: float | No
     return pd.Series(snapped, index=series.index, dtype=np.float64)
 
 
+def _minimum_positive_step(values: np.ndarray) -> float | None:
+    unique_values = np.unique(values.astype(np.float64))
+    if unique_values.size < 2:
+        return None
+    diffs = np.diff(np.sort(unique_values))
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return None
+    return float(np.round(float(positive_diffs.min()), decimals=GRID_COORD_DECIMALS))
+
+
+def _resolve_point_preserving_resolutions(
+    coordinate_frames: dict[str, pd.DataFrame],
+    parquet_uris: list[str],
+    config: ConversionConfig,
+) -> tuple[float | None, float | None]:
+    if not config.preserve_points:
+        return config.x_resolution, config.y_resolution
+
+    transformed_frames = [
+        _transform_coordinate_frame(coordinate_frames[parquet_uri], config)
+        for parquet_uri in parquet_uris
+    ]
+    x_steps = [
+        step
+        for frame in transformed_frames
+        if (step := _minimum_positive_step(frame[config.x_column].to_numpy(dtype=np.float64))) is not None
+    ]
+    y_steps = [
+        step
+        for frame in transformed_frames
+        if (step := _minimum_positive_step(frame[config.y_column].to_numpy(dtype=np.float64))) is not None
+    ]
+    resolved_x = config.x_resolution
+    resolved_y = config.y_resolution
+
+    if x_steps:
+        finest_x = min(x_steps)
+        if resolved_x is None or resolved_x > finest_x:
+            resolved_x = finest_x
+    if y_steps:
+        finest_y = min(y_steps)
+        if resolved_y is None or resolved_y > finest_y:
+            resolved_y = finest_y
+
+    if resolved_x != config.x_resolution or resolved_y != config.y_resolution:
+        logger.info(
+            "Adjusted point-preserving raster resolution: x_resolution=%s->%s y_resolution=%s->%s",
+            config.x_resolution,
+            resolved_x,
+            config.y_resolution,
+            resolved_y,
+        )
+    else:
+        logger.info(
+            "Point-preserving raster resolution already satisfied: x_resolution=%s y_resolution=%s",
+            resolved_x,
+            resolved_y,
+        )
+    return resolved_x, resolved_y
+
+
 def _prepare_spatial_frame(
     df: pd.DataFrame,
     config: ConversionConfig,
@@ -1253,6 +1324,9 @@ def _build_ingest_summary(
         "input_rows": int(input_rows),
         "output_rows": int(output_rows),
         "aggregation_ratio": (float(output_rows) / float(input_rows)) if input_rows else None,
+        "x_resolution": config.x_resolution,
+        "y_resolution": config.y_resolution,
+        "preserve_points": config.preserve_points,
         "shape": {
             "time": 1,
             config.y_dim: int(len(y_values)),
@@ -1742,6 +1816,16 @@ def _append_inputs(
         config=config,
         max_workers=read_workers,
     )
+    resolved_x_resolution, resolved_y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=normalized_links,
+        config=config,
+    )
+    config = replace(
+        config,
+        x_resolution=resolved_x_resolution,
+        y_resolution=resolved_y_resolution,
+    )
     if existing_context is not None:
         resolved_x_origin = _existing_grid_snap_origin(existing_context.x_values)
         resolved_y_origin = _existing_grid_snap_origin(existing_context.y_values)
@@ -1978,6 +2062,7 @@ def main() -> None:
         source_crs=args.source_crs,
         x_snap_origin=args.x_snap_origin,
         y_snap_origin=args.y_snap_origin,
+        preserve_points=args.preserve_points,
     )
 
     parquet_links = _load_links(args.links_file)

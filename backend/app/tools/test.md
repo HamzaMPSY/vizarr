@@ -7,7 +7,7 @@ printf '%s\n' \
     'oci://Ayoub@lrdwfp6kyp5x/maize_2025-01-22_to_2025-01-29.parquet' \
     > /tmp/maize_links.txt
 
-python -m app.tools.parquet_to_zarr \
+uv run --python .venv/bin/python --no-project python -m app.tools.parquet_to_zarr \
 --links-file /tmp/maize_links.txt \
 --output-store oci://Ayoub@lrdwfp6kyp5x/cubes/maize_2025.zarr \
 --x-column LONGITUDE \
@@ -22,5 +22,6 @@ python -m app.tools.parquet_to_zarr \
 --source-crs EPSG:4326 \
 --x-resolution 0.0001 \
 --y-resolution 0.0001 \
+--preserve-points \
 --overwrite \
 --log-level DEBUG

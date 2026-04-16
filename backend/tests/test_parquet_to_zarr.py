@@ -22,7 +22,9 @@ from app.tools.parquet_to_zarr import _initial_read_columns
 from app.tools.parquet_to_zarr import _is_transient_read_error
 from app.tools.parquet_to_zarr import _read_table_with_retries
 from app.tools.parquet_to_zarr import _grid_dataset
+from app.tools.parquet_to_zarr import _minimum_positive_step
 from app.tools.parquet_to_zarr import _prepare_spatial_frame
+from app.tools.parquet_to_zarr import _resolve_point_preserving_resolutions
 from app.tools.parquet_to_zarr import _resolve_snap_origins
 from app.tools.parquet_to_zarr import _resolve_target_grid
 from app.tools.parquet_to_zarr import _regular_step
@@ -37,6 +39,11 @@ from app.tools.parquet_to_zarr import _validate_expected_columns_against_existin
 def test_regular_step_detects_even_spacing() -> None:
     values = np.array([10.0, 20.0, 30.0], dtype=np.float64)
     assert _regular_step(values) == 10.0
+
+
+def test_minimum_positive_step_ignores_duplicate_values() -> None:
+    values = np.array([10.0, 10.0, 10.05, 10.07], dtype=np.float64)
+    assert _minimum_positive_step(values) == pytest.approx(0.02)
 
 
 def test_validate_storage_layout_rejects_non_multiple_shard_size() -> None:
@@ -430,6 +437,9 @@ def test_build_ingest_summary_reports_source_and_aggregated_rows() -> None:
     assert summary["input_rows"] == 4
     assert summary["output_rows"] == 2
     assert summary["aggregation_ratio"] == 0.5
+    assert summary["x_resolution"] == 0.5
+    assert summary["y_resolution"] == 0.5
+    assert summary["preserve_points"] is False
     assert summary["shape"] == {"time": 1, "y": 2, "x": 2}
 
 
@@ -912,6 +922,91 @@ def test_resolve_target_grid_uses_global_resolution_extent(monkeypatch) -> None:
 
     assert target_x.tolist() == [10.0, 10.5, 11.0, 11.5]
     assert target_y.tolist() == [20.5, 20.0, 19.5, 19.0]
+
+
+def test_resolve_point_preserving_resolutions_clamps_coarse_grid() -> None:
+    coordinate_frames = {
+        "oci://Ayoub@test/first.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.00, 10.05, 10.10],
+                "LATITUDE": [20.00, 20.02, 20.04],
+            }
+        ),
+        "oci://Ayoub@test/second.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.15, 10.20],
+                "LATITUDE": [20.06, 20.08],
+            }
+        ),
+    }
+
+    x_resolution, y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=[
+            "oci://Ayoub@test/first.parquet",
+            "oci://Ayoub@test/second.parquet",
+        ],
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=0.1,
+            y_resolution=0.1,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+            preserve_points=True,
+        ),
+    )
+
+    assert x_resolution == pytest.approx(0.05)
+    assert y_resolution == pytest.approx(0.02)
+
+
+def test_resolve_point_preserving_resolutions_infers_missing_grid() -> None:
+    coordinate_frames = {
+        "oci://Ayoub@test/first.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.00, 10.05, 10.10],
+                "LATITUDE": [20.00, 20.02, 20.04],
+            }
+        ),
+    }
+
+    x_resolution, y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=["oci://Ayoub@test/first.parquet"],
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=None,
+            y_resolution=None,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+            preserve_points=True,
+        ),
+    )
+
+    assert x_resolution == pytest.approx(0.05)
+    assert y_resolution == pytest.approx(0.02)
 
 
 def test_resolve_snap_origins_projects_and_infers_shared_10m_grid() -> None:
