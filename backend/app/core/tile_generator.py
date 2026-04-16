@@ -5,6 +5,7 @@ import xarray as xr
 from PIL import Image
 
 from app.core.colormap import encode_tile
+from app.core.variable_display import resolve_display_range
 from app.models.dataset import DatasetMeta
 
 
@@ -62,10 +63,7 @@ def _extract_region(
 
 def resolve_range(meta: DatasetMeta, variable: str, vmin: float | None, vmax: float | None) -> tuple[float, float]:
     variable_meta = next(item for item in meta.variables if item.id == variable)
-    return (
-        variable_meta.stats.p02 if vmin is None else vmin,
-        variable_meta.stats.p98 if vmax is None else vmax,
-    )
+    return resolve_display_range(variable_meta, vmin, vmax)
 
 
 def generate_tile(

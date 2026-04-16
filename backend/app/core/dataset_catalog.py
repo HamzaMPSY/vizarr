@@ -9,6 +9,7 @@ from pyproj import CRS, Geod, Transformer
 from app.config import Settings
 from app.core.datasets import _stats
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.variable_display import apply_variable_display_defaults
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import load_1d_numeric_array
 from app.core.zarr_v3 import load_4d_window
@@ -101,6 +102,10 @@ def _build_variable_meta(
     variables: list[VariableMeta] = []
     for band_index, band_name in enumerate(band_names):
         band_id, band_title = _build_label(band_name)
+        display_vmin, display_vmax, default_colormap = apply_variable_display_defaults(
+            variable_id=band_id,
+            variable_name=band_title,
+        )
         sample = (
             stats_samples[band_index]
             if stats_samples is not None and band_index < len(stats_samples)
@@ -113,6 +118,9 @@ def _build_variable_meta(
                 unit="DN",
                 time_steps=time_steps,
                 stats=_stats(sample),
+                display_vmin=display_vmin,
+                display_vmax=display_vmax,
+                default_colormap=default_colormap,
             )
         )
     return variables

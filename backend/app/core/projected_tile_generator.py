@@ -8,6 +8,7 @@ from app.core.colormap import encode_tile
 from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.variable_display import resolve_display_range
 from app.core.zarr_v3 import load_4d_window
 
 
@@ -340,8 +341,8 @@ def resolve_projected_display_range(
     selected = next(item for item in entry.meta.variables if item.id == variable)
     return _resolve_display_range(
         data=data,
-        fallback_vmin=selected.stats.p02,
-        fallback_vmax=selected.stats.p98,
+        fallback_vmin=resolve_display_range(selected, None, None)[0],
+        fallback_vmax=resolve_display_range(selected, None, None)[1],
         vmin=vmin,
         vmax=vmax,
     )

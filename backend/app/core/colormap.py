@@ -2,15 +2,35 @@ import io
 
 import matplotlib
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
 
+CUSTOM_COLORMAPS = {
+    "red_green": LinearSegmentedColormap.from_list(
+        "red_green",
+        ["#c62828", "#2e7d32"],
+    )
+}
+
+
+def _ensure_custom_colormaps() -> None:
+    for name, colormap in CUSTOM_COLORMAPS.items():
+        if name not in matplotlib.colormaps:
+            matplotlib.colormaps.register(colormap, name=name)
+
+
 def list_colormaps() -> list[str]:
-    names = sorted(matplotlib.colormaps.keys())
-    return [name for name in names if not name.endswith("_r")][:24]
+    _ensure_custom_colormaps()
+    preferred = ["red_green", "viridis", "plasma", "inferno", "magma", "cividis", "turbo"]
+    available = [name for name in sorted(matplotlib.colormaps.keys()) if not name.endswith("_r")]
+    names = [name for name in preferred if name in available]
+    names.extend(name for name in available if name not in names)
+    return names[:24]
 
 
 def encode_tile(data: np.ndarray, colormap: str, vmin: float, vmax: float) -> bytes:
+    _ensure_custom_colormaps()
     if vmax <= vmin:
         vmax = vmin + 1e-6
 
@@ -26,4 +46,3 @@ def encode_tile(data: np.ndarray, colormap: str, vmin: float, vmax: float) -> by
     buffer = io.BytesIO()
     image.save(buffer, format="WEBP", quality=85)
     return buffer.getvalue()
-

@@ -21,6 +21,9 @@ class VariableMeta(BaseModel):
     unit: str
     time_steps: int
     stats: VariableStats
+    display_vmin: float | None = None
+    display_vmax: float | None = None
+    default_colormap: str | None = None
 
 
 class DatasetMeta(BaseModel):

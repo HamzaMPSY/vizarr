@@ -4,6 +4,7 @@ import numpy as np
 import xarray as xr
 from pyproj import Geod
 
+from app.core.variable_display import apply_variable_display_defaults
 from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta, VariableStats
 
 
@@ -107,6 +108,10 @@ def build_metadata(
     for variable_name, data_array in dataset.data_vars.items():
         dims = data_array.sizes
         time_steps = int(dims.get("time", 1))
+        display_vmin, display_vmax, default_colormap = apply_variable_display_defaults(
+            variable_id=variable_name,
+            variable_name=variable_name.replace("_", " ").title(),
+        )
         variables.append(
             VariableMeta(
                 id=variable_name,
@@ -114,6 +119,9 @@ def build_metadata(
                 unit=units.get(variable_name, "unknown"),
                 time_steps=time_steps,
                 stats=_stats_for_data_array(data_array),
+                display_vmin=display_vmin,
+                display_vmax=display_vmax,
+                default_colormap=default_colormap,
             )
         )
 

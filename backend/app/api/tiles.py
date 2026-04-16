@@ -10,6 +10,7 @@ from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import get_or_build_catalog
 from app.core.projected_tile_generator import generate_projected_band_tile
 from app.core.tile_generator import generate_tile
+from app.core.variable_display import resolve_display_range
 
 
 router = APIRouter(prefix="/tiles", tags=["tiles"])
@@ -78,14 +79,15 @@ async def get_tile(
         cached = await request.app.state.cache.get(cache_key)
         selected_variable = next(item for item in entry.meta.variables if item.id == variable)
         if cached is not None:
+            cached_vmin, cached_vmax = resolve_display_range(selected_variable, vmin, vmax)
             return Response(
                 cached,
                 media_type="image/webp",
                 headers={
                     "Cache-Control": "public, max-age=3600",
                     "X-Cache-Status": "HIT",
-                    "X-Data-Vmin": str(vmin if vmin is not None else selected_variable.stats.p02),
-                    "X-Data-Vmax": str(vmax if vmax is not None else selected_variable.stats.p98),
+                    "X-Data-Vmin": str(cached_vmin),
+                    "X-Data-Vmax": str(cached_vmax),
                     "X-Request-Class": tile_plan.request_class,
                     "X-Execution-Path": tile_plan.execution_path,
                     "X-Representation": tile_plan.chosen_representation,

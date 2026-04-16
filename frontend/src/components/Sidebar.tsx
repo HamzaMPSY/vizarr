@@ -36,8 +36,8 @@ export function Sidebar() {
           variable,
           timeIndex,
           colormap,
-          vmin: null,
-          vmax: null
+          vmin,
+          vmax
         })
           .replace("{z}", "1")
           .replace("{x}", "1")
@@ -99,7 +99,8 @@ export function Sidebar() {
           <div className="stats">
             <span>Unit: {selectedVariable.unit}</span>
             <span>
-              Range: {(vmin ?? selectedVariable.stats.p02).toFixed(1)} to {(vmax ?? selectedVariable.stats.p98).toFixed(1)}
+              Range: {(vmin ?? selectedVariable.display_vmin ?? selectedVariable.stats.p02).toFixed(2)} to{" "}
+              {(vmax ?? selectedVariable.display_vmax ?? selectedVariable.stats.p98).toFixed(2)}
             </span>
           </div>
         ) : null}
