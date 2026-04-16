@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from app.api.router import router as api_router
+from app.core.browse_tiles import prewarm_browse_overviews
+from app.core.browse_tiles import start_background_browse_prewarm
 from app.config import get_settings
 from app.core.cache import CacheClient
 from app.core.cache import connect_cache
@@ -62,6 +64,20 @@ async def lifespan(app: FastAPI):
                 app,
                 has_direct_store_target(settings),
             )
+            if settings.browse_prewarm_enabled and has_direct_store_target(settings):
+                await run_in_threadpool(
+                    prewarm_browse_overviews,
+                    settings,
+                    connector,
+                    app.state.dataset_catalog,
+                    settings.browse_prewarm_all_variables,
+                )
+                if not settings.browse_prewarm_all_variables:
+                    start_background_browse_prewarm(
+                        settings,
+                        connector,
+                        app.state.dataset_catalog,
+                    )
     else:
         app.state.registry = build_registry()
     app.state.planner_index.replace(build_index_records(app))

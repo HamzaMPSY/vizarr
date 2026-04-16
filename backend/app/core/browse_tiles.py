@@ -1,8 +1,10 @@
 import hashlib
+import logging
 import math
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
+from threading import Thread
 
 import numpy as np
 
@@ -19,6 +21,7 @@ from app.core.projected_tile_generator import (
 from app.core.oci_object_storage import OCIObjectStorageConnector
 
 
+logger = logging.getLogger(__name__)
 _OVERVIEW_CACHE: OrderedDict[str, tuple[np.ndarray, tuple[float, float, float, float]]] = OrderedDict()
 _OVERVIEW_CACHE_LOCK = Lock()
 _OVERVIEW_CACHE_MAX_ENTRIES = 16
@@ -55,6 +58,79 @@ def generate_browse_tile(
     )
     actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, tile_data, vmin, vmax)
     return encode_tile(tile_data, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)
+
+
+def prewarm_browse_overviews(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    catalog: dict[str, CatalogEntry],
+    all_variables: bool = False,
+) -> int:
+    warmed = 0
+    for entry in catalog.values():
+        if not entry.meta.variables:
+            continue
+        variables = [item.id for item in entry.meta.variables]
+        if not all_variables:
+            variables = variables[:1]
+        for variable in variables:
+            if browse_overview_exists(settings=settings, entry=entry, variable=variable, time_index=0):
+                continue
+            get_or_create_browse_overview(
+                settings=settings,
+                connector=connector,
+                entry=entry,
+                variable=variable,
+                time_index=0,
+            )
+            warmed += 1
+            logger.info("Prewarmed browse overview for %s variable %s", entry.id, variable)
+    return warmed
+
+
+def start_background_browse_prewarm(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    catalog: dict[str, CatalogEntry],
+) -> Thread:
+    thread = Thread(
+        target=_run_background_browse_prewarm,
+        args=(settings, connector, catalog),
+        daemon=True,
+        name="browse-prewarm",
+    )
+    thread.start()
+    return thread
+
+
+def browse_overview_exists(
+    *,
+    settings: Settings,
+    entry: CatalogEntry,
+    variable: str,
+    time_index: int,
+) -> bool:
+    cache_path = _overview_cache_path(settings, entry, variable, time_index)
+    if cache_path.exists():
+        return True
+    return _overview_cache_get(str(cache_path)) is not None
+
+
+def _run_background_browse_prewarm(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    catalog: dict[str, CatalogEntry],
+) -> None:
+    try:
+        warmed = prewarm_browse_overviews(
+            settings=settings,
+            connector=connector,
+            catalog=catalog,
+            all_variables=True,
+        )
+        logger.info("Background browse prewarm finished with %d generated overview(s)", warmed)
+    except Exception:
+        logger.exception("Background browse prewarm failed")
 
 
 def get_or_create_browse_overview(

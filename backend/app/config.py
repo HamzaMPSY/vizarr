@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     browse_enabled_styles: str = "ndvi-default,rgb-default"
     browse_tile_max_zoom: int = 8
     browse_overview_max_size: int = 1536
-    browse_local_cache_dir: str = "/tmp/vizarr-browse"
+    browse_local_cache_dir: str = ".cache/browse"
+    browse_prewarm_enabled: bool = True
+    browse_prewarm_all_variables: bool = False
     interactive_max_clip_bands: int = 4
     interactive_max_clip_days: int = 31
     default_dataset_id: str = "demo-global"
