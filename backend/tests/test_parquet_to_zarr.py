@@ -14,6 +14,7 @@ from app.tools.parquet_to_zarr import _build_spatial_ref_attrs
 from app.tools.parquet_to_zarr import _detect_value_columns
 from app.tools.parquet_to_zarr import _extract_existing_value_columns
 from app.tools.parquet_to_zarr import _extract_timestamps
+from app.tools.parquet_to_zarr import _initial_read_columns
 from app.tools.parquet_to_zarr import _grid_dataset
 from app.tools.parquet_to_zarr import _prepare_spatial_frame
 from app.tools.parquet_to_zarr import _resolve_snap_origins
@@ -98,6 +99,29 @@ def test_required_columns_include_coords_timestamp_and_explicit_values() -> None
         string_cell_aggregation="first",
     )
     assert _required_columns(config) == ["lon", "lat", "acquired_at", "band_1", "band_2"]
+
+
+def test_initial_read_columns_skips_full_scan_when_values_are_explicit() -> None:
+    config = ConversionConfig(
+        x_column="lon",
+        y_column="lat",
+        value_columns=("band_1", "band_2"),
+        layout="bands",
+        timestamp_column="acquired_at",
+        timestamp_regex=None,
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs=None,
+        max_grid_cells=1_000,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+    )
+
+    assert _initial_read_columns(config) == ["lon", "lat", "acquired_at", "band_1", "band_2"]
 
 
 def test_extract_timestamps_returns_multiple_sorted_values_from_column() -> None:

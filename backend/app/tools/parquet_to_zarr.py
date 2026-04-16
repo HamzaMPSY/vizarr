@@ -314,6 +314,12 @@ def _required_columns(config: ConversionConfig) -> list[str] | None:
     return columns
 
 
+def _initial_read_columns(config: ConversionConfig) -> list[str] | None:
+    if config.value_columns is None:
+        return None
+    return _required_columns(config)
+
+
 def _first_value(series: pd.Series) -> Any:
     non_null = series.dropna()
     if non_null.empty:
@@ -1653,7 +1659,11 @@ def _append_inputs(
             len(expected_y),
         )
     first_uri = normalized_links[0]
-    first_frame = _read_partitioned_parquet(filesystem, first_uri, columns=None)
+    first_frame = _read_partitioned_parquet(
+        filesystem,
+        first_uri,
+        columns=_initial_read_columns(config),
+    )
     value_columns = _detect_value_columns(first_frame, config)
     config = replace(config, value_columns=value_columns)
     if existing_context is not None:
