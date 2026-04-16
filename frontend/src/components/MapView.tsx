@@ -72,7 +72,7 @@ export function MapView() {
     setViewState({
       longitude: center.lng,
       latitude: center.lat,
-      zoom: camera.zoom ?? viewState.zoom,
+      zoom: camera.zoom ?? mapRef.current.getZoom(),
       pitch: 0,
       bearing: 0
     });
@@ -83,7 +83,6 @@ export function MapView() {
     dataset?.bounds?.east,
     dataset?.bounds?.north,
     mapLoaded,
-    viewState.zoom,
     setViewState
   ]);
 
