@@ -34,3 +34,13 @@ def test_get_tile() -> None:
     assert response.headers["content-type"] == "image/webp"
     assert response.headers["x-cache-status"] in {"MISS", "HIT"}
     assert len(response.content) > 100
+
+
+def test_get_tile_hits_memory_cache_on_second_request() -> None:
+    first = client.get("/api/tiles/demo-global/temperature/1/1/1")
+    second = client.get("/api/tiles/demo-global/temperature/1/1/1")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.headers["x-cache-status"] == "HIT"
+    assert second.content == first.content

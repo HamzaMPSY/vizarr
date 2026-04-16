@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
 from app.core.cache import build_tile_cache_key
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
@@ -47,7 +48,11 @@ async def get_tile(
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
         try:
-            ensure_catalog_entry_metadata_ready(entry, request.app.state.storage_connector)
+            await run_in_threadpool(
+                ensure_catalog_entry_metadata_ready,
+                entry,
+                request.app.state.storage_connector,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if variable not in entry.band_indices:
@@ -83,17 +88,18 @@ async def get_tile(
                 },
             )
 
-        tile_bytes, (actual_vmin, actual_vmax) = generate_projected_band_tile(
-            connector=request.app.state.storage_connector,
-            entry=entry,
-            variable=variable,
-            z=z,
-            x=x,
-            y=y,
-            time_index=time_index,
-            colormap=colormap,
-            vmin=vmin,
-            vmax=vmax,
+        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+            generate_projected_band_tile,
+            request.app.state.storage_connector,
+            entry,
+            variable,
+            z,
+            x,
+            y,
+            time_index,
+            colormap,
+            vmin,
+            vmax,
         )
         await request.app.state.cache.set(cache_key, tile_bytes)
         return Response(
@@ -150,17 +156,18 @@ async def get_tile(
             },
         )
 
-    tile_bytes, (actual_vmin, actual_vmax) = generate_tile(
-        dataset=registry.dataset,
-        meta=registry.meta,
-        variable=variable,
-        z=z,
-        x=x,
-        y=y,
-        time_index=time_index,
-        colormap=colormap,
-        vmin=vmin,
-        vmax=vmax,
+    tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+        generate_tile,
+        registry.dataset,
+        registry.meta,
+        variable,
+        z,
+        x,
+        y,
+        time_index,
+        colormap,
+        vmin,
+        vmax,
     )
     await request.app.state.cache.set(cache_key, tile_bytes)
     return Response(

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from collections import OrderedDict
+from threading import Lock
 
 import fsspec
 import oci
@@ -32,6 +33,8 @@ class OCIObjectStorageConnector:
         self._text_cache: OrderedDict[str, str] = OrderedDict()
         self._bytes_cache: OrderedDict[str, bytes] = OrderedDict()
         self._bytes_cache_size = 0
+        self._text_cache_lock = Lock()
+        self._bytes_cache_lock = Lock()
 
     def _build_auth(self) -> OCIAuthContext:
         return get_oci_auth_context(
@@ -98,19 +101,22 @@ class OCIObjectStorageConnector:
         use_cache: bool = True,
     ) -> str:
         resolved = object_path.removeprefix("oci://")
-        if use_cache and resolved in self._text_cache:
-            self._text_cache.move_to_end(resolved)
-            return self._text_cache[resolved]
+        if use_cache:
+            with self._text_cache_lock:
+                if resolved in self._text_cache:
+                    self._text_cache.move_to_end(resolved)
+                    return self._text_cache[resolved]
 
         try:
             payload = self.get_filesystem().cat_file(resolved).decode("utf-8")
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._text_cache[resolved] = payload
-            self._text_cache.move_to_end(resolved)
-            while len(self._text_cache) > 256:
-                self._text_cache.popitem(last=False)
+            with self._text_cache_lock:
+                self._text_cache[resolved] = payload
+                self._text_cache.move_to_end(resolved)
+                while len(self._text_cache) > 256:
+                    self._text_cache.popitem(last=False)
         return payload
 
     def read_bytes(
@@ -120,21 +126,24 @@ class OCIObjectStorageConnector:
         use_cache: bool = False,
     ) -> bytes:
         resolved = object_path.removeprefix("oci://")
-        if use_cache and resolved in self._bytes_cache:
-            self._bytes_cache.move_to_end(resolved)
-            return self._bytes_cache[resolved]
+        if use_cache:
+            with self._bytes_cache_lock:
+                if resolved in self._bytes_cache:
+                    self._bytes_cache.move_to_end(resolved)
+                    return self._bytes_cache[resolved]
 
         try:
             payload = self.get_filesystem().cat_file(resolved)
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[resolved] = payload
-            self._bytes_cache.move_to_end(resolved)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[resolved] = payload
+                self._bytes_cache.move_to_end(resolved)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
 
     def read_byte_range(
@@ -147,21 +156,24 @@ class OCIObjectStorageConnector:
     ) -> bytes:
         resolved = object_path.removeprefix("oci://")
         cache_key = f"{resolved}::{start if start is not None else ''}:{end if end is not None else ''}"
-        if use_cache and cache_key in self._bytes_cache:
-            self._bytes_cache.move_to_end(cache_key)
-            return self._bytes_cache[cache_key]
+        if use_cache:
+            with self._bytes_cache_lock:
+                if cache_key in self._bytes_cache:
+                    self._bytes_cache.move_to_end(cache_key)
+                    return self._bytes_cache[cache_key]
 
         try:
             payload = self.get_filesystem().cat_file(resolved, start=start, end=end)
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[cache_key] = payload
-            self._bytes_cache.move_to_end(cache_key)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[cache_key] = payload
+                self._bytes_cache.move_to_end(cache_key)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
 
     def read_byte_tail(
@@ -176,9 +188,11 @@ class OCIObjectStorageConnector:
 
         resolved = object_path.removeprefix("oci://")
         cache_key = f"{resolved}::tail:{length}"
-        if use_cache and cache_key in self._bytes_cache:
-            self._bytes_cache.move_to_end(cache_key)
-            return self._bytes_cache[cache_key]
+        if use_cache:
+            with self._bytes_cache_lock:
+                if cache_key in self._bytes_cache:
+                    self._bytes_cache.move_to_end(cache_key)
+                    return self._bytes_cache[cache_key]
 
         try:
             payload = self.client.get_object(
@@ -190,12 +204,13 @@ class OCIObjectStorageConnector:
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[cache_key] = payload
-            self._bytes_cache.move_to_end(cache_key)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[cache_key] = payload
+                self._bytes_cache.move_to_end(cache_key)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
 
     def _object_name_from_path(self, object_path: str) -> str:

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
@@ -30,7 +31,11 @@ async def get_dataset(dataset_id: str, request: Request) -> DatasetMeta:
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
         try:
-            ensure_catalog_entry_ready(entry, request.app.state.storage_connector)
+            await run_in_threadpool(
+                ensure_catalog_entry_ready,
+                entry,
+                request.app.state.storage_connector,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return entry.meta
@@ -49,7 +54,11 @@ async def list_variables(dataset_id: str, request: Request) -> list[VariableMeta
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
         try:
-            ensure_catalog_entry_metadata_ready(entry, request.app.state.storage_connector)
+            await run_in_threadpool(
+                ensure_catalog_entry_metadata_ready,
+                entry,
+                request.app.state.storage_connector,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return entry.meta.variables

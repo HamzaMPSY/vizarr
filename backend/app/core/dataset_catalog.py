@@ -1,5 +1,6 @@
 import base64
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,6 +31,7 @@ LANDSAT_BAND_NAMES = {
 
 
 logger = logging.getLogger(__name__)
+_MAX_PARALLEL_BAND_SAMPLES = 4
 
 
 @dataclass
@@ -234,6 +236,10 @@ def _resolve_direct_store_path(settings: Settings) -> str | None:
     return None
 
 
+def has_direct_store_target(settings: Settings) -> bool:
+    return _resolve_direct_store_path(settings) is not None
+
+
 def _read_dataset_metadata(
     connector: OCIObjectStorageConnector,
     store_path: str,
@@ -308,7 +314,7 @@ def build_dataset_manifest(catalog: dict[str, CatalogEntry]) -> list[DatasetMeta
     return [entry.meta.model_copy(deep=True) for entry in catalog.values()]
 
 
-def warm_catalog_index(app) -> dict[str, CatalogEntry]:
+def warm_catalog_index(app, eager_entry_state: bool = False) -> dict[str, CatalogEntry]:
     settings = app.state.settings
     connector = app.state.storage_connector
     if connector is None:
@@ -317,6 +323,12 @@ def warm_catalog_index(app) -> dict[str, CatalogEntry]:
         return {}
 
     catalog = build_catalog_index(settings=settings, connector=connector)
+    if eager_entry_state:
+        for entry in catalog.values():
+            try:
+                ensure_catalog_entry_ready(entry, connector)
+            except Exception as exc:
+                logger.warning("Skipping eager catalog warm-up for %s: %s", entry.path, exc)
     app.state.dataset_catalog = catalog
     app.state.dataset_manifest = build_dataset_manifest(catalog)
     logger.info("Built OCI dataset manifest with %d dataset(s)", len(app.state.dataset_manifest))
@@ -367,10 +379,19 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
 
         time_steps = int(metadata[data_array_name]["shape"][0]) if metadata[data_array_name]["shape"] else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
-        stats_samples = [
-            _sample_band_stats(connector, entry, band_index)
-            for band_index in range(len(entry.band_names))
-        ]
+        if len(entry.band_names) <= 1:
+            stats_samples = [
+                _sample_band_stats(connector, entry, band_index)
+                for band_index in range(len(entry.band_names))
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_BAND_SAMPLES, len(entry.band_names))) as executor:
+                stats_samples = list(
+                    executor.map(
+                        lambda band_index: _sample_band_stats(connector, entry, band_index),
+                        range(len(entry.band_names)),
+                    )
+                )
         entry.meta.variables = _build_variable_meta(
             entry.band_names,
             stats_samples=stats_samples,

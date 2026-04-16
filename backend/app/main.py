@@ -3,11 +3,13 @@ from contextlib import asynccontextmanager
 import xarray as xr
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from app.api.router import router as api_router
 from app.config import get_settings
 from app.core.cache import CacheClient
 from app.core.cache import connect_cache
+from app.core.dataset_catalog import has_direct_store_target
 from app.core.dataset_catalog import warm_catalog_index
 from app.core.datasets import build_registry
 from app.core.datasets import build_registry_from_dataset
@@ -55,7 +57,11 @@ async def lifespan(app: FastAPI):
                 dataset_description=dataset_description,
             )
         if not settings.oci_zarr_path:
-            warm_catalog_index(app)
+            await run_in_threadpool(
+                warm_catalog_index,
+                app,
+                has_direct_store_target(settings),
+            )
     else:
         app.state.registry = build_registry()
     app.state.planner_index.replace(build_index_records(app))
