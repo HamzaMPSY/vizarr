@@ -146,6 +146,54 @@ class OCIObjectStorageConnector:
                     self._bytes_cache_size -= len(evicted)
         return payload
 
+    def write_bytes(
+        self,
+        object_path: str,
+        payload: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        resolved = object_path.removeprefix("oci://")
+        self.client.put_object(
+            namespace_name=self.namespace,
+            bucket_name=self._settings.oci_bucket,
+            object_name=self._object_name_from_path(resolved),
+            put_object_body=payload,
+            content_type=content_type,
+        )
+        self._evict_cached_object(resolved)
+
+    def write_text(
+        self,
+        object_path: str,
+        payload: str,
+        *,
+        content_type: str = "application/json",
+    ) -> None:
+        resolved = object_path.removeprefix("oci://")
+        self.client.put_object(
+            namespace_name=self.namespace,
+            bucket_name=self._settings.oci_bucket,
+            object_name=self._object_name_from_path(resolved),
+            put_object_body=payload.encode("utf-8"),
+            content_type=content_type,
+        )
+        self._evict_cached_object(resolved)
+
+    def object_exists(self, object_path: str) -> bool:
+        resolved = object_path.removeprefix("oci://")
+        try:
+            self.client.head_object(
+                namespace_name=self.namespace,
+                bucket_name=self._settings.oci_bucket,
+                object_name=self._object_name_from_path(resolved),
+            )
+            return True
+        except oci.exceptions.ServiceError as error:
+            if error.status == 404:
+                return False
+            raise
+
     def read_byte_range(
         self,
         object_path: str,
@@ -221,6 +269,16 @@ class OCIObjectStorageConnector:
         if "/" in resolved and "@" in resolved.split("/", 1)[0]:
             return resolved.split("/", 1)[1]
         return resolved
+
+    def _evict_cached_object(self, resolved_path: str) -> None:
+        with self._text_cache_lock:
+            self._text_cache.pop(resolved_path, None)
+        with self._bytes_cache_lock:
+            keys_to_remove = [key for key in self._bytes_cache if key == resolved_path or key.startswith(f"{resolved_path}::")]
+            for key in keys_to_remove:
+                removed = self._bytes_cache.pop(key, None)
+                if removed is not None:
+                    self._bytes_cache_size -= len(removed)
 
     def list_objects(self, prefix: str | None = None, limit: int = 200) -> list[OCIObjectSummary]:
         effective_prefix = self._settings.oci_prefix if prefix is None else prefix

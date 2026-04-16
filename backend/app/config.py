@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     browse_local_cache_dir: str = ".cache/browse"
     browse_prewarm_enabled: bool = True
     browse_prewarm_all_variables: bool = False
+    browse_dev_fallback_enabled: bool = True
     interactive_max_clip_bands: int = 4
     interactive_max_clip_days: int = 31
     default_dataset_id: str = "demo-global"
@@ -27,6 +28,7 @@ class Settings(BaseSettings):
     oci_namespace: str = ""
     oci_bucket: str = ""
     oci_prefix: str = ""
+    oci_browse_prefix_root: str = "browse"
     oci_dataset_id: str = ""
     oci_dataset_name: str = ""
     oci_dataset_description: str = ""
