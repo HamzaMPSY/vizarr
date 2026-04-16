@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,7 +13,9 @@ from app.tools.parquet_to_zarr import _build_regular_axis
 from app.tools.parquet_to_zarr import _build_to_zarr_kwargs
 from app.tools.parquet_to_zarr import _build_grid_array
 from app.tools.parquet_to_zarr import _build_spatial_ref_attrs
+from app.tools.parquet_to_zarr import _coerce_numeric_series
 from app.tools.parquet_to_zarr import _detect_value_columns
+from app.tools.parquet_to_zarr import _encode_value_column
 from app.tools.parquet_to_zarr import _extract_existing_value_columns
 from app.tools.parquet_to_zarr import _extract_timestamps
 from app.tools.parquet_to_zarr import _initial_read_columns
@@ -67,6 +71,27 @@ def test_detect_value_columns_skips_coordinate_and_partition_fields() -> None:
         string_cell_aggregation="first",
     )
     assert _detect_value_columns(frame, config) == ("signal",)
+
+
+def test_coerce_numeric_series_accepts_decimal_objects() -> None:
+    series = pd.Series([Decimal("0.1"), Decimal("0.2"), None], dtype=object)
+
+    coerced = _coerce_numeric_series(series, "NDVI")
+
+    assert coerced is not None
+    assert pd.api.types.is_float_dtype(coerced)
+    assert coerced.tolist()[:2] == pytest.approx([0.1, 0.2])
+
+
+def test_encode_value_column_treats_decimal_objects_as_numeric() -> None:
+    frame = pd.DataFrame({"NDVI": [Decimal("0.1"), Decimal("0.2"), None]}, dtype=object)
+
+    encoded, dtype, attrs = _encode_value_column(frame, "NDVI", "float32")
+
+    assert dtype == "float32"
+    assert attrs == {}
+    np.testing.assert_allclose(encoded[:2], np.array([0.1, 0.2], dtype=np.float32))
+    assert np.isnan(encoded[2])
 
 
 def test_build_spatial_ref_attrs_includes_geotransform() -> None:

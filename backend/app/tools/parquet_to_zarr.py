@@ -337,6 +337,26 @@ def _mode_value(series: pd.Series) -> Any:
     return modes.iloc[0]
 
 
+def _coerce_numeric_series(series: pd.Series, column: str) -> pd.Series | None:
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+
+    non_null = series.dropna()
+    if non_null.empty:
+        return None
+
+    try:
+        coerced = pd.to_numeric(series, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+
+    if int(coerced.notna().sum()) != int(non_null.size):
+        return None
+
+    logger.info("Coerced value column %s from dtype=%s to numeric dtype=%s", column, series.dtype, coerced.dtype)
+    return coerced
+
+
 def _is_auth_error(error: BaseException) -> bool:
     current: BaseException | None = error
     while current is not None:
@@ -695,6 +715,9 @@ def _encode_value_column(
     target_dtype: str,
 ) -> tuple[np.ndarray, str, dict[str, Any]]:
     series = frame[column]
+    coerced_numeric = _coerce_numeric_series(series, column)
+    if coerced_numeric is not None:
+        series = coerced_numeric
     if pd.api.types.is_numeric_dtype(series):
         return series.to_numpy(dtype=target_dtype), target_dtype, {}
 
@@ -747,6 +770,10 @@ def _prepare_spatial_frame(
 ) -> pd.DataFrame:
     columns = [config.x_column, config.y_column, *value_columns]
     frame = _transform_coordinate_frame(df[columns].copy(), config)
+    for column in value_columns:
+        coerced_numeric = _coerce_numeric_series(frame[column], column)
+        if coerced_numeric is not None:
+            frame[column] = coerced_numeric
 
     if config.x_resolution is not None:
         frame[config.x_column] = _snap_to_resolution(
