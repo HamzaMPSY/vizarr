@@ -1,5 +1,7 @@
+import numpy as np
 import pytest
 
+from app.core.dataset_catalog import _time_labels_from_values
 from app.core.dataset_catalog import _select_projected_array_names
 from app.core.zarr_v3 import read_store_metadata
 
@@ -74,3 +76,12 @@ def test_read_store_metadata_falls_back_to_child_zarr_json_nodes(monkeypatch) ->
     assert store_metadata["zarr_format"] == 3
     assert sorted(metadata) == ["band", "bands", "x"]
     assert metadata["bands"]["dimension_names"] == ["time", "band", "y", "x"]
+
+
+def test_time_labels_from_nanosecond_epoch_values_returns_iso_dates() -> None:
+    labels = _time_labels_from_values(
+        values=np.array([1736294400000000000, 1736899200000000000], dtype="int64"),
+        attributes={"units": "nanoseconds since 1970-01-01T00:00:00", "calendar": "proleptic_gregorian"},
+    )
+
+    assert labels == ["2025-01-08", "2025-01-15"]

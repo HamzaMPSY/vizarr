@@ -30,3 +30,4 @@ class DatasetMeta(BaseModel):
     variables: list[VariableMeta]
     bounds: DatasetBounds | None = None
     native_resolution_m: float | None = None
+    time_values: list[str] | None = None

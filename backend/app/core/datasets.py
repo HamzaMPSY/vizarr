@@ -124,6 +124,7 @@ def build_metadata(
         variables=variables,
         bounds=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
         native_resolution_m=_estimate_native_resolution_m(dataset),
+        time_values=_time_labels_from_values(np.asarray(dataset.coords["time"].values)) if "time" in dataset.coords else None,
     )
 
 
@@ -187,3 +188,11 @@ def _median_axis_step(values: np.ndarray) -> float | None:
     if finite.size == 0:
         return None
     return float(np.median(finite))
+
+
+def _time_labels_from_values(values: np.ndarray) -> list[str]:
+    if values.size == 0:
+        return []
+    if np.issubdtype(values.dtype, np.datetime64):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    return [str(value.item() if hasattr(value, "item") else value) for value in values]

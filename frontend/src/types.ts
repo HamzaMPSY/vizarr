@@ -26,4 +26,5 @@ export interface DatasetMeta {
   description: string;
   variables: VariableMeta[];
   bounds?: DatasetBounds | null;
+  time_values?: string[] | null;
 }

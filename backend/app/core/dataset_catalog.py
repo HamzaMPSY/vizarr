@@ -379,6 +379,15 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
 
         time_steps = int(metadata[data_array_name]["shape"][0]) if metadata[data_array_name]["shape"] else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
+        if "time" in metadata:
+            time_meta = parse_array_metadata(metadata["time"])
+            time_values = load_1d_numeric_array(
+                connector=connector,
+                store_path=entry.path,
+                array_name="time",
+                metadata=time_meta,
+            )
+            entry.meta.time_values = _time_labels_from_values(time_values, metadata["time"].get("attributes", {}))
         if len(entry.band_names) <= 1:
             stats_samples = [
                 _sample_band_stats(connector, entry, band_index)
@@ -502,3 +511,15 @@ def _axis_resolution(values: np.ndarray, preferred: float | None = None) -> floa
     if finite.size == 0:
         return None
     return float(np.median(finite))
+
+
+def _time_labels_from_values(values: np.ndarray, attributes: dict[str, object]) -> list[str]:
+    if values.size == 0:
+        return []
+
+    units = str(attributes.get("units", ""))
+    if values.dtype == np.dtype(np.int64) and units.startswith("nanoseconds since 1970-01-01T00:00:00"):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    if np.issubdtype(values.dtype, np.datetime64):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    return [str(value.item() if hasattr(value, "item") else value) for value in values]
