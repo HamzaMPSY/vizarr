@@ -85,6 +85,7 @@ def _records_from_meta(
     browse_styles: list[str],
     version: str,
     crs: str | None,
+    native_resolution_m: float | None = None,
 ) -> list[CubeIndexRecord]:
     bands = tuple(item.id for item in meta.variables)
     records = [
@@ -96,6 +97,7 @@ def _records_from_meta(
             bands=bands,
             version=version,
             bbox_wgs84=meta.bounds,
+            native_resolution_m=native_resolution_m if native_resolution_m is not None else meta.native_resolution_m,
             crs=crs,
         ),
         CubeIndexRecord(
@@ -106,6 +108,7 @@ def _records_from_meta(
             bands=bands,
             version=version,
             bbox_wgs84=meta.bounds,
+            native_resolution_m=native_resolution_m if native_resolution_m is not None else meta.native_resolution_m,
             crs=crs,
         ),
         CubeIndexRecord(
@@ -116,6 +119,7 @@ def _records_from_meta(
             bands=bands,
             version=version,
             bbox_wgs84=meta.bounds,
+            native_resolution_m=native_resolution_m if native_resolution_m is not None else meta.native_resolution_m,
             crs=crs,
         ),
     ]
@@ -129,6 +133,7 @@ def _records_from_meta(
                 bands=bands,
                 version=version,
                 bbox_wgs84=meta.bounds,
+                native_resolution_m=native_resolution_m if native_resolution_m is not None else meta.native_resolution_m,
                 style=style,
                 crs=crs,
             )

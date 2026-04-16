@@ -29,3 +29,4 @@ class DatasetMeta(BaseModel):
     description: str
     variables: list[VariableMeta]
     bounds: DatasetBounds | None = None
+    native_resolution_m: float | None = None

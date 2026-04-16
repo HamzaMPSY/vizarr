@@ -15,6 +15,7 @@ class CubeIndexRecord:
     bands: tuple[str, ...]
     version: str
     bbox_wgs84: DatasetBounds | None = None
+    native_resolution_m: float | None = None
     time_start: date | None = None
     time_end: date | None = None
     style: str | None = None

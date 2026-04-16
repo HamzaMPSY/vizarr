@@ -146,6 +146,92 @@ def test_tile_plan_prefers_serving_above_zoom_threshold() -> None:
     assert plan.selected_cube == "sentinel2:serving"
 
 
+def test_tile_plan_uses_native_resolution_to_keep_browse_for_still_coarse_view() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=10,
+        x=512,
+        y=512,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.chosen_representation == "browse"
+    assert "15.3x coarser" in plan.notes[1]
+
+
+def test_tile_plan_uses_native_resolution_to_choose_serving_for_coarse_dataset() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=500.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=500.0,
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=7,
+        x=64,
+        y=64,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.chosen_representation == "serving"
+    assert "2.4x coarser" in plan.notes[1]
+
+
 def test_clip_plan_reroutes_oversized_requests_to_batch() -> None:
     planner = PlannerService(
         Settings(),

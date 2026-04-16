@@ -33,7 +33,7 @@ def test_get_tile() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/webp"
     assert response.headers["x-cache-status"] in {"MISS", "HIT"}
-    assert response.headers["x-representation"] == "browse"
+    assert response.headers["x-representation"] == "serving"
     assert len(response.content) > 100
 
 

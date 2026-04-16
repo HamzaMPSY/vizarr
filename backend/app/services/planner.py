@@ -1,7 +1,7 @@
 import hashlib
 import json
 from datetime import date
-from math import ceil
+from math import ceil, cos, pi
 import re
 
 from app.config import Settings
@@ -42,6 +42,7 @@ class PlannerService:
             "params": params,
         }
         bbox = tile_to_bbox(z, x, y)
+        requested_resolution_m = _tile_resolution_meters_per_pixel(bbox, z)
         candidates = self._index.find_candidates(
             collection_id=collection_id,
             bands=[str(params.get("variable"))],
@@ -53,6 +54,7 @@ class PlannerService:
             style=style,
             candidates=candidates,
             z=z,
+            requested_resolution_m=requested_resolution_m,
         )
         return self._build_plan(
             collection_id=collection_id,
@@ -63,7 +65,13 @@ class PlannerService:
             candidates=selected_candidates,
             expected_chunk_count=max(1, len(selected_candidates) * int(params.get("band_count", 1))),
             notes=_append_candidate_note(
-                base=["Tile requests stay on the interactive plane."],
+                base=[
+                    "Tile requests stay on the interactive plane.",
+                    _tile_resolution_note(
+                        requested_resolution_m=requested_resolution_m,
+                        native_resolution_m=_native_resolution_meters(candidates),
+                    ),
+                ],
                 candidates=selected_candidates,
             ),
         )
@@ -213,12 +221,17 @@ class PlannerService:
         style: str | None,
         candidates: list[CubeIndexRecord],
         z: int | None,
+        requested_resolution_m: float | None = None,
     ) -> tuple[list[CubeIndexRecord], str]:
         if request_class == "export":
             priorities = ("source",)
         elif request_class in {"tile", "preview"}:
-            if request_class == "tile" and (z is None or z > self._settings.browse_tile_max_zoom):
-                priorities = ("serving", "source", "browse")
+            if request_class == "tile":
+                priorities = self._tile_representation_priorities(
+                    candidates=candidates,
+                    z=z,
+                    requested_resolution_m=requested_resolution_m,
+                )
             else:
                 priorities = ("browse", "serving", "source")
         else:
@@ -233,6 +246,30 @@ class PlannerService:
 
         fallback_representation = priorities[-1]
         return [], fallback_representation
+
+    def _tile_representation_priorities(
+        self,
+        *,
+        candidates: list[CubeIndexRecord],
+        z: int | None,
+        requested_resolution_m: float | None,
+    ) -> tuple[str, ...]:
+        browse_candidates = [item for item in candidates if item.representation == "browse"]
+        serving_candidates = [item for item in candidates if item.representation == "serving"]
+        source_candidates = [item for item in candidates if item.representation == "source"]
+        native_resolution_m = _native_resolution_meters(serving_candidates or source_candidates or candidates)
+
+        if requested_resolution_m is not None and native_resolution_m is not None and browse_candidates:
+            browse_threshold = native_resolution_m * self._settings.browse_tile_native_resolution_ratio
+            serving_threshold = native_resolution_m * self._settings.serving_tile_native_resolution_ratio
+            if requested_resolution_m >= browse_threshold:
+                return ("browse", "serving", "source")
+            if requested_resolution_m <= serving_threshold:
+                return ("serving", "source", "browse")
+
+        if z is None or z > self._settings.browse_tile_max_zoom:
+            return ("serving", "source", "browse")
+        return ("browse", "serving", "source")
 
     def _build_plan(
         self,
@@ -296,3 +333,30 @@ def _append_candidate_note(
     if candidates:
         return base + [f"Planner pruned to {len(candidates)} candidate cube(s) before execution."]
     return base + ["Planner found no matching indexed cube candidates."]
+
+
+def _tile_resolution_meters_per_pixel(bbox: tuple[float, float, float, float], z: int) -> float:
+    _west, south, _east, north = bbox
+    center_lat = max(min((south + north) / 2.0, 85.05112878), -85.05112878)
+    return 156543.03392804097 * cos(center_lat * pi / 180.0) / (2**z)
+
+
+def _native_resolution_meters(candidates: list[CubeIndexRecord]) -> float | None:
+    values = [item.native_resolution_m for item in candidates if item.native_resolution_m is not None and item.native_resolution_m > 0]
+    if not values:
+        return None
+    return min(values)
+
+
+def _tile_resolution_note(
+    *,
+    requested_resolution_m: float,
+    native_resolution_m: float | None,
+) -> str:
+    if native_resolution_m is None:
+        return f"Requested tile scale is about {requested_resolution_m:.1f} m/px; planner fell back to zoom policy."
+    ratio = requested_resolution_m / native_resolution_m
+    return (
+        f"Requested tile scale is about {requested_resolution_m:.1f} m/px versus native {native_resolution_m:.1f} m/px "
+        f"({ratio:.1f}x coarser)."
+    )

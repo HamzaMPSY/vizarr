@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 
 from app.config import Settings
 from app.core.datasets import _stats
@@ -434,6 +434,14 @@ def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectS
             crs_wkt=entry.crs_wkt,
             geo_transform=entry.geo_transform,
         )
+    if entry.meta.native_resolution_m is None and entry.x_values is not None and entry.y_values is not None:
+        entry.meta.native_resolution_m = _estimate_native_resolution_m(
+            x_values=entry.x_values,
+            y_values=entry.y_values,
+            crs_wkt=entry.crs_wkt,
+            geo_transform=entry.geo_transform,
+            bounds=entry.meta.bounds,
+        )
 
     return entry
 
@@ -448,3 +456,49 @@ def get_or_build_catalog(app) -> dict[str, CatalogEntry]:
         return existing
 
     return warm_catalog_index(app)
+
+
+def _estimate_native_resolution_m(
+    *,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    crs_wkt: str | None,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+    bounds: DatasetBounds | None,
+) -> float | None:
+    x_step = _axis_resolution(x_values, preferred=abs(geo_transform[1]) if geo_transform is not None else None)
+    y_step = _axis_resolution(y_values, preferred=abs(geo_transform[5]) if geo_transform is not None else None)
+    samples = [value for value in (x_step, y_step) if value is not None and value > 0]
+    if not samples:
+        return None
+
+    if crs_wkt:
+        crs = CRS.from_wkt(crs_wkt)
+        if crs.is_projected and crs.axis_info:
+            conversion = float(crs.axis_info[0].unit_conversion_factor or 1.0)
+            return float(sum(samples) / len(samples) * conversion)
+
+    center_lon = 0.0 if bounds is None else (bounds.west + bounds.east) / 2.0
+    center_lat = 0.0 if bounds is None else (bounds.south + bounds.north) / 2.0
+    geod = Geod(ellps="WGS84")
+    metric_samples: list[float] = []
+    if x_step is not None and x_step > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon + x_step], [center_lat, center_lat])))
+    if y_step is not None and y_step > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon], [center_lat, center_lat + y_step])))
+    metric_samples = [value for value in metric_samples if value > 0]
+    if not metric_samples:
+        return None
+    return float(sum(metric_samples) / len(metric_samples))
+
+
+def _axis_resolution(values: np.ndarray, preferred: float | None = None) -> float | None:
+    if preferred is not None and preferred > 0:
+        return float(preferred)
+    if values.size < 2:
+        return None
+    diffs = np.abs(np.diff(values.astype(np.float64, copy=False)))
+    finite = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if finite.size == 0:
+        return None
+    return float(np.median(finite))

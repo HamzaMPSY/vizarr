@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     planner_version: str = "v1"
     browse_enabled_styles: str = "ndvi-default,rgb-default"
     browse_tile_max_zoom: int = 8
+    browse_tile_native_resolution_ratio: float = 12.0
+    serving_tile_native_resolution_ratio: float = 6.0
     browse_overview_max_size: int = 1536
     browse_local_cache_dir: str = ".cache/browse"
     browse_prewarm_enabled: bool = True
