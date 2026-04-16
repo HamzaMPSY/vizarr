@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from dataclasses import replace
@@ -39,6 +40,8 @@ DEFAULT_WRITE_BATCH = 10
 DEFAULT_MAX_GRID_CELLS = 50_000_000
 DEFAULT_CHUNK_SIZE = 256
 DEFAULT_ZARR_V3_SHARD_SIZE = 4096
+DEFAULT_TRANSIENT_READ_RETRIES = 3
+DEFAULT_TRANSIENT_READ_RETRY_DELAY_SECONDS = 2.0
 GRID_COORD_DECIMALS = 12
 
 
@@ -375,6 +378,42 @@ def _raise_auth_expired(error: BaseException) -> None:
     ) from error
 
 
+def _is_transient_read_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (ConnectionError, TimeoutError, OSError)):
+            return True
+        message = str(current)
+        if (
+            "Remote end closed connection without response" in message
+            or "Connection aborted" in message
+            or "ProtocolError" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _read_table_with_retries(read_fn, parquet_uri: str):
+    for attempt in range(1, DEFAULT_TRANSIENT_READ_RETRIES + 1):
+        try:
+            return read_fn()
+        except Exception as error:
+            if _is_auth_error(error):
+                logger.error("OCI auth failure while reading parquet dataset %s", parquet_uri)
+                _raise_auth_expired(error)
+            if attempt >= DEFAULT_TRANSIENT_READ_RETRIES or not _is_transient_read_error(error):
+                raise
+            logger.warning(
+                "Transient parquet read failure for %s on attempt %d/%d: %s",
+                parquet_uri,
+                attempt,
+                DEFAULT_TRANSIENT_READ_RETRIES,
+                error,
+            )
+            time.sleep(DEFAULT_TRANSIENT_READ_RETRY_DELAY_SECONDS * attempt)
+
+
 def _read_partitioned_parquet(
     filesystem: Any,
     parquet_uri: str,
@@ -391,13 +430,7 @@ def _read_partitioned_parquet(
         partitioning="hive",
     )
     logger.debug("Reading parquet dataset at %s", parquet_uri)
-    try:
-        table = dataset.to_table(columns=columns)
-    except Exception as error:
-        if _is_auth_error(error):
-            logger.error("OCI auth failure while reading parquet dataset %s", parquet_uri)
-            _raise_auth_expired(error)
-        raise
+    table = _read_table_with_retries(lambda: dataset.to_table(columns=columns), parquet_uri)
     frame = table.to_pandas()
     logger.info(
         "Read parquet dataset %s with %d row(s), %d column(s)",

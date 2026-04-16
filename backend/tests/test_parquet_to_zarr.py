@@ -19,6 +19,8 @@ from app.tools.parquet_to_zarr import _encode_value_column
 from app.tools.parquet_to_zarr import _extract_existing_value_columns
 from app.tools.parquet_to_zarr import _extract_timestamps
 from app.tools.parquet_to_zarr import _initial_read_columns
+from app.tools.parquet_to_zarr import _is_transient_read_error
+from app.tools.parquet_to_zarr import _read_table_with_retries
 from app.tools.parquet_to_zarr import _grid_dataset
 from app.tools.parquet_to_zarr import _prepare_spatial_frame
 from app.tools.parquet_to_zarr import _resolve_snap_origins
@@ -92,6 +94,28 @@ def test_encode_value_column_treats_decimal_objects_as_numeric() -> None:
     assert attrs == {}
     np.testing.assert_allclose(encoded[:2], np.array([0.1, 0.2], dtype=np.float32))
     assert np.isnan(encoded[2])
+
+
+def test_is_transient_read_error_detects_remote_disconnect() -> None:
+    error = ConnectionError("Remote end closed connection without response")
+
+    assert _is_transient_read_error(error) is True
+
+
+def test_read_table_with_retries_retries_transient_failure(monkeypatch) -> None:
+    monkeypatch.setattr("app.tools.parquet_to_zarr.time.sleep", lambda *_args, **_kwargs: None)
+    attempts = {"count": 0}
+
+    def flaky_read():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionError("Connection aborted.")
+        return "ok"
+
+    result = _read_table_with_retries(flaky_read, "oci://Ayoub@test/maize.parquet")
+
+    assert result == "ok"
+    assert attempts["count"] == 2
 
 
 def test_build_spatial_ref_attrs_includes_geotransform() -> None:
