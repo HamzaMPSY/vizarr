@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import maplibregl from "maplibre-gl";
 import Map, { Layer, Source } from "react-map-gl/maplibre";
@@ -33,6 +33,7 @@ export function MapView() {
   const { datasetId, variable, timeIndex, colormap, vmin, vmax, viewState, setViewState } = useMapStore();
   const { data: dataset } = useDataset(datasetId);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  const [mapLoaded, setMapLoaded] = useState(false);
   const tileTemplate =
     datasetId && variable
       ? buildTileUrl({ datasetId, variable, timeIndex, colormap, vmin, vmax })
@@ -44,26 +45,51 @@ export function MapView() {
   const tileLayerId = tileSourceId ? `${tileSourceId}:layer` : null;
 
   useEffect(() => {
-    if (!dataset?.bounds || !mapRef.current) {
+    if (!dataset?.bounds || !mapRef.current || !mapLoaded) {
       return;
     }
 
-    mapRef.current.fitBounds(
+    const camera = mapRef.current.cameraForBounds(
       [
         [dataset.bounds.west, dataset.bounds.south],
         [dataset.bounds.east, dataset.bounds.north]
       ],
       {
         padding: 40,
-        duration: 0
+        maxZoom: 12
       }
     );
-  }, [dataset?.bounds]);
+
+    if (!camera) {
+      return;
+    }
+
+    if (!camera.center) {
+      return;
+    }
+
+    const center = maplibregl.LngLat.convert(camera.center);
+    setViewState({
+      longitude: center.lng,
+      latitude: center.lat,
+      zoom: camera.zoom ?? viewState.zoom,
+      pitch: 0,
+      bearing: 0
+    });
+  }, [
+    dataset?.id,
+    dataset?.bounds?.west,
+    dataset?.bounds?.south,
+    dataset?.bounds?.east,
+    dataset?.bounds?.north,
+    mapLoaded,
+    viewState.zoom,
+    setViewState
+  ]);
 
   return (
     <div className="map-shell">
       <Map
-        key={tileSourceId ?? "vizarr-map"}
         mapLib={maplibregl}
         ref={(instance) => {
           mapRef.current = instance?.getMap() ?? null;
@@ -74,6 +100,7 @@ export function MapView() {
         zoom={viewState.zoom}
         pitch={viewState.pitch}
         bearing={viewState.bearing}
+        onLoad={() => setMapLoaded(true)}
         onMove={(event) =>
           setViewState({
             longitude: event.viewState.longitude,
