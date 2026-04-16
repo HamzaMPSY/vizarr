@@ -62,6 +62,90 @@ def test_preview_plan_prefers_browse_for_known_styles() -> None:
     assert plan.selected_cube == "sentinel2:browse:ndvi-default"
 
 
+def test_tile_plan_prefers_browse_below_zoom_threshold() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=6,
+        x=32,
+        y=30,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.request_class == "tile"
+    assert plan.chosen_representation == "browse"
+    assert plan.selected_cube == "sentinel2:browse"
+
+
+def test_tile_plan_prefers_serving_above_zoom_threshold() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=12,
+        x=2048,
+        y=2048,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.request_class == "tile"
+    assert plan.chosen_representation == "serving"
+    assert plan.selected_cube == "sentinel2:serving"
+
+
 def test_clip_plan_reroutes_oversized_requests_to_batch() -> None:
     planner = PlannerService(
         Settings(),

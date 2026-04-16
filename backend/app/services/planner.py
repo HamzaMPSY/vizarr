@@ -52,6 +52,7 @@ class PlannerService:
             request_class="tile",
             style=style,
             candidates=candidates,
+            z=z,
         )
         return self._build_plan(
             collection_id=collection_id,
@@ -82,6 +83,7 @@ class PlannerService:
             request_class="preview",
             style=request.style,
             candidates=candidates,
+            z=None,
         )
         return self._build_plan(
             collection_id=request.collection_id,
@@ -110,6 +112,7 @@ class PlannerService:
             request_class="stats",
             style=None,
             candidates=candidates,
+            z=None,
         )
         return self._build_plan(
             collection_id=request.collection_id,
@@ -148,6 +151,7 @@ class PlannerService:
             request_class="small_clip",
             style=None,
             candidates=candidates,
+            z=None,
         )
         representation = "source" if execution_path == "batch" else interactive_representation
         if execution_path == "batch":
@@ -183,6 +187,7 @@ class PlannerService:
             request_class="export",
             style=None,
             candidates=candidates,
+            z=None,
         )
         return self._build_plan(
             collection_id=request.collection_id,
@@ -207,17 +212,21 @@ class PlannerService:
         request_class: str,
         style: str | None,
         candidates: list[CubeIndexRecord],
+        z: int | None,
     ) -> tuple[list[CubeIndexRecord], str]:
         if request_class == "export":
             priorities = ("source",)
         elif request_class in {"tile", "preview"}:
-            priorities = ("browse", "serving", "source")
+            if request_class == "tile" and (z is None or z > self._settings.browse_tile_max_zoom):
+                priorities = ("serving", "source", "browse")
+            else:
+                priorities = ("browse", "serving", "source")
         else:
             priorities = ("serving", "source", "browse")
 
         for representation in priorities:
             subset = [item for item in candidates if item.representation == representation]
-            if representation == "browse" and style is not None:
+            if request_class == "preview" and representation == "browse" and style is not None:
                 subset = [item for item in subset if item.style == style]
             if subset:
                 return subset, representation

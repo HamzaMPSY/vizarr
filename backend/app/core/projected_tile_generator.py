@@ -16,7 +16,7 @@ WEB_MERCATOR_RADIUS = WEB_MERCATOR_HALF_WORLD / math.pi
 TILE_SIZE = 256
 
 
-def _xyz_to_web_mercator_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+def xyz_to_web_mercator_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
     n = 2**z
     west = x / n * (2 * WEB_MERCATOR_HALF_WORLD) - WEB_MERCATOR_HALF_WORLD
     east = (x + 1) / n * (2 * WEB_MERCATOR_HALF_WORLD) - WEB_MERCATOR_HALF_WORLD
@@ -25,29 +25,31 @@ def _xyz_to_web_mercator_bbox(z: int, x: int, y: int) -> tuple[float, float, flo
     return west, south, east, north
 
 
-def _tile_pixel_centers(
+def _pixel_centers(
     bbox: tuple[float, float, float, float],
-    tile_size: int = TILE_SIZE,
+    width: int,
+    height: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     west, south, east, north = bbox
-    pixel_width = (east - west) / tile_size
-    pixel_height = (north - south) / tile_size
+    pixel_width = (east - west) / width
+    pixel_height = (north - south) / height
 
-    xs = west + (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_width
-    ys = north - (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_height
+    xs = west + (np.arange(width, dtype=np.float64) + 0.5) * pixel_width
+    ys = north - (np.arange(height, dtype=np.float64) + 0.5) * pixel_height
     return np.meshgrid(xs, ys)
 
 
-def _tile_pixel_center_axes(
+def _pixel_center_axes(
     bbox: tuple[float, float, float, float],
-    tile_size: int = TILE_SIZE,
+    width: int,
+    height: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     west, south, east, north = bbox
-    pixel_width = (east - west) / tile_size
-    pixel_height = (north - south) / tile_size
+    pixel_width = (east - west) / width
+    pixel_height = (north - south) / height
 
-    xs = west + (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_width
-    ys = north - (np.arange(tile_size, dtype=np.float64) + 0.5) * pixel_height
+    xs = west + (np.arange(width, dtype=np.float64) + 0.5) * pixel_width
+    ys = north - (np.arange(height, dtype=np.float64) + 0.5) * pixel_height
     return xs, ys
 
 
@@ -328,18 +330,54 @@ def _resolve_display_range(
     )
 
 
-def generate_projected_band_tile(
+def resolve_projected_display_range(
+    entry: CatalogEntry,
+    variable: str,
+    data: np.ndarray,
+    vmin: float | None,
+    vmax: float | None,
+) -> tuple[float, float]:
+    selected = next(item for item in entry.meta.variables if item.id == variable)
+    return _resolve_display_range(
+        data=data,
+        fallback_vmin=selected.stats.p02,
+        fallback_vmax=selected.stats.p98,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+
+def sample_web_mercator_array(
+    data: np.ndarray,
+    data_bbox: tuple[float, float, float, float],
+    target_bbox: tuple[float, float, float, float],
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    data_height, data_width = data.shape
+    target_xs, target_ys = _pixel_centers(target_bbox, width=width, height=height)
+    data_west, data_south, data_east, data_north = data_bbox
+    data_width_span = data_east - data_west
+    data_height_span = data_north - data_south
+    if math.isclose(data_width_span, 0.0) or math.isclose(data_height_span, 0.0):
+        return np.full((height, width), np.nan, dtype=np.float32)
+
+    x_idx = ((target_xs - data_west) / data_width_span) * data_width - 0.5
+    y_idx = ((data_north - target_ys) / data_height_span) * data_height - 0.5
+    return _bilinear_sample(data=data.astype(np.float32, copy=False), y_idx=y_idx, x_idx=x_idx)
+
+
+def render_projected_band_array(
     connector: OCIObjectStorageConnector,
     entry: CatalogEntry,
     variable: str,
-    z: int,
-    x: int,
-    y: int,
+    bbox: tuple[float, float, float, float],
+    *,
+    width: int,
+    height: int,
     time_index: int,
-    colormap: str,
-    vmin: float | None,
-    vmax: float | None,
-) -> tuple[bytes, tuple[float, float]]:
+) -> np.ndarray:
     entry = ensure_catalog_entry_ready(entry, connector)
     x_values = entry.x_values
     y_values = entry.y_values
@@ -348,9 +386,8 @@ def generate_projected_band_tile(
     assert entry.data_array_meta is not None
 
     band_index = entry.band_indices[variable]
-    web_bbox = _xyz_to_web_mercator_bbox(z, x, y)
     if _is_fast_latlon_entry(entry):
-        mercator_x_axis, mercator_y_axis = _tile_pixel_center_axes(web_bbox)
+        mercator_x_axis, mercator_y_axis = _pixel_center_axes(bbox, width=width, height=height)
         lon_values = _web_mercator_x_to_lon(mercator_x_axis)
         lat_values = _web_mercator_y_to_lat(mercator_y_axis)
         affine_axes = _fractional_indices_from_north_up_geotransform_axes(
@@ -360,8 +397,8 @@ def generate_projected_band_tile(
         )
         assert affine_axes is not None
         x_idx_axis, y_idx_axis = affine_axes
-        x_idx_full = np.broadcast_to(x_idx_axis[np.newaxis, :], (TILE_SIZE, TILE_SIZE))
-        y_idx_full = np.broadcast_to(y_idx_axis[:, np.newaxis], (TILE_SIZE, TILE_SIZE))
+        x_idx_full = np.broadcast_to(x_idx_axis[np.newaxis, :], (height, width))
+        y_idx_full = np.broadcast_to(y_idx_axis[:, np.newaxis], (height, width))
         window_bounds = _source_window_bounds_from_axis_indices(
             x_idx=x_idx_axis,
             y_idx=y_idx_axis,
@@ -370,7 +407,7 @@ def generate_projected_band_tile(
         )
         source_xs = source_ys = None
     else:
-        mercator_xs, mercator_ys = _tile_pixel_centers(web_bbox)
+        mercator_xs, mercator_ys = _pixel_centers(bbox, width=width, height=height)
         target_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
         transformer = _transformer_from_mercator(target_crs.to_wkt())
         source_xs, source_ys = transformer.transform(
@@ -400,16 +437,7 @@ def generate_projected_band_tile(
             )
 
     if window_bounds is None:
-        empty = np.full((TILE_SIZE, TILE_SIZE), np.nan, dtype=np.float32)
-        selected = next(item for item in entry.meta.variables if item.id == variable)
-        actual_vmin, actual_vmax = _resolve_display_range(
-            data=empty,
-            fallback_vmin=selected.stats.p02,
-            fallback_vmax=selected.stats.p98,
-            vmin=vmin,
-            vmax=vmax,
-        )
-        return encode_tile(empty, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)
+        return np.full((height, width), np.nan, dtype=np.float32)
 
     x_start, x_stop, y_start, y_stop = window_bounds
     window = load_4d_window(
@@ -435,18 +463,33 @@ def generate_projected_band_tile(
         assert source_ys is not None
         x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
         y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
-    reprojected = _bilinear_sample(
+    return _bilinear_sample(
         data=window,
         y_idx=y_idx,
         x_idx=x_idx,
     )
 
-    selected = next(item for item in entry.meta.variables if item.id == variable)
-    actual_vmin, actual_vmax = _resolve_display_range(
-        data=reprojected,
-        fallback_vmin=selected.stats.p02,
-        fallback_vmax=selected.stats.p98,
-        vmin=vmin,
-        vmax=vmax,
+
+def generate_projected_band_tile(
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    variable: str,
+    z: int,
+    x: int,
+    y: int,
+    time_index: int,
+    colormap: str,
+    vmin: float | None,
+    vmax: float | None,
+) -> tuple[bytes, tuple[float, float]]:
+    reprojected = render_projected_band_array(
+        connector=connector,
+        entry=entry,
+        variable=variable,
+        bbox=xyz_to_web_mercator_bbox(z, x, y),
+        width=TILE_SIZE,
+        height=TILE_SIZE,
+        time_index=time_index,
     )
+    actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, reprojected, vmin, vmax)
     return encode_tile(reprojected, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)

@@ -85,6 +85,16 @@ def _records_from_meta(
     bands = tuple(item.id for item in meta.variables)
     records = [
         CubeIndexRecord(
+            cube_id=f"{collection_id}:browse",
+            collection_id=collection_id,
+            representation="browse",
+            path=browse_path_root,
+            bands=bands,
+            version=version,
+            bbox_wgs84=meta.bounds,
+            crs=crs,
+        ),
+        CubeIndexRecord(
             cube_id=f"{collection_id}:source",
             collection_id=collection_id,
             representation="source",

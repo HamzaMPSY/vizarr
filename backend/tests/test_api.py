@@ -33,6 +33,7 @@ def test_get_tile() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/webp"
     assert response.headers["x-cache-status"] in {"MISS", "HIT"}
+    assert response.headers["x-representation"] == "browse"
     assert len(response.content) > 100
 
 
@@ -44,3 +45,10 @@ def test_get_tile_hits_memory_cache_on_second_request() -> None:
     assert second.status_code == 200
     assert second.headers["x-cache-status"] == "HIT"
     assert second.content == first.content
+
+
+def test_high_zoom_tile_prefers_serving_representation() -> None:
+    response = client.get("/api/tiles/demo-global/temperature/10/512/512")
+
+    assert response.status_code == 200
+    assert response.headers["x-representation"] == "serving"

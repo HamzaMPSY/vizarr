@@ -49,7 +49,7 @@ class PlannerIndex:
                 continue
             if required_bands and record.bands and not required_bands.issubset(set(record.bands)):
                 continue
-            if style is not None and record.representation == "browse" and record.style != style:
+            if style is not None and record.representation == "browse" and record.style is not None and record.style != style:
                 continue
             if bbox is not None and record.bbox_wgs84 is not None and not _bboxes_intersect(record.bbox_wgs84, bbox):
                 continue
