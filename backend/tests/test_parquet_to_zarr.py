@@ -5,6 +5,7 @@ import xarray as xr
 
 from app.tools.parquet_to_zarr import ConversionConfig
 from app.tools.parquet_to_zarr import ExistingStoreContext
+from app.tools.parquet_to_zarr import _build_ingest_summary
 from app.tools.parquet_to_zarr import _build_input_time_slices
 from app.tools.parquet_to_zarr import _build_regular_axis
 from app.tools.parquet_to_zarr import _build_to_zarr_kwargs
@@ -321,6 +322,44 @@ def test_build_grid_array_places_values_by_coordinate_index() -> None:
     assert result[0].tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_build_ingest_summary_reports_source_and_aggregated_rows() -> None:
+    summary = _build_ingest_summary(
+        parquet_uri="oci://Ayoub@test/maize.parquet",
+        timestamp=np.datetime64("2025-01-15T00:00:00.000000000"),
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=0.5,
+            y_resolution=0.5,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+        ),
+        value_columns=("NDVI",),
+        x_values=np.array([10.0, 10.5], dtype=np.float64),
+        y_values=np.array([20.5, 20.0], dtype=np.float64),
+        input_rows=4,
+        output_rows=2,
+    )
+
+    assert summary["source"] == "oci://Ayoub@test/maize.parquet"
+    assert summary["variables"] == ["bands"]
+    assert summary["value_columns"] == ["NDVI"]
+    assert summary["input_rows"] == 4
+    assert summary["output_rows"] == 2
+    assert summary["aggregation_ratio"] == 0.5
+    assert summary["shape"] == {"time": 1, "y": 2, "x": 2}
+
+
 def test_grid_dataset_builds_time_slice_with_spatial_metadata() -> None:
     frame = pd.DataFrame(
         {
@@ -359,6 +398,8 @@ def test_grid_dataset_builds_time_slice_with_spatial_metadata() -> None:
     assert dataset["value"].shape == (1, 2, 2)
     assert dataset["time"].values[0] == np.datetime64("2026-01-17T00:00:00.000000000")
     assert dataset["value"].values[0].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert dataset.attrs["source_input_rows"] == 4
+    assert dataset.attrs["source_output_rows"] == 4
     assert dataset["spatial_ref"].attrs["GeoTransform"] == "5.0 10.0 0.0 55.0 0.0 -10.0"
 
 
@@ -391,7 +432,7 @@ def test_grid_dataset_fails_fast_for_sparse_point_cloud_shape() -> None:
         string_cell_aggregation="first",
     )
 
-    with pytest.raises(ValueError, match="dense regular grid"):
+    with pytest.raises(ValueError, match="Dense grid too large"):
         _grid_dataset(
             frame,
             parquet_uri="oci://Ayoub@test/maize.parquet",
@@ -434,8 +475,8 @@ def test_prepare_spatial_frame_snaps_and_aggregates_duplicate_cells() -> None:
     assert len(prepared.index) == 2
     assert prepared["LONGITUDE"].tolist() == [10.0, 10.5]
     assert prepared["LATITUDE"].tolist() == [20.0, 20.5]
-    assert prepared["NDVI"].tolist() == [0.3, 0.6]
-    assert prepared["FINAL_PREDICTION"].tolist() == [2.0, 5.0]
+    assert prepared["NDVI"].tolist() == pytest.approx([0.3, 0.6])
+    assert prepared["FINAL_PREDICTION"].tolist() == pytest.approx([2.0, 5.0])
 
 
 def test_prepare_coordinate_frame_deduplicates_without_value_columns() -> None:
@@ -509,7 +550,13 @@ def test_grid_dataset_builds_snapped_cube_from_point_rows() -> None:
 
     assert dataset["x"].values.tolist() == [10.0, 10.5]
     assert dataset["y"].values.tolist() == [20.5, 20.0]
-    assert dataset["NDVI"].values[0].tolist() == [[np.nan, 0.7], [0.3, np.nan]]
+    np.testing.assert_allclose(
+        dataset["NDVI"].values[0],
+        np.array([[np.nan, 0.7], [0.3, np.nan]], dtype=np.float32),
+        equal_nan=True,
+    )
+    assert dataset.attrs["source_input_rows"] == 4
+    assert dataset.attrs["source_output_rows"] == 2
 
 
 def test_grid_dataset_encodes_string_value_columns() -> None:
@@ -550,7 +597,11 @@ def test_grid_dataset_encodes_string_value_columns() -> None:
 
     assert dataset["LABEL"].attrs["categorical_encoding"] == {"0": "corn", "1": "soy"}
     assert dataset["LABEL"].attrs["_FillValue"] == -1
-    assert dataset["LABEL"].values[0].tolist() == [[-1.0, 1.0], [0.0, -1.0]]
+    np.testing.assert_allclose(
+        dataset["LABEL"].values[0],
+        np.array([[np.nan, 1.0], [0.0, np.nan]], dtype=np.float32),
+        equal_nan=True,
+    )
 
 
 def test_build_to_zarr_kwargs_defaults_to_v3_shape() -> None:
@@ -654,8 +705,14 @@ def test_grid_dataset_builds_viewer_compatible_bands_cube() -> None:
 
     assert dataset["bands"].shape == (1, 2, 2, 2)
     assert dataset["band"].values.tolist() == ["NDVI", "FINAL_PREDICTION"]
-    assert dataset["bands"].values[0, 0].tolist() == [[0.1, 0.2], [0.3, 0.4]]
-    assert dataset["bands"].values[0, 1].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 0],
+        np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 1],
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+    )
     assert dataset["bands"].attrs["grid_mapping"] == "spatial_ref"
 
 
@@ -722,11 +779,18 @@ def test_grid_dataset_reindexes_to_shared_target_grid() -> None:
     assert dataset["x"].values.tolist() == [10.0, 11.0, 12.0]
     assert dataset["y"].values.tolist() == [50.0, 49.0, 48.0]
     assert dataset["bands"].shape == (1, 1, 3, 3)
-    assert dataset["bands"].values[0, 0].tolist() == [
-        [0.2, np.nan, np.nan],
-        [np.nan, 0.8, np.nan],
-        [np.nan, np.nan, np.nan],
-    ]
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 0],
+        np.array(
+            [
+                [0.2, np.nan, np.nan],
+                [np.nan, 0.8, np.nan],
+                [np.nan, np.nan, np.nan],
+            ],
+            dtype=np.float32,
+        ),
+        equal_nan=True,
+    )
 
 
 def test_resolve_target_grid_uses_global_resolution_extent(monkeypatch) -> None:

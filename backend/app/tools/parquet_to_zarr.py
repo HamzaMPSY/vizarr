@@ -1125,6 +1125,8 @@ def _grid_dataset(
         coords["band"] = np.asarray(value_columns, dtype=str)
 
     dataset = xr.Dataset(data_vars=data_vars, coords=coords)
+    dataset.attrs["source_input_rows"] = int(len(df.index))
+    dataset.attrs["source_output_rows"] = int(len(spatial_df.index))
     dataset[config.x_dim].attrs["axis"] = "X"
     dataset[config.y_dim].attrs["axis"] = "Y"
     if config.layout == "bands":
@@ -1163,6 +1165,34 @@ def _grid_dataset(
         [name for name in dataset.data_vars if name != "spatial_ref"],
     )
     return dataset
+
+
+def _build_ingest_summary(
+    *,
+    parquet_uri: str,
+    timestamp: np.datetime64,
+    config: ConversionConfig,
+    value_columns: tuple[str, ...],
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    input_rows: int,
+    output_rows: int,
+) -> dict[str, Any]:
+    stored_variables = ["bands"] if config.layout == "bands" else list(value_columns)
+    return {
+        "source": parquet_uri,
+        "timestamp": str(timestamp),
+        "variables": stored_variables,
+        "value_columns": list(value_columns),
+        "input_rows": int(input_rows),
+        "output_rows": int(output_rows),
+        "aggregation_ratio": (float(output_rows) / float(input_rows)) if input_rows else None,
+        "shape": {
+            "time": 1,
+            config.y_dim: int(len(y_values)),
+            config.x_dim: int(len(x_values)),
+        },
+    }
 
 
 def _data_chunk_shape(variable: xr.DataArray, dataset: xr.Dataset, chunk_size: int) -> tuple[int, ...] | None:
@@ -1420,16 +1450,16 @@ def _write_sparse_time_slice(
             sort_keys=True,
         )
 
-    return {
-        "source": parquet_uri,
-        "timestamp": str(timestamp),
-        "variables": ["bands"] if config.layout == "bands" else list(value_columns),
-        "shape": {
-            "time": 1,
-            config.y_dim: int(len(y_values)),
-            config.x_dim: int(len(x_values)),
-        },
-    }
+    return _build_ingest_summary(
+        parquet_uri=parquet_uri,
+        timestamp=timestamp,
+        config=config,
+        value_columns=value_columns,
+        x_values=x_values,
+        y_values=y_values,
+        input_rows=len(frame.index),
+        output_rows=len(spatial_df.index),
+    )
 
 
 def _write_sparse_inputs(
@@ -1769,16 +1799,16 @@ def _append_inputs(
             expected_y = dataset[config.y_dim].values
             batch_datasets.append(dataset)
             summaries.append(
-                {
-                    "source": time_slice.source_uri,
-                    "timestamp": str(dataset["time"].values[0]),
-                    "variables": [name for name in dataset.data_vars if name != "spatial_ref"],
-                    "shape": {
-                        "time": int(dataset.sizes["time"]),
-                        config.y_dim: int(dataset.sizes[config.y_dim]),
-                        config.x_dim: int(dataset.sizes[config.x_dim]),
-                    },
-                }
+                _build_ingest_summary(
+                    parquet_uri=time_slice.source_uri,
+                    timestamp=dataset["time"].values[0],
+                    config=config,
+                    value_columns=config.value_columns or (),
+                    x_values=np.asarray(dataset[config.x_dim].values, dtype=np.float64),
+                    y_values=np.asarray(dataset[config.y_dim].values, dtype=np.float64),
+                    input_rows=int(dataset.attrs.get("source_input_rows", len(frame.index))),
+                    output_rows=int(dataset.attrs.get("source_output_rows", len(frame.index))),
+                )
             )
             logger.info(
                 "Completed time slice %d of %d: %s @ %s",
