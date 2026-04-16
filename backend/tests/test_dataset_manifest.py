@@ -189,3 +189,63 @@ def test_build_catalog_index_skips_unsupported_store(monkeypatch) -> None:
 
     assert len(catalog) == 1
     assert next(iter(catalog.values())).path == "cubes/good.zarr"
+
+
+def test_build_catalog_index_accepts_direct_store_prefix_without_listing(monkeypatch) -> None:
+    connector = SimpleNamespace()
+    settings = SimpleNamespace(
+        oci_prefix="cubes/example.zarr",
+        oci_zarr_path="",
+    )
+
+    monkeypatch.setattr(
+        connector,
+        "list_zarr_stores",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("direct store path should skip prefix listing")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.read_consolidated_metadata",
+        lambda *, store_path, **_kwargs: (
+            {"zarr_format": 3, "consolidated_metadata": {"metadata": {}}},
+            {
+                "cube": {
+                    "shape": [1, 2, 4, 4],
+                    "dimension_names": ["time", "bandish", "y", "x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [1, 1, 2, 2]}},
+                    "data_type": "uint16",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "bandish": {
+                    "shape": [2],
+                    "dimension_names": ["bandish"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [2]}},
+                    "data_type": {"name": "fixed_length_utf32", "configuration": {"length_bytes": 8}},
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "x": {
+                    "shape": [4],
+                    "dimension_names": ["x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "y": {
+                    "shape": [4],
+                    "dimension_names": ["y"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+            },
+        ),
+    )
+
+    catalog = build_catalog_index(settings=settings, connector=connector)  # type: ignore[arg-type]
+
+    assert len(catalog) == 1
+    assert next(iter(catalog.values())).path == "cubes/example.zarr"

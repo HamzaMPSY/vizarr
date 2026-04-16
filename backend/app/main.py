@@ -13,6 +13,8 @@ from app.core.datasets import build_registry
 from app.core.datasets import build_registry_from_dataset
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.zarr_reader import open_oci_zarr_dataset
+from app.index.catalog_store import build_index_records
+from app.index.planner_index import PlannerIndex
 from app.services.export_jobs import ExportJobStore
 from app.services.planner import PlannerService
 
@@ -21,7 +23,8 @@ from app.services.planner import PlannerService
 async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.settings = settings
-    app.state.planner = PlannerService(settings)
+    app.state.planner_index = PlannerIndex()
+    app.state.planner = PlannerService(settings, app.state.planner_index)
     app.state.export_job_store = ExportJobStore()
     app.state.storage_connector = None
     app.state.dataset_catalog = None
@@ -55,6 +58,7 @@ async def lifespan(app: FastAPI):
             warm_catalog_index(app)
     else:
         app.state.registry = build_registry()
+    app.state.planner_index.replace(build_index_records(app))
     app.state.cache = await connect_cache(settings.redis_url, settings.tile_cache_ttl)
     yield
     await app.state.cache.close()
@@ -71,7 +75,8 @@ app.add_middleware(
 )
 app.include_router(api_router, prefix="/api")
 app.state.settings = settings
-app.state.planner = PlannerService(settings)
+app.state.planner_index = PlannerIndex()
+app.state.planner = PlannerService(settings, app.state.planner_index)
 app.state.export_job_store = ExportJobStore()
 app.state.storage_connector = None
 app.state.dataset_catalog = None
@@ -92,3 +97,4 @@ if settings.storage_backend == "oci_zarr":
     )
 else:
     app.state.registry = build_registry()
+app.state.planner_index.replace(build_index_records(app))

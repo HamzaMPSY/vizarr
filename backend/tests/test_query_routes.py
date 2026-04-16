@@ -10,11 +10,11 @@ def test_preview_route_returns_planned_artifact() -> None:
     response = client.post(
         "/api/query/preview",
         json={
-            "collection_id": "sentinel2",
+            "collection_id": "demo-global",
             "aoi_wkt": "POLYGON((0 0,1 0,1 1,0 1,0 0))",
             "start": "2026-01-01",
             "end": "2026-01-31",
-            "bands": ["B04", "B03", "B02"],
+            "bands": ["temperature"],
             "style": "rgb-default",
             "max_size": 1024,
         },
@@ -26,17 +26,19 @@ def test_preview_route_returns_planned_artifact() -> None:
     assert payload["execution_path"] == "interactive"
     assert payload["artifact_id"].startswith("art_")
     assert payload["plan"]["chosen_representation"] == "browse"
+    assert payload["plan"]["collection_id"] == "demo-global"
+    assert payload["plan"]["selected_cube"] == "demo-global:browse:rgb-default"
 
 
 def test_clip_route_hands_off_oversized_request_to_batch() -> None:
     response = client.post(
         "/api/query/clip",
         json={
-            "collection_id": "sentinel2",
+            "collection_id": "demo-global",
             "aoi_wkt": "POLYGON((0 0,1 0,1 1,0 1,0 0))",
             "start": "2026-01-01",
             "end": "2026-03-31",
-            "bands": ["B02", "B03", "B04", "B08", "B11"],
+            "bands": ["temperature", "precipitation", "temperature", "precipitation", "temperature"],
             "output_format": "zarr",
         },
     )
@@ -52,11 +54,11 @@ def test_export_routes_create_and_fetch_job() -> None:
     create_response = client.post(
         "/api/exports",
         json={
-            "collection_id": "sentinel2",
+            "collection_id": "demo-global",
             "aoi_wkt": "POLYGON((0 0,1 0,1 1,0 1,0 0))",
             "start": "2026-01-01",
             "end": "2026-03-31",
-            "bands": ["B02", "B03", "B04", "B08"],
+            "bands": ["temperature", "precipitation"],
             "output_format": "zarr",
         },
     )

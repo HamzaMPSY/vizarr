@@ -223,6 +223,17 @@ def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float,
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
 
 
+def _resolve_direct_store_path(settings: Settings) -> str | None:
+    oci_zarr_path = getattr(settings, "oci_zarr_path", "")
+    if oci_zarr_path:
+        return oci_zarr_path.removeprefix("oci://").split("/", 1)[-1]
+
+    prefix = getattr(settings, "oci_prefix", "").rstrip("/")
+    if prefix.endswith(".zarr"):
+        return prefix
+    return None
+
+
 def _read_dataset_metadata(
     connector: OCIObjectStorageConnector,
     store_path: str,
@@ -240,40 +251,50 @@ def _read_dataset_metadata(
 
 
 def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector) -> dict[str, CatalogEntry]:
-    stores = connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
+    direct_store_path = _resolve_direct_store_path(settings)
+    stores = [] if direct_store_path is not None else connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
     catalog: dict[str, CatalogEntry] = {}
 
-    for store in stores:
-        if store.zarr_format != 3:
-            continue
-        if not store.path.endswith(".zarr"):
+    store_paths: list[tuple[str, int | None, bool | None]]
+    if direct_store_path is not None:
+        store_paths = [(direct_store_path, None, None)]
+    else:
+        store_paths = [(store.path, store.zarr_format, store.consolidated) for store in stores]
+
+    for store_path, store_zarr_format, store_consolidated in store_paths:
+        if not store_path.endswith(".zarr"):
             continue
 
         try:
-            _, metadata = _read_dataset_metadata(
+            store_metadata, metadata = _read_dataset_metadata(
                 connector=connector,
-                store_path=store.path,
+                store_path=store_path,
             )
+            zarr_format = int(store_metadata.get("zarr_format", store_zarr_format or 0))
+            if zarr_format != 3:
+                continue
             data_array_name, band_array_name = _select_projected_array_names(metadata)
         except Exception as exc:
-            logger.warning("Skipping unsupported dataset store %s: %s", store.path, exc)
+            logger.warning("Skipping unsupported dataset store %s: %s", store_path, exc)
             continue
 
-        dataset_id = _encode_dataset_id(store.path)
-        dataset_name = store.path.split("/")[-1]
-        dataset_description = f"OCI Zarr store at {store.path}"
+        dataset_id = _encode_dataset_id(store_path)
+        dataset_name = store_path.split("/")[-1]
+        dataset_description = f"OCI Zarr store at {store_path}"
 
         catalog[dataset_id] = CatalogEntry(
             id=dataset_id,
-            path=store.path,
+            path=store_path,
             meta=DatasetMeta(
                 id=dataset_id,
                 name=dataset_name,
                 description=dataset_description,
                 variables=[],
             ),
-            zarr_format=store.zarr_format,
-            consolidated=store.consolidated,
+            zarr_format=zarr_format,
+            consolidated=bool(
+                store_consolidated if store_consolidated is not None else "consolidated_metadata" in store_metadata
+            ),
             data_array_name=data_array_name,
             band_array_name=band_array_name,
             band_names=[],
