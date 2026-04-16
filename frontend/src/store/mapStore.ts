@@ -43,6 +43,8 @@ export const useMapStore = create<MapState>((set) => ({
       datasetId,
       variable: null,
       timeIndex: 0,
+      vmin: null,
+      vmax: null,
       viewState:
         datasetId === "demo-global"
           ? state.viewState
@@ -54,7 +56,7 @@ export const useMapStore = create<MapState>((set) => ({
               bearing: 0
             }
     })),
-  setVariable: (variable) => set({ variable, timeIndex: 0 }),
+  setVariable: (variable) => set({ variable, timeIndex: 0, vmin: null, vmax: null }),
   setTimeIndex: (timeIndex) => set({ timeIndex }),
   setColormap: (colormap) => set({ colormap }),
   setRange: (vmin, vmax) => set({ vmin, vmax }),

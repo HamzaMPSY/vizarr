@@ -11,6 +11,8 @@ export function Sidebar() {
     variable,
     timeIndex,
     colormap,
+    vmin,
+    vmax,
     setDataset,
     setVariable,
     setTimeIndex,
@@ -93,7 +95,7 @@ export function Sidebar() {
           <div className="stats">
             <span>Unit: {selectedVariable.unit}</span>
             <span>
-              Range: {selectedVariable.stats.p02.toFixed(1)} to {selectedVariable.stats.p98.toFixed(1)}
+              Range: {(vmin ?? selectedVariable.stats.p02).toFixed(1)} to {(vmax ?? selectedVariable.stats.p98).toFixed(1)}
             </span>
           </div>
         ) : null}
