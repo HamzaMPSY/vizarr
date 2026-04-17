@@ -194,6 +194,38 @@ def test_get_or_create_browse_overview_prefers_oci_manifest_artifact(tmp_path: P
     assert bbox == (0.0, 0.0, 1.0, 1.0)
 
 
+def test_get_or_create_browse_overview_skips_runtime_build_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    settings = SimpleNamespace(
+        browse_local_cache_dir=str(tmp_path),
+        planner_version="v1",
+        browse_overview_max_size=1536,
+        oci_browse_prefix_root="browse",
+        browse_dev_fallback_enabled=True,
+        browse_request_build_enabled=False,
+    )
+    entry = _entry()
+    connector = _FakeConnector()
+
+    def _unexpected_build(**_kwargs):
+        raise AssertionError("request path should not build browse artifacts")
+
+    monkeypatch.setattr("app.core.browse_tiles._build_overview", _unexpected_build)
+
+    try:
+        get_or_create_browse_overview(
+            settings=settings,
+            connector=connector,
+            entry=entry,
+            variable="B1",
+            time_index=0,
+            allow_build=settings.browse_request_build_enabled,
+        )
+    except FileNotFoundError as exc:
+        assert "No durable browse overview is available" in str(exc)
+    else:
+        raise AssertionError("expected missing browse overview to fail when runtime build is disabled")
+
+
 def test_build_and_store_browse_overviews_writes_objects_and_manifest(tmp_path: Path, monkeypatch) -> None:
     settings = SimpleNamespace(
         browse_local_cache_dir=str(tmp_path),

@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     browse_local_cache_dir: str = ".cache/browse"
     browse_prewarm_enabled: bool = True
     browse_prewarm_all_variables: bool = False
+    browse_request_build_enabled: bool = False
     browse_dev_fallback_enabled: bool = True
     interactive_max_clip_bands: int = 4
     interactive_max_clip_days: int = 31

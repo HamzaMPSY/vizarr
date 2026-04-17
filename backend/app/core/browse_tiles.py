@@ -63,6 +63,7 @@ def generate_browse_tile(
         entry=entry,
         variable=variable,
         time_index=time_index,
+        allow_build=settings.browse_request_build_enabled,
     )
     tile_data = sample_web_mercator_array(
         overview,
@@ -169,6 +170,7 @@ def get_or_create_browse_overview(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    allow_build: bool = True,
 ) -> tuple[np.ndarray, tuple[float, float, float, float], str]:
     cache_path = _overview_cache_path(settings, entry, variable, time_index)
     cache_key = str(cache_path)
@@ -185,13 +187,17 @@ def get_or_create_browse_overview(
     manifest = read_browse_manifest(connector, settings, entry)
     overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
     if overview_path is not None:
-        loaded = _load_overview_from_object_storage(
-            connector=connector,
-            object_path=overview_path,
-            cache_path=cache_path,
-        )
-        _overview_cache_set(cache_key, loaded)
-        return loaded[0], loaded[1], "oci"
+        try:
+            loaded = _load_overview_from_object_storage(
+                connector=connector,
+                object_path=overview_path,
+                cache_path=cache_path,
+            )
+        except FileNotFoundError:
+            loaded = None
+        if loaded is not None:
+            _overview_cache_set(cache_key, loaded)
+            return loaded[0], loaded[1], "oci"
 
     build_lock = _build_lock(cache_key)
     with build_lock:
@@ -206,15 +212,19 @@ def get_or_create_browse_overview(
         manifest = read_browse_manifest(connector, settings, entry)
         overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
         if overview_path is not None:
-            loaded = _load_overview_from_object_storage(
-                connector=connector,
-                object_path=overview_path,
-                cache_path=cache_path,
-            )
-            _overview_cache_set(cache_key, loaded)
-            return loaded[0], loaded[1], "oci"
+            try:
+                loaded = _load_overview_from_object_storage(
+                    connector=connector,
+                    object_path=overview_path,
+                    cache_path=cache_path,
+                )
+            except FileNotFoundError:
+                loaded = None
+            if loaded is not None:
+                _overview_cache_set(cache_key, loaded)
+                return loaded[0], loaded[1], "oci"
 
-        if not settings.browse_dev_fallback_enabled:
+        if not allow_build or not settings.browse_dev_fallback_enabled:
             raise FileNotFoundError(
                 f"No durable browse overview is available for dataset={entry.id} variable={variable} time_index={time_index}"
             )
