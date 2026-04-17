@@ -1,9 +1,13 @@
 import numpy as np
 import pytest
 
+from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import _time_labels_from_values
 from app.core.dataset_catalog import _select_projected_array_names
+from app.core.dataset_catalog import ensure_catalog_entry_ready
+from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import read_store_metadata
+from app.models.dataset import DatasetMeta
 
 
 def test_select_projected_array_names_accepts_non_landsat_band_dim_name() -> None:
@@ -85,3 +89,52 @@ def test_time_labels_from_nanosecond_epoch_values_returns_iso_dates() -> None:
     )
 
     assert labels == ["2025-01-08", "2025-01-15"]
+
+
+def test_ensure_catalog_entry_ready_uses_geotransform_without_loading_coordinates(monkeypatch) -> None:
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="bands",
+        band_array_name="band",
+        band_names=["NDVI"],
+        band_indices={"NDVI": 0},
+        data_array_meta=ZarrV3ArrayMetadata(
+            shape=(1, 1, 2, 2),
+            chunk_shape=(1, 1, 2, 2),
+            data_type="float32",
+            fill_value=None,
+            codecs=[],
+            separator="/",
+            attributes={"band_labels": ["NDVI"]},
+            dimension_names=("time", "band", "y", "x"),
+        ),
+        x_meta=object(),  # type: ignore[arg-type]
+        y_meta=object(),  # type: ignore[arg-type]
+        crs_wkt='GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]]',
+        geo_transform=(29.95, 0.1, 0.0, 10.05, 0.0, -0.1),
+    )
+
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.ensure_catalog_entry_metadata_ready",
+        lambda current_entry, _connector: current_entry,
+    )
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.load_1d_numeric_array",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("coordinate arrays should not be loaded")),
+    )
+
+    ready = ensure_catalog_entry_ready(entry, connector=object())  # type: ignore[arg-type]
+
+    assert ready.meta.bounds is not None
+    assert ready.meta.bounds.west == pytest.approx(29.95)
+    assert ready.meta.bounds.east == pytest.approx(30.15)
+    assert ready.meta.native_resolution_m is not None

@@ -1,15 +1,19 @@
 import numpy as np
 
+from app.core.dataset_catalog import CatalogEntry
 from app.core.projected_tile_generator import _bilinear_sample
 from app.core.projected_tile_generator import _coordinate_to_fractional_index
 from app.core.projected_tile_generator import _fractional_indices_from_geotransform
 from app.core.projected_tile_generator import _fractional_indices_from_north_up_geotransform_axes
 from app.core.projected_tile_generator import _resolve_display_range
+from app.core.projected_tile_generator import render_projected_band_array
 from app.core.projected_tile_generator import _source_window_bounds_from_axis_indices
 from app.core.projected_tile_generator import _source_window_bounds
 from app.core.projected_tile_generator import _source_window_bounds_from_indices
 from app.core.projected_tile_generator import _web_mercator_x_to_lon
 from app.core.projected_tile_generator import _web_mercator_y_to_lat
+from app.core.zarr_v3 import ZarrV3ArrayMetadata
+from app.models.dataset import DatasetMeta
 
 
 def test_coordinate_to_fractional_index_for_increasing_axis() -> None:
@@ -125,3 +129,63 @@ def test_resolve_display_range_prefers_dataset_defaults_when_available() -> None
         vmax=None,
     )
     assert (actual_vmin, actual_vmax) == (10.0, 20.0)
+
+
+def test_render_projected_band_array_fast_latlon_path_skips_coordinate_axes(monkeypatch) -> None:
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="bands",
+        band_array_name="band",
+        band_names=["NDVI"],
+        band_indices={"NDVI": 0},
+        data_array_meta=ZarrV3ArrayMetadata(
+            shape=(1, 1, 2, 2),
+            chunk_shape=(1, 1, 2, 2),
+            data_type="float32",
+            fill_value=None,
+            codecs=[],
+            separator="/",
+            attributes={},
+            dimension_names=("time", "band", "y", "x"),
+        ),
+        crs_wkt='GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]]',
+        geo_transform=(-0.5, 1.0, 0.0, 1.5, 0.0, -1.0),
+    )
+
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.ensure_catalog_entry_metadata_ready",
+        lambda current_entry, _connector: current_entry,
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.ensure_catalog_entry_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full coordinate hydration should not run")),
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.load_4d_window",
+        lambda **_kwargs: np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._is_fast_latlon_entry",
+        lambda _entry: True,
+    )
+
+    rendered = render_projected_band_array(
+        connector=None,  # type: ignore[arg-type]
+        entry=entry,
+        variable="NDVI",
+        bbox=(-20037508.342789244, -20037508.342789244, 20037508.342789244, 20037508.342789244),
+        width=2,
+        height=2,
+        time_index=0,
+    )
+
+    assert rendered.shape == (2, 2)

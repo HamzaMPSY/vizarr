@@ -224,6 +224,44 @@ def _compute_bounds(
     )
 
 
+def _compute_bounds_from_grid_shape(
+    *,
+    width: int,
+    height: int,
+    crs_wkt: str | None,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+) -> DatasetBounds | None:
+    if width <= 0 or height <= 0 or geo_transform is None:
+        return None
+
+    source_crs = CRS.from_wkt(crs_wkt) if crs_wkt else CRS.from_epsg(4326)
+    transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+    origin_x, pixel_width, rot_x, origin_y, rot_y, pixel_height = geo_transform
+    xs = [
+        origin_x,
+        origin_x + width * pixel_width,
+        origin_x + width * pixel_width + height * rot_x,
+        origin_x + height * rot_x,
+    ]
+    ys = [
+        origin_y,
+        origin_y + width * rot_y,
+        origin_y + width * rot_y + height * pixel_height,
+        origin_y + height * pixel_height,
+    ]
+    lon_values, lat_values = transformer.transform(xs, ys)
+    west = max(min(lon_values), -180.0)
+    east = min(max(lon_values), 180.0)
+    south = max(min(lat_values), -85.0511)
+    north = min(max(lat_values), 85.0511)
+    return DatasetBounds(
+        west=west,
+        south=south,
+        east=east,
+        north=north,
+    )
+
+
 def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float, float, float] | None:
     if not value:
         return None
@@ -231,6 +269,41 @@ def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float,
     if len(parts) != 6:
         return None
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
+
+
+def _estimate_native_resolution_from_geotransform(
+    *,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+    crs_wkt: str | None,
+    bounds: DatasetBounds | None,
+) -> float | None:
+    if geo_transform is None:
+        return None
+    _origin_x, pixel_width, _rot_x, _origin_y, _rot_y, pixel_height = geo_transform
+    samples = [value for value in (abs(pixel_width), abs(pixel_height)) if value > 0]
+    if not samples:
+        return None
+
+    if crs_wkt:
+        crs = CRS.from_wkt(crs_wkt)
+        if crs.is_projected and crs.axis_info:
+            conversion = float(crs.axis_info[0].unit_conversion_factor or 1.0)
+            return float(sum(samples) / len(samples) * conversion)
+
+    center_lon = 0.0 if bounds is None else (bounds.west + bounds.east) / 2.0
+    center_lat = 0.0 if bounds is None else (bounds.south + bounds.north) / 2.0
+    geod = Geod(ellps="WGS84")
+    metric_samples = [
+        abs(geod.line_length([center_lon, center_lon + sample], [center_lat, center_lat]))
+        for sample in [abs(pixel_width)]
+        if sample > 0
+    ]
+    if abs(pixel_height) > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon], [center_lat, center_lat + abs(pixel_height)])))
+    metric_samples = [value for value in metric_samples if value > 0]
+    if not metric_samples:
+        return None
+    return float(sum(metric_samples) / len(metric_samples))
 
 
 def _resolve_direct_store_path(settings: Settings) -> str | None:
@@ -313,7 +386,36 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             band_array_name=band_array_name,
             band_names=[],
             band_indices={},
+            data_array_meta=parse_array_metadata(metadata[data_array_name]),
+            x_meta=parse_array_metadata(metadata["x"]) if "x" in metadata else None,
+            y_meta=parse_array_metadata(metadata["y"]) if "y" in metadata else None,
+            crs_wkt=metadata.get("spatial_ref", {}).get("attributes", {}).get("crs_wkt"),
+            geo_transform=_parse_geo_transform(metadata.get("spatial_ref", {}).get("attributes", {}).get("GeoTransform")),
         )
+        entry = catalog[dataset_id]
+        if entry.data_array_meta is not None and len(entry.data_array_meta.shape) >= 4:
+            bounds = _compute_bounds_from_grid_shape(
+                width=int(entry.data_array_meta.shape[-1]),
+                height=int(entry.data_array_meta.shape[-2]),
+                crs_wkt=entry.crs_wkt,
+                geo_transform=entry.geo_transform,
+            )
+            entry.meta.bounds = bounds
+            entry.meta.native_resolution_m = _estimate_native_resolution_from_geotransform(
+                geo_transform=entry.geo_transform,
+                crs_wkt=entry.crs_wkt,
+                bounds=bounds,
+            )
+            time_node = metadata.get("time")
+            if isinstance(time_node, dict):
+                time_meta = parse_array_metadata(time_node)
+                time_values = load_1d_numeric_array(
+                    connector=connector,
+                    store_path=entry.path,
+                    array_name="time",
+                    metadata=time_meta,
+                )
+                entry.meta.time_values = _time_labels_from_values(time_values, time_node.get("attributes", {}))
 
     return catalog
 
@@ -420,6 +522,28 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
 
 def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
     ensure_catalog_entry_metadata_ready(entry, connector)
+
+    if (
+        entry.meta.bounds is None
+        and entry.data_array_meta is not None
+        and len(entry.data_array_meta.shape) >= 4
+        and entry.geo_transform is not None
+    ):
+        entry.meta.bounds = _compute_bounds_from_grid_shape(
+            width=int(entry.data_array_meta.shape[-1]),
+            height=int(entry.data_array_meta.shape[-2]),
+            crs_wkt=entry.crs_wkt,
+            geo_transform=entry.geo_transform,
+        )
+    if entry.meta.native_resolution_m is None and entry.geo_transform is not None:
+        entry.meta.native_resolution_m = _estimate_native_resolution_from_geotransform(
+            geo_transform=entry.geo_transform,
+            crs_wkt=entry.crs_wkt,
+            bounds=entry.meta.bounds,
+        )
+
+    if entry.meta.bounds is not None and entry.meta.native_resolution_m is not None:
+        return entry
 
     if entry.x_values is None:
         if entry.x_meta is None:

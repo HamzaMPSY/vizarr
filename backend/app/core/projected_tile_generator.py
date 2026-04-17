@@ -6,6 +6,7 @@ from pyproj import CRS, Transformer
 
 from app.core.colormap import encode_tile
 from app.core.dataset_catalog import CatalogEntry
+from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.variable_display import resolve_display_range
@@ -379,15 +380,13 @@ def render_projected_band_array(
     height: int,
     time_index: int,
 ) -> np.ndarray:
-    entry = ensure_catalog_entry_ready(entry, connector)
-    x_values = entry.x_values
-    y_values = entry.y_values
-    assert x_values is not None
-    assert y_values is not None
+    entry = ensure_catalog_entry_metadata_ready(entry, connector)
     assert entry.data_array_meta is not None
 
     band_index = entry.band_indices[variable]
     if _is_fast_latlon_entry(entry):
+        source_width = int(entry.data_array_meta.shape[-1])
+        source_height = int(entry.data_array_meta.shape[-2])
         mercator_x_axis, mercator_y_axis = _pixel_center_axes(bbox, width=width, height=height)
         lon_values = _web_mercator_x_to_lon(mercator_x_axis)
         lat_values = _web_mercator_y_to_lat(mercator_y_axis)
@@ -403,11 +402,17 @@ def render_projected_band_array(
         window_bounds = _source_window_bounds_from_axis_indices(
             x_idx=x_idx_axis,
             y_idx=y_idx_axis,
-            width=len(x_values),
-            height=len(y_values),
+            width=source_width,
+            height=source_height,
         )
         source_xs = source_ys = None
+        x_values = y_values = None
     else:
+        entry = ensure_catalog_entry_ready(entry, connector)
+        x_values = entry.x_values
+        y_values = entry.y_values
+        assert x_values is not None
+        assert y_values is not None
         mercator_xs, mercator_ys = _pixel_centers(bbox, width=width, height=height)
         target_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
         transformer = _transformer_from_mercator(target_crs.to_wkt())
@@ -454,14 +459,16 @@ def render_projected_band_array(
         x_stop=x_stop,
     ).astype(np.float32)
 
-    local_x_values = x_values[x_start:x_stop]
-    local_y_values = y_values[y_start:y_stop]
     if x_idx_full is not None and y_idx_full is not None:
         x_idx = x_idx_full - x_start
         y_idx = y_idx_full - y_start
     else:
         assert source_xs is not None
         assert source_ys is not None
+        assert x_values is not None
+        assert y_values is not None
+        local_x_values = x_values[x_start:x_stop]
+        local_y_values = y_values[y_start:y_stop]
         x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
         y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
     return _bilinear_sample(
