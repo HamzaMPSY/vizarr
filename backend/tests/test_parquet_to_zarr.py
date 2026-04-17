@@ -46,6 +46,11 @@ def test_minimum_positive_step_ignores_duplicate_values() -> None:
     assert _minimum_positive_step(values) == pytest.approx(0.02)
 
 
+def test_minimum_positive_step_ignores_sub_precision_jitter() -> None:
+    values = np.array([10.0, 10.0 + 1e-13, 10.05], dtype=np.float64)
+    assert _minimum_positive_step(values) == pytest.approx(0.05)
+
+
 def test_validate_storage_layout_rejects_non_multiple_shard_size() -> None:
     with pytest.raises(ValueError, match="integer multiple"):
         _validate_storage_layout(chunk_size=256, shard_size=3000, zarr_version=3)

@@ -806,14 +806,14 @@ def _snap_to_resolution(series: pd.Series, resolution: float, origin: float | No
 
 
 def _minimum_positive_step(values: np.ndarray) -> float | None:
-    unique_values = np.unique(values.astype(np.float64))
+    unique_values = np.unique(np.round(values.astype(np.float64), decimals=GRID_COORD_DECIMALS))
     if unique_values.size < 2:
         return None
     diffs = np.diff(np.sort(unique_values))
     positive_diffs = diffs[diffs > 0]
     if positive_diffs.size == 0:
         return None
-    return float(np.round(float(positive_diffs.min()), decimals=GRID_COORD_DECIMALS))
+    return float(positive_diffs.min())
 
 
 def _resolve_point_preserving_resolutions(
