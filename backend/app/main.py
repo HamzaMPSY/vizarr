@@ -59,12 +59,14 @@ async def lifespan(app: FastAPI):
                 dataset_description=dataset_description,
             )
         if not settings.oci_zarr_path:
+            direct_store_target = has_direct_store_target(settings)
+            eager_catalog_entry_state = settings.browse_prewarm_enabled and direct_store_target
             await run_in_threadpool(
                 warm_catalog_index,
                 app,
-                has_direct_store_target(settings),
+                eager_catalog_entry_state,
             )
-            if settings.browse_prewarm_enabled and has_direct_store_target(settings):
+            if settings.browse_prewarm_enabled and direct_store_target:
                 await run_in_threadpool(
                     prewarm_browse_overviews,
                     settings,
