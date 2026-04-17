@@ -141,8 +141,10 @@ def load_1d_numeric_array(
 
     chunk_size = metadata.effective_chunk_shape[0]
     chunk_count = int(np.ceil(metadata.shape[0] / chunk_size))
-    values: list[np.ndarray] = []
-    for chunk_index in range(chunk_count):
+    if chunk_count <= 0:
+        return np.asarray([], dtype=metadata.dtype)
+
+    def read_chunk(chunk_index: int) -> np.ndarray:
         decoded = _read_array_chunk_bytes(
             connector=connector,
             store_path=store_path,
@@ -155,10 +157,11 @@ def load_1d_numeric_array(
             chunk_size=chunk_size,
             chunk_index=chunk_index,
         )
-        values.append(np.frombuffer(decoded, dtype=metadata.dtype, count=expected_count).copy())
+        return np.frombuffer(decoded, dtype=metadata.dtype, count=expected_count).copy()
 
-    if not values:
-        return np.asarray([], dtype=metadata.dtype)
+    with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, chunk_count)) as executor:
+        values = list(executor.map(read_chunk, range(chunk_count)))
+
     return np.concatenate(values, axis=0)
 
 
