@@ -32,9 +32,10 @@ def browse_overview_object_path(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> str:
-    digest = _overview_digest(settings, entry, variable, time_index)
-    return f"{browse_artifact_root(settings, entry)}/overviews/{variable}-{time_index}-{digest}.npz"
+    digest = _overview_digest(settings, entry, variable, time_index, zoom)
+    return f"{browse_artifact_root(settings, entry)}/overviews/{variable}-{time_index}-z{zoom}-{digest}.npz"
 
 
 def browse_manifest_contains_overview(
@@ -42,8 +43,9 @@ def browse_manifest_contains_overview(
     *,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> bool:
-    return browse_manifest_overview_path(manifest, variable=variable, time_index=time_index) is not None
+    return browse_manifest_overview_path(manifest, variable=variable, time_index=time_index, zoom=zoom) is not None
 
 
 def browse_manifest_overview_path(
@@ -51,6 +53,7 @@ def browse_manifest_overview_path(
     *,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> str | None:
     if manifest is None:
         return None
@@ -66,6 +69,12 @@ def browse_manifest_overview_path(
     overview_entry = overviews.get(str(time_index))
     if not isinstance(overview_entry, dict):
         return None
+    levels = overview_entry.get("levels")
+    if isinstance(levels, dict):
+        level_entry = levels.get(str(zoom))
+        if isinstance(level_entry, dict):
+            path = level_entry.get("path")
+            return path if isinstance(path, str) else None
     path = overview_entry.get("path")
     return path if isinstance(path, str) else None
 
@@ -131,9 +140,10 @@ def _overview_digest(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> str:
     return hashlib.sha1(
-        f"{entry.id}:{variable}:{time_index}:{settings.planner_version}:{settings.browse_overview_max_size}".encode(
+        f"{entry.id}:{variable}:{time_index}:{zoom}:{settings.planner_version}:{settings.browse_overview_max_size}".encode(
             "utf-8"
         )
     ).hexdigest()[:16]

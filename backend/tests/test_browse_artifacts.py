@@ -58,8 +58,8 @@ def test_browse_artifact_paths_follow_oci_browse_prefix_root() -> None:
 
     assert browse_artifact_root(settings, entry) == "browse/cubes/landsat/example.zarr"
     assert browse_manifest_path(settings, entry) == "browse/cubes/landsat/example.zarr/manifest.json"
-    assert browse_overview_object_path(settings, entry, "B4", 0).startswith(
-        "browse/cubes/landsat/example.zarr/overviews/B4-0-"
+    assert browse_overview_object_path(settings, entry, "B4", 0, 3).startswith(
+        "browse/cubes/landsat/example.zarr/overviews/B4-0-z3-"
     )
 
 
@@ -79,8 +79,15 @@ def test_browse_manifest_roundtrip_uses_connector_storage() -> None:
             "B4": {
                 "overviews": {
                     "0": {
-                        "path": browse_overview_object_path(settings, entry, "B4", 0),
+                        "path": browse_overview_object_path(settings, entry, "B4", 0, 3),
                         "bbox": [0.0, 0.0, 1.0, 1.0],
+                        "levels": {
+                            "3": {
+                                "path": browse_overview_object_path(settings, entry, "B4", 0, 3),
+                                "bbox": [0.0, 0.0, 1.0, 1.0],
+                                "zoom": 3,
+                            }
+                        },
                     }
                 }
             }
@@ -103,11 +110,16 @@ def test_browse_manifest_contains_overview_detects_registered_variable() -> None
         "variables": {
             "B4": {
                 "overviews": {
-                    "0": {"path": "browse/cubes/landsat/example.zarr/overviews/B4-0-abcd.npz"}
+                    "0": {
+                        "path": "browse/cubes/landsat/example.zarr/overviews/B4-0-z0-abcd.npz",
+                        "levels": {
+                            "0": {"path": "browse/cubes/landsat/example.zarr/overviews/B4-0-z0-abcd.npz"}
+                        },
+                    }
                 }
             }
         }
     }
 
-    assert browse_manifest_contains_overview(manifest, variable="B4", time_index=0) is True
-    assert browse_manifest_contains_overview(manifest, variable="B5", time_index=0) is False
+    assert browse_manifest_contains_overview(manifest, variable="B4", time_index=0, zoom=0) is True
+    assert browse_manifest_contains_overview(manifest, variable="B5", time_index=0, zoom=0) is False

@@ -90,7 +90,7 @@ def test_prewarm_browse_overviews_warms_first_variable_only_by_default(monkeypat
     )
 
     count = prewarm_browse_overviews(
-        SimpleNamespace(),
+        SimpleNamespace(browse_tile_max_zoom=8),
         object(),  # type: ignore[arg-type]
         {"dataset-1": entry},
     )
@@ -110,7 +110,7 @@ def test_prewarm_browse_overviews_can_warm_all_variables(monkeypatch) -> None:
     )
 
     count = prewarm_browse_overviews(
-        SimpleNamespace(),
+        SimpleNamespace(browse_tile_max_zoom=8),
         object(),  # type: ignore[arg-type]
         {"dataset-1": entry},
         all_variables=True,
@@ -126,6 +126,7 @@ def test_browse_overview_exists_checks_disk_cache(tmp_path: Path) -> None:
         planner_version="v1",
         browse_overview_max_size=1536,
         oci_browse_prefix_root="browse",
+        browse_tile_max_zoom=8,
     )
     entry = _entry()
     connector = _FakeConnector()
@@ -151,6 +152,7 @@ def test_browse_overview_exists_checks_disk_cache(tmp_path: Path) -> None:
             entry=entry,
             variable="B1",
             time_index=0,
+            zoom=8,
         ) is True
     finally:
         browse_tiles_module._overview_cache_path = original
@@ -163,10 +165,11 @@ def test_get_or_create_browse_overview_prefers_oci_manifest_artifact(tmp_path: P
         browse_overview_max_size=1536,
         oci_browse_prefix_root="browse",
         browse_dev_fallback_enabled=False,
+        browse_tile_max_zoom=8,
     )
     entry = _entry()
     connector = _FakeConnector()
-    object_path = browse_overview_object_path(settings, entry, "B1", 0)
+    object_path = browse_overview_object_path(settings, entry, "B1", 0, 3)
     payload_path = browse_manifest_path(settings, entry)
     connector.payloads[object_path] = _serialized_overview()
     connector.text_payloads[payload_path] = json.dumps(
@@ -174,7 +177,12 @@ def test_get_or_create_browse_overview_prefers_oci_manifest_artifact(tmp_path: P
             "variables": {
                 "B1": {
                     "overviews": {
-                        "0": {"path": object_path}
+                        "0": {
+                            "path": object_path,
+                            "levels": {
+                                "3": {"path": object_path}
+                            },
+                        }
                     }
                 }
             }
@@ -187,6 +195,7 @@ def test_get_or_create_browse_overview_prefers_oci_manifest_artifact(tmp_path: P
         entry=entry,
         variable="B1",
         time_index=0,
+        zoom=3,
     )
 
     assert source == "oci"
@@ -202,6 +211,7 @@ def test_get_or_create_browse_overview_skips_runtime_build_when_disabled(tmp_pat
         oci_browse_prefix_root="browse",
         browse_dev_fallback_enabled=True,
         browse_request_build_enabled=False,
+        browse_tile_max_zoom=8,
     )
     entry = _entry()
     connector = _FakeConnector()
@@ -218,6 +228,7 @@ def test_get_or_create_browse_overview_skips_runtime_build_when_disabled(tmp_pat
             entry=entry,
             variable="B1",
             time_index=0,
+            zoom=3,
             allow_build=settings.browse_request_build_enabled,
         )
     except FileNotFoundError as exc:
@@ -233,6 +244,7 @@ def test_build_and_store_browse_overviews_writes_objects_and_manifest(tmp_path: 
         browse_overview_max_size=1536,
         oci_browse_prefix_root="browse",
         browse_dev_fallback_enabled=True,
+        browse_tile_max_zoom=8,
     )
     entry = _entry()
     connector = _FakeConnector()
@@ -248,13 +260,21 @@ def test_build_and_store_browse_overviews_writes_objects_and_manifest(tmp_path: 
         entry=entry,
         variables=["B1"],
         time_indices=[0],
+        zoom_levels=[2, 3],
     )
 
-    assert summary["generated"] == 1
-    assert connector.write_bytes_calls == [browse_overview_object_path(settings, entry, "B1", 0)]
+    assert summary["generated"] == 2
+    assert summary["zoom_levels"] == [2, 3]
+    assert connector.write_bytes_calls == [
+        browse_overview_object_path(settings, entry, "B1", 0, 2),
+        browse_overview_object_path(settings, entry, "B1", 0, 3),
+    ]
     assert connector.write_text_calls == [browse_manifest_path(settings, entry)]
     manifest = json.loads(connector.text_payloads[browse_manifest_path(settings, entry)])
-    assert manifest["variables"]["B1"]["overviews"]["0"]["path"] == browse_overview_object_path(settings, entry, "B1", 0)
+    assert manifest["variables"]["B1"]["overviews"]["0"]["path"] == browse_overview_object_path(settings, entry, "B1", 0, 2)
+    assert manifest["variables"]["B1"]["overviews"]["0"]["levels"]["3"]["path"] == browse_overview_object_path(
+        settings, entry, "B1", 0, 3
+    )
 
 
 def _serialized_overview() -> bytes:

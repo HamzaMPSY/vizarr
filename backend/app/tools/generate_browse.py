@@ -36,6 +36,13 @@ def _parse_args() -> argparse.Namespace:
         help="Time index to generate. Repeat to generate more than one. Default: 0.",
     )
     parser.add_argument(
+        "--zoom-level",
+        action="append",
+        dest="zoom_levels",
+        type=int,
+        help="Browse pyramid zoom level to generate. Repeat to generate more than one. Default: 0 through browse_tile_max_zoom.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Regenerate and replace existing browse overview objects.",
@@ -67,12 +74,14 @@ def main() -> int:
 
     variables = args.variables or [item.id for item in entry.meta.variables]
     time_indices = args.time_indices or [0]
+    zoom_levels = args.zoom_levels
     summary = build_and_store_browse_overviews(
         settings=settings,
         connector=connector,
         entry=entry,
         variables=variables,
         time_indices=time_indices,
+        zoom_levels=zoom_levels,
         overwrite=args.overwrite,
     )
     logger.info(

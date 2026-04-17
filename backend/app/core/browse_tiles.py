@@ -57,12 +57,14 @@ def generate_browse_tile(
     vmin: float | None,
     vmax: float | None,
 ) -> BrowseTileResult:
+    browse_zoom = _resolved_browse_zoom(settings, z)
     overview, overview_bbox, source = get_or_create_browse_overview(
         settings=settings,
         connector=connector,
         entry=entry,
         variable=variable,
         time_index=time_index,
+        zoom=browse_zoom,
         allow_build=settings.browse_request_build_enabled,
     )
     tile_data = sample_web_mercator_array(
@@ -100,6 +102,7 @@ def prewarm_browse_overviews(
                 entry=entry,
                 variable=variable,
                 time_index=0,
+                zoom=settings.browse_tile_max_zoom,
             ):
                 continue
             get_or_create_browse_overview(
@@ -108,6 +111,7 @@ def prewarm_browse_overviews(
                 entry=entry,
                 variable=variable,
                 time_index=0,
+                zoom=settings.browse_tile_max_zoom,
             )
             warmed += 1
             logger.info("Prewarmed browse overview for %s variable %s", entry.id, variable)
@@ -136,14 +140,18 @@ def browse_overview_exists(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> bool:
-    cache_path = _overview_cache_path(settings, entry, variable, time_index)
+    resolved_zoom = _resolved_browse_zoom(settings, zoom)
+    cache_path = _overview_cache_path(settings, entry, variable, time_index, resolved_zoom)
     if cache_path.exists():
         return True
     if _overview_cache_get(str(cache_path)) is not None:
         return True
     manifest = read_browse_manifest(connector, settings, entry)
-    return browse_manifest_contains_overview(manifest, variable=variable, time_index=time_index)
+    if browse_manifest_contains_overview(manifest, variable=variable, time_index=time_index, zoom=resolved_zoom):
+        return True
+    return bool(_available_manifest_zoom_levels(manifest, variable=variable, time_index=time_index))
 
 
 def _run_background_browse_prewarm(
@@ -163,6 +171,78 @@ def _run_background_browse_prewarm(
         logger.exception("Background browse prewarm failed")
 
 
+def _resolved_browse_zoom(settings: Settings, zoom: int) -> int:
+    return max(0, min(int(zoom), settings.browse_tile_max_zoom))
+
+
+def _default_browse_zoom_levels(settings: Settings) -> list[int]:
+    return list(range(0, settings.browse_tile_max_zoom + 1))
+
+
+def _available_manifest_zoom_levels(
+    manifest: dict[str, object] | None,
+    *,
+    variable: str,
+    time_index: int,
+) -> list[int]:
+    if manifest is None:
+        return []
+    variables = manifest.get("variables")
+    if not isinstance(variables, dict):
+        return []
+    variable_entry = variables.get(variable)
+    if not isinstance(variable_entry, dict):
+        return []
+    overviews = variable_entry.get("overviews")
+    if not isinstance(overviews, dict):
+        return []
+    overview_entry = overviews.get(str(time_index))
+    if not isinstance(overview_entry, dict):
+        return []
+    levels = overview_entry.get("levels")
+    if not isinstance(levels, dict):
+        return []
+    parsed: list[int] = []
+    for level in levels:
+        try:
+            parsed.append(int(level))
+        except ValueError:
+            continue
+    return sorted(set(parsed))
+
+
+def _browse_manifest_best_overview_path(
+    manifest: dict[str, object] | None,
+    *,
+    variable: str,
+    time_index: int,
+    zoom: int,
+) -> str | None:
+    exact = browse_manifest_overview_path(
+        manifest,
+        variable=variable,
+        time_index=time_index,
+        zoom=zoom,
+    )
+    if exact is not None:
+        return exact
+    available_levels = _available_manifest_zoom_levels(
+        manifest,
+        variable=variable,
+        time_index=time_index,
+    )
+    if not available_levels:
+        return None
+    lower_or_equal = [level for level in available_levels if level <= zoom]
+    selected_zoom = max(lower_or_equal) if lower_or_equal else min(available_levels)
+    return browse_manifest_overview_path(
+        manifest,
+        variable=variable,
+        time_index=time_index,
+        zoom=selected_zoom,
+    )
+
+
 def get_or_create_browse_overview(
     *,
     settings: Settings,
@@ -170,9 +250,11 @@ def get_or_create_browse_overview(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
     allow_build: bool = True,
 ) -> tuple[np.ndarray, tuple[float, float, float, float], str]:
-    cache_path = _overview_cache_path(settings, entry, variable, time_index)
+    resolved_zoom = _resolved_browse_zoom(settings, zoom)
+    cache_path = _overview_cache_path(settings, entry, variable, time_index, resolved_zoom)
     cache_key = str(cache_path)
 
     cached = _overview_cache_get(cache_key)
@@ -185,7 +267,12 @@ def get_or_create_browse_overview(
         return loaded[0], loaded[1], "local"
 
     manifest = read_browse_manifest(connector, settings, entry)
-    overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
+    overview_path = _browse_manifest_best_overview_path(
+        manifest,
+        variable=variable,
+        time_index=time_index,
+        zoom=resolved_zoom,
+    )
     if overview_path is not None:
         try:
             loaded = _load_overview_from_object_storage(
@@ -210,7 +297,12 @@ def get_or_create_browse_overview(
             return loaded[0], loaded[1], "local"
 
         manifest = read_browse_manifest(connector, settings, entry)
-        overview_path = browse_manifest_overview_path(manifest, variable=variable, time_index=time_index)
+        overview_path = _browse_manifest_best_overview_path(
+            manifest,
+            variable=variable,
+            time_index=time_index,
+            zoom=resolved_zoom,
+        )
         if overview_path is not None:
             try:
                 loaded = _load_overview_from_object_storage(
@@ -235,6 +327,7 @@ def get_or_create_browse_overview(
             entry=entry,
             variable=variable,
             time_index=time_index,
+            zoom=resolved_zoom,
         )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -253,6 +346,7 @@ def build_and_store_browse_overviews(
     entry: CatalogEntry,
     variables: list[str],
     time_indices: list[int],
+    zoom_levels: list[int] | None = None,
     overwrite: bool = False,
 ) -> dict[str, object]:
     manifest = read_browse_manifest(connector, settings, entry, use_cache=False) or build_browse_manifest(
@@ -263,43 +357,57 @@ def build_and_store_browse_overviews(
     variables_payload = dict(manifest.get("variables", {}))
     generated = 0
     reused = 0
+    requested_zoom_levels = [_resolved_browse_zoom(settings, zoom) for zoom in (zoom_levels or _default_browse_zoom_levels(settings))]
 
     for variable in variables:
         variable_payload = dict(variables_payload.get(variable, {}))
         overviews = dict(variable_payload.get("overviews", {}))
         for time_index in time_indices:
-            object_path = browse_overview_object_path(settings, entry, variable, time_index)
-            exists = connector.object_exists(object_path)
-            if exists and not overwrite:
-                reused += 1
-                overviews.setdefault(str(time_index), {"path": object_path})
-                continue
+            overview_payload = dict(overviews.get(str(time_index), {}))
+            levels_payload = dict(overview_payload.get("levels", {}))
+            for zoom in requested_zoom_levels:
+                object_path = browse_overview_object_path(settings, entry, variable, time_index, zoom)
+                exists = connector.object_exists(object_path)
+                if exists and not overwrite:
+                    reused += 1
+                    levels_payload.setdefault(str(zoom), {"path": object_path})
+                    continue
 
-            built = _build_overview(
-                settings=settings,
-                connector=connector,
-                entry=entry,
-                variable=variable,
-                time_index=time_index,
-            )
-            connector.write_bytes(
-                object_path,
-                _serialize_overview(*built),
-                content_type="application/octet-stream",
-            )
-            cache_path = _overview_cache_path(settings, entry, variable, time_index)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                cache_path,
-                data=built[0],
-                bbox=np.asarray(built[1], dtype=np.float64),
-            )
-            _overview_cache_set(str(cache_path), built)
-            overviews[str(time_index)] = {
-                "path": object_path,
-                "bbox": [float(value) for value in built[1]],
-            }
-            generated += 1
+                built = _build_overview(
+                    settings=settings,
+                    connector=connector,
+                    entry=entry,
+                    variable=variable,
+                    time_index=time_index,
+                    zoom=zoom,
+                )
+                connector.write_bytes(
+                    object_path,
+                    _serialize_overview(*built),
+                    content_type="application/octet-stream",
+                )
+                cache_path = _overview_cache_path(settings, entry, variable, time_index, zoom)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    cache_path,
+                    data=built[0],
+                    bbox=np.asarray(built[1], dtype=np.float64),
+                )
+                _overview_cache_set(str(cache_path), built)
+                levels_payload[str(zoom)] = {
+                    "path": object_path,
+                    "bbox": [float(value) for value in built[1]],
+                    "zoom": zoom,
+                }
+                generated += 1
+
+            if levels_payload:
+                overview_payload["levels"] = levels_payload
+                lowest_zoom = min(int(value) for value in levels_payload)
+                highest_zoom = max(int(value) for value in levels_payload)
+                overview_payload["path"] = levels_payload[str(lowest_zoom)]["path"]
+                overview_payload["max_zoom_path"] = levels_payload[str(highest_zoom)]["path"]
+                overviews[str(time_index)] = overview_payload
 
         variable_payload["overviews"] = overviews
         variables_payload[variable] = variable_payload
@@ -312,6 +420,7 @@ def build_and_store_browse_overviews(
         "reused": reused,
         "variables": variables,
         "time_indices": time_indices,
+        "zoom_levels": requested_zoom_levels,
     }
 
 
@@ -322,6 +431,7 @@ def _build_overview(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     if entry.meta.bounds is None:
         raise ValueError(f"Dataset {entry.id} is missing bounds required for browse overview generation")
@@ -332,7 +442,7 @@ def _build_overview(
         entry.meta.bounds.east,
         entry.meta.bounds.north,
     )
-    width, height = _overview_dimensions(overview_bbox, settings.browse_overview_max_size)
+    width, height = _overview_dimensions(overview_bbox, settings.browse_overview_max_size, zoom)
     overview = render_projected_band_array(
         connector=connector,
         entry=entry,
@@ -348,16 +458,18 @@ def _build_overview(
 def _overview_dimensions(
     bbox: tuple[float, float, float, float],
     max_size: int,
+    zoom: int,
 ) -> tuple[int, int]:
     west, south, east, north = bbox
-    width_span = max(east - west, 1.0)
-    height_span = max(north - south, 1.0)
-    if width_span >= height_span:
-        width = max_size
-        height = max(1, round(max_size * (height_span / width_span)))
-    else:
-        height = max_size
-        width = max(1, round(max_size * (width_span / height_span)))
+    world_span = 2.0 * math.pi * WEB_MERCATOR_RADIUS
+    pixels_per_world = 256 * (2**zoom)
+    width = max(1, math.ceil(max(east - west, 1.0) / world_span * pixels_per_world))
+    height = max(1, math.ceil(max(north - south, 1.0) / world_span * pixels_per_world))
+    max_dimension = max(width, height)
+    if max_dimension > max_size:
+        scale = max_size / max_dimension
+        width = max(1, math.ceil(width * scale))
+        height = max(1, math.ceil(height * scale))
     return width, height
 
 
@@ -389,13 +501,14 @@ def _overview_cache_path(
     entry: CatalogEntry,
     variable: str,
     time_index: int,
+    zoom: int,
 ) -> Path:
     digest = hashlib.sha1(
-        f"{entry.id}:{variable}:{time_index}:{settings.planner_version}:{settings.browse_overview_max_size}".encode(
+        f"{entry.id}:{variable}:{time_index}:{zoom}:{settings.planner_version}:{settings.browse_overview_max_size}".encode(
             "utf-8"
         )
     ).hexdigest()[:16]
-    return Path(settings.browse_local_cache_dir) / entry.id / f"{variable}-{time_index}-{digest}.npz"
+    return Path(settings.browse_local_cache_dir) / entry.id / f"{variable}-{time_index}-z{zoom}-{digest}.npz"
 
 
 def _load_overview(path: Path) -> tuple[np.ndarray, tuple[float, float, float, float]]:
