@@ -2,12 +2,15 @@ import numpy as np
 import pytest
 
 from app.core.dataset_catalog import CatalogEntry
+from app.core.dataset_catalog import _refine_bounds_from_nonempty_data
 from app.core.dataset_catalog import _time_labels_from_values
 from app.core.dataset_catalog import _select_projected_array_names
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import read_store_metadata
 from app.models.dataset import DatasetMeta
+from app.models.dataset import VariableMeta
+from app.models.dataset import VariableStats
 
 
 def test_select_projected_array_names_accepts_non_landsat_band_dim_name() -> None:
@@ -138,3 +141,55 @@ def test_ensure_catalog_entry_ready_uses_geotransform_without_loading_coordinate
     assert ready.meta.bounds.west == pytest.approx(29.95)
     assert ready.meta.bounds.east == pytest.approx(30.15)
     assert ready.meta.native_resolution_m is not None
+
+
+def test_refine_bounds_from_nonempty_data_prefers_source_window_over_browse(monkeypatch) -> None:
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="bands",
+        band_array_name="band",
+        band_names=["NDVI"],
+        band_indices={"NDVI": 0},
+        data_array_meta=ZarrV3ArrayMetadata(
+            shape=(2, 1, 200, 300),
+            chunk_shape=(1, 1, 64, 64),
+            data_type="float32",
+            fill_value=np.nan,
+            codecs=[],
+            separator="/",
+            attributes={"band_labels": ["NDVI"]},
+            dimension_names=("time", "band", "y", "x"),
+        ),
+        geo_transform=(10.0, 0.1, 0.0, 20.0, 0.0, -0.1),
+    )
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=2,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.estimate_4d_nonempty_pixel_bounds",
+        lambda **_kwargs: (10, 30, 20, 50),
+    )
+
+    bounds = _refine_bounds_from_nonempty_data(entry=entry, connector=object())  # type: ignore[arg-type]
+
+    assert bounds is not None
+    assert bounds.west == pytest.approx(11.0)
+    assert bounds.east == pytest.approx(13.0)
+    assert bounds.north == pytest.approx(18.0)
+    assert bounds.south == pytest.approx(15.0)

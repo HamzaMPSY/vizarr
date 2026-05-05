@@ -217,6 +217,8 @@ def load_4d_window(
     y_stop: int,
     x_start: int,
     x_stop: int,
+    *,
+    max_parallel_chunk_reads: int | None = None,
 ) -> np.ndarray:
     if len(metadata.shape) != 4:
         raise ValueError(f"{array_name} is not a 4D array")
@@ -253,7 +255,11 @@ def load_4d_window(
     if len(chunk_positions) <= 1:
         loaded_chunks = [_load_chunk(position) for position in chunk_positions]
     else:
-        with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, len(chunk_positions))) as executor:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
@@ -281,6 +287,94 @@ def load_4d_window(
         ]
 
     return window
+
+
+def load_4d_window_decimated(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    time_index: int,
+    band_index: int,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    *,
+    y_step: int,
+    x_step: int,
+    max_parallel_chunk_reads: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(metadata.shape) != 4:
+        raise ValueError(f"{array_name} is not a 4D array")
+    if y_step <= 0 or x_step <= 0:
+        raise ValueError("Decimation steps must be positive integers")
+
+    chunk_t, chunk_b, chunk_y, chunk_x = metadata.effective_chunk_shape
+    if chunk_t != 1 or chunk_b != 1:
+        raise ValueError(f"{array_name} chunk layout is not supported: {metadata.effective_chunk_shape}")
+
+    sampled_y = np.arange(y_start, y_stop, y_step, dtype=np.int64)
+    sampled_x = np.arange(x_start, x_stop, x_step, dtype=np.int64)
+    if sampled_y.size == 0:
+        sampled_y = np.asarray([y_start], dtype=np.int64)
+    if sampled_x.size == 0:
+        sampled_x = np.asarray([x_start], dtype=np.int64)
+    if sampled_y[-1] != (y_stop - 1):
+        sampled_y = np.append(sampled_y, y_stop - 1)
+    if sampled_x[-1] != (x_stop - 1):
+        sampled_x = np.append(sampled_x, x_stop - 1)
+
+    fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+    window = np.full((len(sampled_y), len(sampled_x)), fill_value, dtype=metadata.dtype)
+
+    y_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for row_index, y_value in enumerate(sampled_y.tolist()):
+        y_chunk_index = y_value // chunk_y
+        y_samples_by_chunk.setdefault(y_chunk_index, []).append((row_index, y_value - (y_chunk_index * chunk_y)))
+
+    x_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for col_index, x_value in enumerate(sampled_x.tolist()):
+        x_chunk_index = x_value // chunk_x
+        x_samples_by_chunk.setdefault(x_chunk_index, []).append((col_index, x_value - (x_chunk_index * chunk_x)))
+
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in y_samples_by_chunk
+        for x_chunk_index in x_samples_by_chunk
+    ]
+
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_4d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(time_index, band_index, y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
+
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
+        row_samples = y_samples_by_chunk[y_chunk_index]
+        col_samples = x_samples_by_chunk[x_chunk_index]
+        row_indices = np.asarray([sample[0] for sample in row_samples], dtype=np.int64)
+        col_indices = np.asarray([sample[0] for sample in col_samples], dtype=np.int64)
+        local_y = np.asarray([sample[1] for sample in row_samples], dtype=np.int64)
+        local_x = np.asarray([sample[1] for sample in col_samples], dtype=np.int64)
+        window[np.ix_(row_indices, col_indices)] = chunk[0, 0][np.ix_(local_y, local_x)]
+
+    return window, sampled_y.astype(np.float64), sampled_x.astype(np.float64)
 
 
 def load_4d_chunk(
@@ -320,6 +414,206 @@ def load_4d_chunk(
         f"Unexpected decoded chunk size for {array_name}: "
         f"{flat.size} values, expected {expected_size} or {full_chunk_size}"
     )
+
+
+def estimate_4d_nonempty_pixel_bounds(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    *,
+    time_indices: list[int] | None = None,
+    band_index: int = 0,
+) -> tuple[int, int, int, int] | None:
+    if len(metadata.shape) != 4:
+        raise ValueError(f"{array_name} is not a 4D array")
+
+    sharding = metadata.sharding
+    if sharding is None:
+        return None
+
+    chunk_t, chunk_b, chunk_y, chunk_x = metadata.effective_chunk_shape
+    if chunk_t != 1 or chunk_b != 1:
+        raise ValueError(f"{array_name} chunk layout is not supported: {metadata.effective_chunk_shape}")
+
+    shape_t, shape_b, shape_y, shape_x = metadata.shape
+    if band_index < 0 or band_index >= shape_b:
+        return None
+
+    if time_indices is None:
+        time_indices = list(range(shape_t))
+    else:
+        time_indices = [index for index in time_indices if 0 <= index < shape_t]
+    if not time_indices:
+        return None
+
+    chunk_grid_y = int(np.ceil(shape_y / chunk_y))
+    chunk_grid_x = int(np.ceil(shape_x / chunk_x))
+    chunks_per_shard = _chunks_per_shard(
+        shard_shape=metadata.chunk_shape,
+        inner_chunk_shape=sharding.chunk_shape,
+    )
+    shard_positions = _list_present_shard_positions(
+        connector=connector,
+        store_path=store_path,
+        array_name=array_name,
+        metadata=metadata,
+        time_indices=time_indices,
+        band_index=band_index,
+    )
+    if shard_positions is None:
+        y_shard_count = int(np.ceil(chunk_grid_y / chunks_per_shard[2]))
+        x_shard_count = int(np.ceil(chunk_grid_x / chunks_per_shard[3]))
+        shard_positions = [
+            (time_index, band_index, y_shard_index, x_shard_index)
+            for time_index in time_indices
+            for y_shard_index in range(y_shard_count)
+            for x_shard_index in range(x_shard_count)
+        ]
+
+    def _load_nonempty_chunks(position: tuple[int, int, int, int]) -> list[tuple[int, int]]:
+        time_index, band_index_value, y_shard_index, x_shard_index = position
+        object_path = build_chunk_object_path(
+            store_path=store_path,
+            array_name=array_name,
+            separator=metadata.separator,
+            chunk_indices=(time_index, band_index_value, y_shard_index, x_shard_index),
+        )
+        try:
+            shard_index = _read_shard_index(
+                connector=connector,
+                object_path=object_path,
+                shard_shape=metadata.chunk_shape,
+                inner_chunk_shape=sharding.chunk_shape,
+                index_codecs=sharding.index_codecs,
+                index_location=sharding.index_location,
+            )
+        except FileNotFoundError:
+            return []
+
+        local_y_limit = min(chunks_per_shard[2], chunk_grid_y - (y_shard_index * chunks_per_shard[2]))
+        local_x_limit = min(chunks_per_shard[3], chunk_grid_x - (x_shard_index * chunks_per_shard[3]))
+        nonempty: list[tuple[int, int]] = []
+        for local_y in range(max(local_y_limit, 0)):
+            for local_x in range(max(local_x_limit, 0)):
+                offset = int(shard_index[0, 0, local_y, local_x, 0])
+                length = int(shard_index[0, 0, local_y, local_x, 1])
+                if offset == _UINT64_MAX and length == _UINT64_MAX:
+                    continue
+                nonempty.append(
+                    (
+                        y_shard_index * chunks_per_shard[2] + local_y,
+                        x_shard_index * chunks_per_shard[3] + local_x,
+                    )
+                )
+        return nonempty
+
+    if len(shard_positions) <= 1:
+        shard_results = [_load_nonempty_chunks(position) for position in shard_positions]
+    else:
+        with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, len(shard_positions))) as executor:
+            shard_results = list(executor.map(_load_nonempty_chunks, shard_positions))
+
+    nonempty_chunks = [item for group in shard_results for item in group]
+    if not nonempty_chunks:
+        return None
+
+    y_chunks = [item[0] for item in nonempty_chunks]
+    x_chunks = [item[1] for item in nonempty_chunks]
+    min_y_chunk = min(y_chunks)
+    max_y_chunk = max(y_chunks)
+    min_x_chunk = min(x_chunks)
+    max_x_chunk = max(x_chunks)
+    return (
+        min_x_chunk * chunk_x,
+        min((max_x_chunk + 1) * chunk_x, shape_x),
+        min_y_chunk * chunk_y,
+        min((max_y_chunk + 1) * chunk_y, shape_y),
+    )
+
+
+def estimate_4d_present_shard_pixel_bounds(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    *,
+    time_indices: list[int] | None = None,
+    band_index: int = 0,
+) -> tuple[int, int, int, int] | None:
+    if len(metadata.shape) != 4:
+        raise ValueError(f"{array_name} is not a 4D array")
+
+    sharding = metadata.sharding
+    if sharding is None:
+        return None
+
+    shape_t, shape_b, shape_y, shape_x = metadata.shape
+    if band_index < 0 or band_index >= shape_b:
+        return None
+
+    if time_indices is None:
+        time_indices = list(range(shape_t))
+    else:
+        time_indices = [index for index in time_indices if 0 <= index < shape_t]
+    if not time_indices:
+        return None
+
+    shard_positions = _list_present_shard_positions(
+        connector=connector,
+        store_path=store_path,
+        array_name=array_name,
+        metadata=metadata,
+        time_indices=time_indices,
+        band_index=band_index,
+    )
+    if not shard_positions:
+        return None
+
+    shard_y = int(metadata.chunk_shape[2])
+    shard_x = int(metadata.chunk_shape[3])
+    y_shards = [position[2] for position in shard_positions]
+    x_shards = [position[3] for position in shard_positions]
+    return (
+        min(x_shards) * shard_x,
+        min((max(x_shards) + 1) * shard_x, shape_x),
+        min(y_shards) * shard_y,
+        min((max(y_shards) + 1) * shard_y, shape_y),
+    )
+
+
+def _list_present_shard_positions(
+    *,
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    time_indices: list[int],
+    band_index: int,
+) -> list[tuple[int, int, int, int]] | None:
+    if metadata.separator != "/":
+        return None
+    if not hasattr(connector, "list_prefixes") or not hasattr(connector, "list_objects"):
+        return None
+
+    present: list[tuple[int, int, int, int]] = []
+    array_root = f"{store_path.rstrip('/')}/{array_name}/c"
+
+    for time_index in time_indices:
+        band_root = f"{array_root}/{time_index}/{band_index}/"
+        y_prefixes = connector.list_prefixes(prefix=band_root)
+        for y_prefix in y_prefixes:
+            y_token = y_prefix.removeprefix(band_root).rstrip("/")
+            if not y_token.isdigit():
+                continue
+            y_shard_index = int(y_token)
+            for item in connector.list_objects(prefix=y_prefix, limit=10000):
+                x_token = item.name.rstrip("/").split("/")[-1]
+                if not x_token.isdigit():
+                    continue
+                present.append((time_index, band_index, y_shard_index, int(x_token)))
+
+    return present or None
 
 
 def _resolved_chunk_length(size: int, chunk_size: int, chunk_index: int) -> int:

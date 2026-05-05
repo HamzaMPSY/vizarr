@@ -45,16 +45,7 @@ export const useMapStore = create<MapState>((set) => ({
       timeIndex: 0,
       vmin: null,
       vmax: null,
-      viewState:
-        datasetId === "demo-global"
-          ? state.viewState
-          : {
-              longitude: -9.5,
-              latitude: 31.2,
-              zoom: 7.2,
-              pitch: 0,
-              bearing: 0
-            }
+      viewState: state.viewState
     })),
   setVariable: (variable) => set({ variable, timeIndex: 0, vmin: null, vmax: null }),
   setTimeIndex: (timeIndex) => set({ timeIndex }),

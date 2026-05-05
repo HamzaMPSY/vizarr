@@ -7,10 +7,14 @@ import numpy as np
 from pyproj import CRS, Geod, Transformer
 
 from app.config import Settings
+from app.core.multiscale_store import multiscale_proxy_root
+from app.core.multiscale_store import multiscale_store_path
+from app.core.multiscale_store import probe_multiscale_store
 from app.core.datasets import _stats
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.variable_display import apply_variable_display_defaults
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
+from app.core.zarr_v3 import estimate_4d_nonempty_pixel_bounds
 from app.core.zarr_v3 import load_1d_numeric_array
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
@@ -53,6 +57,7 @@ class CatalogEntry:
     geo_transform: tuple[float, float, float, float, float, float] | None = None
     x_values: np.ndarray | None = None
     y_values: np.ndarray | None = None
+    data_bounds_ready: bool = False
 
 
 def _encode_dataset_id(path: str) -> str:
@@ -262,6 +267,174 @@ def _compute_bounds_from_grid_shape(
     )
 
 
+def _compute_bounds_from_pixel_window(
+    *,
+    x_start: int,
+    x_stop: int,
+    y_start: int,
+    y_stop: int,
+    crs_wkt: str | None,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+) -> DatasetBounds | None:
+    if x_start >= x_stop or y_start >= y_stop or geo_transform is None:
+        return None
+
+    source_crs = CRS.from_wkt(crs_wkt) if crs_wkt else CRS.from_epsg(4326)
+    transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+    origin_x, pixel_width, rot_x, origin_y, rot_y, pixel_height = geo_transform
+
+    def _point(column: int, row: int) -> tuple[float, float]:
+        return (
+            origin_x + (column * pixel_width) + (row * rot_x),
+            origin_y + (column * rot_y) + (row * pixel_height),
+        )
+
+    xs: list[float] = []
+    ys: list[float] = []
+    for column, row in (
+        (x_start, y_start),
+        (x_stop, y_start),
+        (x_stop, y_stop),
+        (x_start, y_stop),
+    ):
+        x_value, y_value = _point(column, row)
+        xs.append(x_value)
+        ys.append(y_value)
+
+    lon_values, lat_values = transformer.transform(xs, ys)
+    west = max(min(lon_values), -180.0)
+    east = min(max(lon_values), 180.0)
+    south = max(min(lat_values), -85.0511)
+    north = min(max(lat_values), 85.0511)
+    return DatasetBounds(
+        west=west,
+        south=south,
+        east=east,
+        north=north,
+    )
+
+
+def _refine_bounds_from_nonempty_data(
+    *,
+    entry: CatalogEntry,
+    connector: OCIObjectStorageConnector,
+) -> DatasetBounds | None:
+    if not entry.meta.variables:
+        return None
+
+    variable_id = entry.meta.variables[0].id
+    time_steps = max(int(entry.data_array_meta.shape[0]) if entry.data_array_meta is not None else 0, 1)
+    source_bounds = _refine_bounds_from_nonempty_source_data(
+        entry=entry,
+        connector=connector,
+        variable_id=variable_id,
+        time_steps=time_steps,
+    )
+    if source_bounds is not None:
+        return source_bounds
+
+    from app.config import get_settings
+    from app.core.browse_tiles import get_or_create_browse_overview
+
+    settings = get_settings()
+    target_zoom = min(getattr(settings, "browse_tile_max_zoom", 5), 5)
+    transformer = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+    refined_west: float | None = None
+    refined_south: float | None = None
+    refined_east: float | None = None
+    refined_north: float | None = None
+
+    for time_index in range(time_steps):
+        try:
+            overview, overview_bbox, _source = get_or_create_browse_overview(
+                settings=settings,
+                connector=connector,
+                entry=entry,
+                variable=variable_id,
+                time_index=time_index,
+                zoom=target_zoom,
+                allow_build=True,
+            )
+        except Exception:
+            logger.exception("Failed to build overview-based bounds for %s time %s", entry.id, time_index)
+            continue
+
+        finite = np.isfinite(overview)
+        if not np.any(finite):
+            continue
+
+        rows, cols = np.where(finite)
+        height, width = overview.shape
+        west, south, east, north = overview_bbox
+        pixel_width = (east - west) / width
+        pixel_height = (north - south) / height
+
+        data_west = west + (int(cols.min()) * pixel_width)
+        data_east = west + ((int(cols.max()) + 1) * pixel_width)
+        data_north = north - (int(rows.min()) * pixel_height)
+        data_south = north - ((int(rows.max()) + 1) * pixel_height)
+
+        lon_values, lat_values = transformer.transform(
+            [data_west, data_east, data_east, data_west],
+            [data_south, data_south, data_north, data_north],
+        )
+        current_west = max(min(lon_values), -180.0)
+        current_east = min(max(lon_values), 180.0)
+        current_south = max(min(lat_values), -85.0511)
+        current_north = min(max(lat_values), 85.0511)
+
+        refined_west = current_west if refined_west is None else min(refined_west, current_west)
+        refined_south = current_south if refined_south is None else min(refined_south, current_south)
+        refined_east = current_east if refined_east is None else max(refined_east, current_east)
+        refined_north = current_north if refined_north is None else max(refined_north, current_north)
+
+    if None in {refined_west, refined_south, refined_east, refined_north}:
+        return None
+    return DatasetBounds(
+        west=refined_west,
+        south=refined_south,
+        east=refined_east,
+        north=refined_north,
+    )
+
+
+def _refine_bounds_from_nonempty_source_data(
+    *,
+    entry: CatalogEntry,
+    connector: OCIObjectStorageConnector,
+    variable_id: str,
+    time_steps: int,
+) -> DatasetBounds | None:
+    if entry.data_array_meta is None or entry.geo_transform is None:
+        return None
+
+    band_index = entry.band_indices.get(variable_id)
+    if band_index is None:
+        return None
+
+    pixel_window = estimate_4d_nonempty_pixel_bounds(
+        connector=connector,
+        store_path=entry.path,
+        array_name=entry.data_array_name,
+        metadata=entry.data_array_meta,
+        time_indices=list(range(time_steps)),
+        band_index=band_index,
+    )
+    if pixel_window is None:
+        return None
+
+    x_start, x_stop, y_start, y_stop = pixel_window
+    return _compute_bounds_from_pixel_window(
+        x_start=x_start,
+        x_stop=x_stop,
+        y_start=y_start,
+        y_stop=y_stop,
+        crs_wkt=entry.crs_wkt,
+        geo_transform=entry.geo_transform,
+    )
+
+
 def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float, float, float] | None:
     if not value:
         return None
@@ -377,6 +550,11 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
                 name=dataset_name,
                 description=dataset_description,
                 variables=[],
+                zarr_format=zarr_format,
+                zarr_consolidated=bool(
+                    store_consolidated if store_consolidated is not None else "consolidated_metadata" in store_metadata
+                ),
+                zarr_proxy_root=f"/api/zarr/{dataset_id}",
             ),
             zarr_format=zarr_format,
             consolidated=bool(
@@ -393,6 +571,18 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             geo_transform=_parse_geo_transform(metadata.get("spatial_ref", {}).get("attributes", {}).get("GeoTransform")),
         )
         entry = catalog[dataset_id]
+        multiscale_summary = probe_multiscale_store(
+            connector=connector,
+            store_path=multiscale_store_path(settings, store_path),
+        )
+        if multiscale_summary is not None:
+            entry.meta.multiscale_store_path = multiscale_summary.path
+            entry.meta.multiscale_zarr_format = multiscale_summary.zarr_format
+            entry.meta.multiscale_zarr_consolidated = multiscale_summary.consolidated
+            entry.meta.multiscale_proxy_root = multiscale_proxy_root(dataset_id)
+            entry.meta.multiscale_population_strategy = multiscale_summary.population_strategy
+            entry.meta.multiscale_prepopulated_zoom_max = multiscale_summary.prepopulated_zoom_max
+            entry.meta.multiscale_max_zoom = multiscale_summary.max_zoom
         if entry.data_array_meta is not None and len(entry.data_array_meta.shape) >= 4:
             bounds = _compute_bounds_from_grid_shape(
                 width=int(entry.data_array_meta.shape[-1]),
@@ -446,7 +636,14 @@ def warm_catalog_index(app, eager_entry_state: bool = False) -> dict[str, Catalo
 
 
 def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
-    if entry.data_array_meta is None or entry.x_meta is None or entry.y_meta is None or not entry.band_names:
+    if (
+        entry.data_array_meta is None
+        or entry.x_meta is None
+        or entry.y_meta is None
+        or not entry.band_names
+        or not entry.band_indices
+        or not entry.meta.variables
+    ):
         _, metadata = _read_dataset_metadata(
             connector=connector,
             store_path=entry.path,
@@ -498,22 +695,12 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
                 metadata=time_meta,
             )
             entry.meta.time_values = _time_labels_from_values(time_values, metadata["time"].get("attributes", {}))
-        if len(entry.band_names) <= 1:
-            stats_samples = [
-                _sample_band_stats(connector, entry, band_index)
-                for band_index in range(len(entry.band_names))
-            ]
-        else:
-            with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_BAND_SAMPLES, len(entry.band_names))) as executor:
-                stats_samples = list(
-                    executor.map(
-                        lambda band_index: _sample_band_stats(connector, entry, band_index),
-                        range(len(entry.band_names)),
-                    )
-                )
         entry.meta.variables = _build_variable_meta(
             entry.band_names,
-            stats_samples=stats_samples,
+            # Keep variable discovery cheap on remote OCI stores. Interactive rendering
+            # uses explicit display defaults and tile-time ranges, so blocking the
+            # sidebar on remote stats sampling is not worth the latency cost.
+            stats_samples=None,
             time_steps=time_steps,
         )
 
@@ -535,6 +722,14 @@ def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectS
             crs_wkt=entry.crs_wkt,
             geo_transform=entry.geo_transform,
         )
+    if not entry.data_bounds_ready:
+        refined_bounds = _refine_bounds_from_nonempty_data(
+            entry=entry,
+            connector=connector,
+        )
+        if refined_bounds is not None:
+            entry.meta.bounds = refined_bounds
+        entry.data_bounds_ready = True
     if entry.meta.native_resolution_m is None and entry.geo_transform is not None:
         entry.meta.native_resolution_m = _estimate_native_resolution_from_geotransform(
             geo_transform=entry.geo_transform,

@@ -1,4 +1,6 @@
 import configparser
+import base64
+import json
 import os
 from dataclasses import dataclass
 
@@ -18,6 +20,11 @@ class OCIAuthContext:
     config: dict
     signer: object
     region_code: str | None
+    token_expires_at_epoch: int | None = None
+
+
+class OCIAuthExpiredError(RuntimeError):
+    pass
 
 
 def _load_local_oci_config(config_file: str, profile_name: str) -> dict:
@@ -60,9 +67,10 @@ def get_oci_auth_context(profile_name: str, config_file: str | None = None) -> O
     token_path = os.path.expanduser(oci_config["security_token_file"])
     with open(token_path, "r", encoding="utf-8") as handle:
         token = handle.read()
+    token_expires_at_epoch = _extract_token_expiry_epoch(token)
     token_container = oci.auth.security_token_container.SecurityTokenContainer(None, token)
     if not token_container.valid():
-        raise RuntimeError(
+        raise OCIAuthExpiredError(
             "OCI CLI token has expired. Re-authenticate before starting the backend."
         )
     private_key = oci.signer.load_private_key_from_file(oci_config["key_file"])
@@ -71,4 +79,24 @@ def get_oci_auth_context(profile_name: str, config_file: str | None = None) -> O
         config=oci_config,
         signer=signer,
         region_code=all_regions.get(oci_config.get("region")),
+        token_expires_at_epoch=token_expires_at_epoch,
     )
+
+
+def _extract_token_expiry_epoch(token: str) -> int | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8")
+        parsed = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+    try:
+        return int(parsed.get("exp"))
+    except (TypeError, ValueError):
+        return None

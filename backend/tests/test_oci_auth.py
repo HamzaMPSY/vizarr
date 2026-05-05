@@ -1,3 +1,5 @@
+import base64
+import json
 from pathlib import Path
 
 from app.core.oci_auth import get_oci_auth_context
@@ -11,7 +13,8 @@ def test_get_oci_auth_context_accepts_security_token_profile_without_user(
     key_path = tmp_path / "session.pem"
     token_path = tmp_path / "token"
     key_path.write_text("private-key", encoding="utf-8")
-    token_path.write_text("token", encoding="utf-8")
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": 1_234_567_890}).encode("utf-8")).decode("utf-8").rstrip("=")
+    token_path.write_text(f"header.{payload}.signature", encoding="utf-8")
     config_path.write_text(
         "\n".join(
             [
@@ -56,4 +59,5 @@ def test_get_oci_auth_context_accepts_security_token_profile_without_user(
     assert auth.config["tenancy"] == "ocid1.tenancy.oc1..example"
     assert auth.config["key_file"] == str(key_path)
     assert auth.config["security_token_file"] == str(token_path)
-    assert auth.signer == {"token": "token", "private_key": "private-key"}
+    assert auth.signer == {"token": f"header.{payload}.signature", "private_key": "private-key"}
+    assert auth.token_expires_at_epoch == 1_234_567_890

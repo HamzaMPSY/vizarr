@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 RequestClass = Literal["tile", "preview", "stats", "small_clip", "export"]
 ExecutionPath = Literal["interactive", "batch"]
-Representation = Literal["browse", "serving", "source"]
+Representation = Literal["browse", "serving", "source", "pyramid"]
 
 
 class QueryPlan(BaseModel):
