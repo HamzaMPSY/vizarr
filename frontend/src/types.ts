@@ -11,6 +11,9 @@ export interface VariableMeta {
   unit: string;
   time_steps: number;
   stats: VariableStats;
+  display_vmin?: number | null;
+  display_vmax?: number | null;
+  default_colormap?: string | null;
 }
 
 export interface DatasetBounds {
@@ -26,4 +29,5 @@ export interface DatasetMeta {
   description: string;
   variables: VariableMeta[];
   bounds?: DatasetBounds | null;
+  time_values?: string[] | null;
 }

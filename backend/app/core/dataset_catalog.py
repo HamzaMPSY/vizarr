@@ -1,18 +1,21 @@
 import base64
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 
 from app.config import Settings
 from app.core.datasets import _stats
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.variable_display import apply_variable_display_defaults
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import load_1d_numeric_array
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
 from app.core.zarr_v3 import parse_array_metadata
+from app.core.zarr_v3 import read_consolidated_metadata
 from app.core.zarr_v3 import read_store_metadata
 from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta
 
@@ -29,6 +32,7 @@ LANDSAT_BAND_NAMES = {
 
 
 logger = logging.getLogger(__name__)
+_MAX_PARALLEL_BAND_SAMPLES = 4
 
 
 @dataclass
@@ -98,6 +102,10 @@ def _build_variable_meta(
     variables: list[VariableMeta] = []
     for band_index, band_name in enumerate(band_names):
         band_id, band_title = _build_label(band_name)
+        display_vmin, display_vmax, default_colormap = apply_variable_display_defaults(
+            variable_id=band_id,
+            variable_name=band_title,
+        )
         sample = (
             stats_samples[band_index]
             if stats_samples is not None and band_index < len(stats_samples)
@@ -110,6 +118,9 @@ def _build_variable_meta(
                 unit="DN",
                 time_steps=time_steps,
                 stats=_stats(sample),
+                display_vmin=display_vmin,
+                display_vmax=display_vmax,
+                default_colormap=default_colormap,
             )
         )
     return variables
@@ -213,6 +224,44 @@ def _compute_bounds(
     )
 
 
+def _compute_bounds_from_grid_shape(
+    *,
+    width: int,
+    height: int,
+    crs_wkt: str | None,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+) -> DatasetBounds | None:
+    if width <= 0 or height <= 0 or geo_transform is None:
+        return None
+
+    source_crs = CRS.from_wkt(crs_wkt) if crs_wkt else CRS.from_epsg(4326)
+    transformer = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+    origin_x, pixel_width, rot_x, origin_y, rot_y, pixel_height = geo_transform
+    xs = [
+        origin_x,
+        origin_x + width * pixel_width,
+        origin_x + width * pixel_width + height * rot_x,
+        origin_x + height * rot_x,
+    ]
+    ys = [
+        origin_y,
+        origin_y + width * rot_y,
+        origin_y + width * rot_y + height * pixel_height,
+        origin_y + height * pixel_height,
+    ]
+    lon_values, lat_values = transformer.transform(xs, ys)
+    west = max(min(lon_values), -180.0)
+    east = min(max(lon_values), 180.0)
+    south = max(min(lat_values), -85.0511)
+    north = min(max(lat_values), 85.0511)
+    return DatasetBounds(
+        west=west,
+        south=south,
+        east=east,
+        north=north,
+    )
+
+
 def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float, float, float] | None:
     if not value:
         return None
@@ -222,46 +271,151 @@ def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float,
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
 
 
+def _estimate_native_resolution_from_geotransform(
+    *,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+    crs_wkt: str | None,
+    bounds: DatasetBounds | None,
+) -> float | None:
+    if geo_transform is None:
+        return None
+    _origin_x, pixel_width, _rot_x, _origin_y, _rot_y, pixel_height = geo_transform
+    samples = [value for value in (abs(pixel_width), abs(pixel_height)) if value > 0]
+    if not samples:
+        return None
+
+    if crs_wkt:
+        crs = CRS.from_wkt(crs_wkt)
+        if crs.is_projected and crs.axis_info:
+            conversion = float(crs.axis_info[0].unit_conversion_factor or 1.0)
+            return float(sum(samples) / len(samples) * conversion)
+
+    center_lon = 0.0 if bounds is None else (bounds.west + bounds.east) / 2.0
+    center_lat = 0.0 if bounds is None else (bounds.south + bounds.north) / 2.0
+    geod = Geod(ellps="WGS84")
+    metric_samples = [
+        abs(geod.line_length([center_lon, center_lon + sample], [center_lat, center_lat]))
+        for sample in [abs(pixel_width)]
+        if sample > 0
+    ]
+    if abs(pixel_height) > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon], [center_lat, center_lat + abs(pixel_height)])))
+    metric_samples = [value for value in metric_samples if value > 0]
+    if not metric_samples:
+        return None
+    return float(sum(metric_samples) / len(metric_samples))
+
+
+def _resolve_direct_store_path(settings: Settings) -> str | None:
+    oci_zarr_path = getattr(settings, "oci_zarr_path", "")
+    if oci_zarr_path:
+        return oci_zarr_path.removeprefix("oci://").split("/", 1)[-1]
+
+    prefix = getattr(settings, "oci_prefix", "").rstrip("/")
+    if prefix.endswith(".zarr"):
+        return prefix
+    return None
+
+
+def has_direct_store_target(settings: Settings) -> bool:
+    return _resolve_direct_store_path(settings) is not None
+
+
+def _read_dataset_metadata(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+) -> tuple[dict, dict]:
+    store_metadata, metadata = read_consolidated_metadata(
+        connector=connector,
+        store_path=store_path,
+    )
+    if metadata:
+        return store_metadata, metadata
+    return read_store_metadata(
+        connector=connector,
+        store_path=store_path,
+    )
+
+
 def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector) -> dict[str, CatalogEntry]:
-    stores = connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
+    direct_store_path = _resolve_direct_store_path(settings)
+    stores = [] if direct_store_path is not None else connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
     catalog: dict[str, CatalogEntry] = {}
 
-    for store in stores:
-        if store.zarr_format != 3:
-            continue
-        if not store.path.endswith(".zarr"):
+    store_paths: list[tuple[str, int | None, bool | None]]
+    if direct_store_path is not None:
+        store_paths = [(direct_store_path, None, None)]
+    else:
+        store_paths = [(store.path, store.zarr_format, store.consolidated) for store in stores]
+
+    for store_path, store_zarr_format, store_consolidated in store_paths:
+        if not store_path.endswith(".zarr"):
             continue
 
         try:
-            _, metadata = read_store_metadata(
+            store_metadata, metadata = _read_dataset_metadata(
                 connector=connector,
-                store_path=store.path,
+                store_path=store_path,
             )
+            zarr_format = int(store_metadata.get("zarr_format", store_zarr_format or 0))
+            if zarr_format != 3:
+                continue
             data_array_name, band_array_name = _select_projected_array_names(metadata)
         except Exception as exc:
-            logger.warning("Skipping unsupported dataset store %s: %s", store.path, exc)
+            logger.warning("Skipping unsupported dataset store %s: %s", store_path, exc)
             continue
 
-        dataset_id = _encode_dataset_id(store.path)
-        dataset_name = store.path.split("/")[-1]
-        dataset_description = f"OCI Zarr store at {store.path}"
+        dataset_id = _encode_dataset_id(store_path)
+        dataset_name = store_path.split("/")[-1]
+        dataset_description = f"OCI Zarr store at {store_path}"
 
         catalog[dataset_id] = CatalogEntry(
             id=dataset_id,
-            path=store.path,
+            path=store_path,
             meta=DatasetMeta(
                 id=dataset_id,
                 name=dataset_name,
                 description=dataset_description,
                 variables=[],
             ),
-            zarr_format=store.zarr_format,
-            consolidated=store.consolidated,
+            zarr_format=zarr_format,
+            consolidated=bool(
+                store_consolidated if store_consolidated is not None else "consolidated_metadata" in store_metadata
+            ),
             data_array_name=data_array_name,
             band_array_name=band_array_name,
             band_names=[],
             band_indices={},
+            data_array_meta=parse_array_metadata(metadata[data_array_name]),
+            x_meta=parse_array_metadata(metadata["x"]) if "x" in metadata else None,
+            y_meta=parse_array_metadata(metadata["y"]) if "y" in metadata else None,
+            crs_wkt=metadata.get("spatial_ref", {}).get("attributes", {}).get("crs_wkt"),
+            geo_transform=_parse_geo_transform(metadata.get("spatial_ref", {}).get("attributes", {}).get("GeoTransform")),
         )
+        entry = catalog[dataset_id]
+        if entry.data_array_meta is not None and len(entry.data_array_meta.shape) >= 4:
+            bounds = _compute_bounds_from_grid_shape(
+                width=int(entry.data_array_meta.shape[-1]),
+                height=int(entry.data_array_meta.shape[-2]),
+                crs_wkt=entry.crs_wkt,
+                geo_transform=entry.geo_transform,
+            )
+            entry.meta.bounds = bounds
+            entry.meta.native_resolution_m = _estimate_native_resolution_from_geotransform(
+                geo_transform=entry.geo_transform,
+                crs_wkt=entry.crs_wkt,
+                bounds=bounds,
+            )
+            time_node = metadata.get("time")
+            if isinstance(time_node, dict):
+                time_meta = parse_array_metadata(time_node)
+                time_values = load_1d_numeric_array(
+                    connector=connector,
+                    store_path=entry.path,
+                    array_name="time",
+                    metadata=time_meta,
+                )
+                entry.meta.time_values = _time_labels_from_values(time_values, time_node.get("attributes", {}))
 
     return catalog
 
@@ -270,7 +424,7 @@ def build_dataset_manifest(catalog: dict[str, CatalogEntry]) -> list[DatasetMeta
     return [entry.meta.model_copy(deep=True) for entry in catalog.values()]
 
 
-def warm_catalog_index(app) -> dict[str, CatalogEntry]:
+def warm_catalog_index(app, eager_entry_state: bool = False) -> dict[str, CatalogEntry]:
     settings = app.state.settings
     connector = app.state.storage_connector
     if connector is None:
@@ -279,6 +433,12 @@ def warm_catalog_index(app) -> dict[str, CatalogEntry]:
         return {}
 
     catalog = build_catalog_index(settings=settings, connector=connector)
+    if eager_entry_state:
+        for entry in catalog.values():
+            try:
+                ensure_catalog_entry_ready(entry, connector)
+            except Exception as exc:
+                logger.warning("Skipping eager catalog warm-up for %s: %s", entry.path, exc)
     app.state.dataset_catalog = catalog
     app.state.dataset_manifest = build_dataset_manifest(catalog)
     logger.info("Built OCI dataset manifest with %d dataset(s)", len(app.state.dataset_manifest))
@@ -287,7 +447,7 @@ def warm_catalog_index(app) -> dict[str, CatalogEntry]:
 
 def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
     if entry.data_array_meta is None or entry.x_meta is None or entry.y_meta is None or not entry.band_names:
-        _, metadata = read_store_metadata(
+        _, metadata = _read_dataset_metadata(
             connector=connector,
             store_path=entry.path,
         )
@@ -329,10 +489,28 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
 
         time_steps = int(metadata[data_array_name]["shape"][0]) if metadata[data_array_name]["shape"] else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
-        stats_samples = [
-            _sample_band_stats(connector, entry, band_index)
-            for band_index in range(len(entry.band_names))
-        ]
+        if "time" in metadata:
+            time_meta = parse_array_metadata(metadata["time"])
+            time_values = load_1d_numeric_array(
+                connector=connector,
+                store_path=entry.path,
+                array_name="time",
+                metadata=time_meta,
+            )
+            entry.meta.time_values = _time_labels_from_values(time_values, metadata["time"].get("attributes", {}))
+        if len(entry.band_names) <= 1:
+            stats_samples = [
+                _sample_band_stats(connector, entry, band_index)
+                for band_index in range(len(entry.band_names))
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_BAND_SAMPLES, len(entry.band_names))) as executor:
+                stats_samples = list(
+                    executor.map(
+                        lambda band_index: _sample_band_stats(connector, entry, band_index),
+                        range(len(entry.band_names)),
+                    )
+                )
         entry.meta.variables = _build_variable_meta(
             entry.band_names,
             stats_samples=stats_samples,
@@ -344,6 +522,28 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
 
 def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectStorageConnector) -> CatalogEntry:
     ensure_catalog_entry_metadata_ready(entry, connector)
+
+    if (
+        entry.meta.bounds is None
+        and entry.data_array_meta is not None
+        and len(entry.data_array_meta.shape) >= 4
+        and entry.geo_transform is not None
+    ):
+        entry.meta.bounds = _compute_bounds_from_grid_shape(
+            width=int(entry.data_array_meta.shape[-1]),
+            height=int(entry.data_array_meta.shape[-2]),
+            crs_wkt=entry.crs_wkt,
+            geo_transform=entry.geo_transform,
+        )
+    if entry.meta.native_resolution_m is None and entry.geo_transform is not None:
+        entry.meta.native_resolution_m = _estimate_native_resolution_from_geotransform(
+            geo_transform=entry.geo_transform,
+            crs_wkt=entry.crs_wkt,
+            bounds=entry.meta.bounds,
+        )
+
+    if entry.meta.bounds is not None and entry.meta.native_resolution_m is not None:
+        return entry
 
     if entry.x_values is None:
         if entry.x_meta is None:
@@ -375,6 +575,14 @@ def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectS
             crs_wkt=entry.crs_wkt,
             geo_transform=entry.geo_transform,
         )
+    if entry.meta.native_resolution_m is None and entry.x_values is not None and entry.y_values is not None:
+        entry.meta.native_resolution_m = _estimate_native_resolution_m(
+            x_values=entry.x_values,
+            y_values=entry.y_values,
+            crs_wkt=entry.crs_wkt,
+            geo_transform=entry.geo_transform,
+            bounds=entry.meta.bounds,
+        )
 
     return entry
 
@@ -389,3 +597,61 @@ def get_or_build_catalog(app) -> dict[str, CatalogEntry]:
         return existing
 
     return warm_catalog_index(app)
+
+
+def _estimate_native_resolution_m(
+    *,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    crs_wkt: str | None,
+    geo_transform: tuple[float, float, float, float, float, float] | None,
+    bounds: DatasetBounds | None,
+) -> float | None:
+    x_step = _axis_resolution(x_values, preferred=abs(geo_transform[1]) if geo_transform is not None else None)
+    y_step = _axis_resolution(y_values, preferred=abs(geo_transform[5]) if geo_transform is not None else None)
+    samples = [value for value in (x_step, y_step) if value is not None and value > 0]
+    if not samples:
+        return None
+
+    if crs_wkt:
+        crs = CRS.from_wkt(crs_wkt)
+        if crs.is_projected and crs.axis_info:
+            conversion = float(crs.axis_info[0].unit_conversion_factor or 1.0)
+            return float(sum(samples) / len(samples) * conversion)
+
+    center_lon = 0.0 if bounds is None else (bounds.west + bounds.east) / 2.0
+    center_lat = 0.0 if bounds is None else (bounds.south + bounds.north) / 2.0
+    geod = Geod(ellps="WGS84")
+    metric_samples: list[float] = []
+    if x_step is not None and x_step > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon + x_step], [center_lat, center_lat])))
+    if y_step is not None and y_step > 0:
+        metric_samples.append(abs(geod.line_length([center_lon, center_lon], [center_lat, center_lat + y_step])))
+    metric_samples = [value for value in metric_samples if value > 0]
+    if not metric_samples:
+        return None
+    return float(sum(metric_samples) / len(metric_samples))
+
+
+def _axis_resolution(values: np.ndarray, preferred: float | None = None) -> float | None:
+    if preferred is not None and preferred > 0:
+        return float(preferred)
+    if values.size < 2:
+        return None
+    diffs = np.abs(np.diff(values.astype(np.float64, copy=False)))
+    finite = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if finite.size == 0:
+        return None
+    return float(np.median(finite))
+
+
+def _time_labels_from_values(values: np.ndarray, attributes: dict[str, object]) -> list[str]:
+    if values.size == 0:
+        return []
+
+    units = str(attributes.get("units", ""))
+    if values.dtype == np.dtype(np.int64) and units.startswith("nanoseconds since 1970-01-01T00:00:00"):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    if np.issubdtype(values.dtype, np.datetime64):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    return [str(value.item() if hasattr(value, "item") else value) for value in values]

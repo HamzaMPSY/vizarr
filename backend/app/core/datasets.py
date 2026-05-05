@@ -2,7 +2,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
+from pyproj import Geod
 
+from app.core.variable_display import apply_variable_display_defaults
 from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta, VariableStats
 
 
@@ -106,6 +108,10 @@ def build_metadata(
     for variable_name, data_array in dataset.data_vars.items():
         dims = data_array.sizes
         time_steps = int(dims.get("time", 1))
+        display_vmin, display_vmax, default_colormap = apply_variable_display_defaults(
+            variable_id=variable_name,
+            variable_name=variable_name.replace("_", " ").title(),
+        )
         variables.append(
             VariableMeta(
                 id=variable_name,
@@ -113,6 +119,9 @@ def build_metadata(
                 unit=units.get(variable_name, "unknown"),
                 time_steps=time_steps,
                 stats=_stats_for_data_array(data_array),
+                display_vmin=display_vmin,
+                display_vmax=display_vmax,
+                default_colormap=default_colormap,
             )
         )
 
@@ -122,6 +131,8 @@ def build_metadata(
         description=dataset_description,
         variables=variables,
         bounds=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+        native_resolution_m=_estimate_native_resolution_m(dataset),
+        time_values=_time_labels_from_values(np.asarray(dataset.coords["time"].values)) if "time" in dataset.coords else None,
     )
 
 
@@ -150,3 +161,46 @@ def build_registry() -> DatasetRegistry:
         dataset_name=str(dataset.attrs["name"]),
         dataset_description=str(dataset.attrs["description"]),
     )
+
+
+def _estimate_native_resolution_m(dataset: xr.Dataset) -> float | None:
+    lat_name = next((name for name in ("lat", "latitude", "y") if name in dataset.coords), None)
+    lon_name = next((name for name in ("lon", "longitude", "x") if name in dataset.coords), None)
+    if lat_name is None or lon_name is None:
+        return None
+
+    lat_values = np.asarray(dataset.coords[lat_name].values, dtype=np.float64)
+    lon_values = np.asarray(dataset.coords[lon_name].values, dtype=np.float64)
+    if lat_values.size < 2 or lon_values.size < 2:
+        return None
+
+    lat_step = _median_axis_step(lat_values)
+    lon_step = _median_axis_step(lon_values)
+    if lat_step is None or lon_step is None:
+        return None
+
+    center_lat = float(np.clip(np.nanmean(lat_values), -85.0, 85.0))
+    center_lon = float(np.clip(np.nanmean(lon_values), -180.0, 180.0))
+    geod = Geod(ellps="WGS84")
+    lon_m = abs(geod.line_length([center_lon, center_lon + lon_step], [center_lat, center_lat]))
+    lat_m = abs(geod.line_length([center_lon, center_lon], [center_lat, center_lat + lat_step]))
+    samples = [value for value in (lon_m, lat_m) if value > 0]
+    if not samples:
+        return None
+    return float(sum(samples) / len(samples))
+
+
+def _median_axis_step(values: np.ndarray) -> float | None:
+    diffs = np.abs(np.diff(values))
+    finite = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if finite.size == 0:
+        return None
+    return float(np.median(finite))
+
+
+def _time_labels_from_values(values: np.ndarray) -> list[str]:
+    if values.size == 0:
+        return []
+    if np.issubdtype(values.dtype, np.datetime64):
+        return [str(value).split("T", 1)[0] for value in values.astype("datetime64[ns]")]
+    return [str(value.item() if hasattr(value, "item") else value) for value in values]

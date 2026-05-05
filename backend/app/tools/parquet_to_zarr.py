@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from dataclasses import replace
@@ -39,6 +40,8 @@ DEFAULT_WRITE_BATCH = 10
 DEFAULT_MAX_GRID_CELLS = 50_000_000
 DEFAULT_CHUNK_SIZE = 256
 DEFAULT_ZARR_V3_SHARD_SIZE = 4096
+DEFAULT_TRANSIENT_READ_RETRIES = 3
+DEFAULT_TRANSIENT_READ_RETRY_DELAY_SECONDS = 2.0
 GRID_COORD_DECIMALS = 12
 
 
@@ -64,6 +67,7 @@ class ConversionConfig:
     source_crs: str | None = None
     x_snap_origin: float | None = None
     y_snap_origin: float | None = None
+    preserve_points: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,14 @@ def _parse_args() -> argparse.Namespace:
         default="first",
         choices=("first", "mode"),
         help="How to combine string/categorical values when multiple rows land in the same grid cell. Default: first.",
+    )
+    parser.add_argument(
+        "--preserve-points",
+        action="store_true",
+        help=(
+            "Infer or clamp x/y resolutions to the finest observed regular coordinate step before writing Zarr. "
+            "Use this for source cubes when distinct point rows should not be merged by a coarse snap grid."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -314,6 +326,12 @@ def _required_columns(config: ConversionConfig) -> list[str] | None:
     return columns
 
 
+def _initial_read_columns(config: ConversionConfig) -> list[str] | None:
+    if config.value_columns is None:
+        return None
+    return _required_columns(config)
+
+
 def _first_value(series: pd.Series) -> Any:
     non_null = series.dropna()
     if non_null.empty:
@@ -329,6 +347,26 @@ def _mode_value(series: pd.Series) -> Any:
     if modes.empty:
         return non_null.iloc[0]
     return modes.iloc[0]
+
+
+def _coerce_numeric_series(series: pd.Series, column: str) -> pd.Series | None:
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+
+    non_null = series.dropna()
+    if non_null.empty:
+        return None
+
+    try:
+        coerced = pd.to_numeric(series, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+
+    if int(coerced.notna().sum()) != int(non_null.size):
+        return None
+
+    logger.info("Coerced value column %s from dtype=%s to numeric dtype=%s", column, series.dtype, coerced.dtype)
+    return coerced
 
 
 def _is_auth_error(error: BaseException) -> bool:
@@ -349,6 +387,42 @@ def _raise_auth_expired(error: BaseException) -> None:
     ) from error
 
 
+def _is_transient_read_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, (ConnectionError, TimeoutError, OSError)):
+            return True
+        message = str(current)
+        if (
+            "Remote end closed connection without response" in message
+            or "Connection aborted" in message
+            or "ProtocolError" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _read_table_with_retries(read_fn, parquet_uri: str):
+    for attempt in range(1, DEFAULT_TRANSIENT_READ_RETRIES + 1):
+        try:
+            return read_fn()
+        except Exception as error:
+            if _is_auth_error(error):
+                logger.error("OCI auth failure while reading parquet dataset %s", parquet_uri)
+                _raise_auth_expired(error)
+            if attempt >= DEFAULT_TRANSIENT_READ_RETRIES or not _is_transient_read_error(error):
+                raise
+            logger.warning(
+                "Transient parquet read failure for %s on attempt %d/%d: %s",
+                parquet_uri,
+                attempt,
+                DEFAULT_TRANSIENT_READ_RETRIES,
+                error,
+            )
+            time.sleep(DEFAULT_TRANSIENT_READ_RETRY_DELAY_SECONDS * attempt)
+
+
 def _read_partitioned_parquet(
     filesystem: Any,
     parquet_uri: str,
@@ -365,13 +439,7 @@ def _read_partitioned_parquet(
         partitioning="hive",
     )
     logger.debug("Reading parquet dataset at %s", parquet_uri)
-    try:
-        table = dataset.to_table(columns=columns)
-    except Exception as error:
-        if _is_auth_error(error):
-            logger.error("OCI auth failure while reading parquet dataset %s", parquet_uri)
-            _raise_auth_expired(error)
-        raise
+    table = _read_table_with_retries(lambda: dataset.to_table(columns=columns), parquet_uri)
     frame = table.to_pandas()
     logger.info(
         "Read parquet dataset %s with %d row(s), %d column(s)",
@@ -689,6 +757,9 @@ def _encode_value_column(
     target_dtype: str,
 ) -> tuple[np.ndarray, str, dict[str, Any]]:
     series = frame[column]
+    coerced_numeric = _coerce_numeric_series(series, column)
+    if coerced_numeric is not None:
+        series = coerced_numeric
     if pd.api.types.is_numeric_dtype(series):
         return series.to_numpy(dtype=target_dtype), target_dtype, {}
 
@@ -734,6 +805,68 @@ def _snap_to_resolution(series: pd.Series, resolution: float, origin: float | No
     return pd.Series(snapped, index=series.index, dtype=np.float64)
 
 
+def _minimum_positive_step(values: np.ndarray) -> float | None:
+    unique_values = np.unique(np.round(values.astype(np.float64), decimals=GRID_COORD_DECIMALS))
+    if unique_values.size < 2:
+        return None
+    diffs = np.diff(np.sort(unique_values))
+    positive_diffs = diffs[diffs > 0]
+    if positive_diffs.size == 0:
+        return None
+    return float(positive_diffs.min())
+
+
+def _resolve_point_preserving_resolutions(
+    coordinate_frames: dict[str, pd.DataFrame],
+    parquet_uris: list[str],
+    config: ConversionConfig,
+) -> tuple[float | None, float | None]:
+    if not config.preserve_points:
+        return config.x_resolution, config.y_resolution
+
+    transformed_frames = [
+        _transform_coordinate_frame(coordinate_frames[parquet_uri], config)
+        for parquet_uri in parquet_uris
+    ]
+    x_steps = [
+        step
+        for frame in transformed_frames
+        if (step := _minimum_positive_step(frame[config.x_column].to_numpy(dtype=np.float64))) is not None
+    ]
+    y_steps = [
+        step
+        for frame in transformed_frames
+        if (step := _minimum_positive_step(frame[config.y_column].to_numpy(dtype=np.float64))) is not None
+    ]
+    resolved_x = config.x_resolution
+    resolved_y = config.y_resolution
+
+    if x_steps:
+        finest_x = min(x_steps)
+        if resolved_x is None or resolved_x > finest_x:
+            resolved_x = finest_x
+    if y_steps:
+        finest_y = min(y_steps)
+        if resolved_y is None or resolved_y > finest_y:
+            resolved_y = finest_y
+
+    if resolved_x != config.x_resolution or resolved_y != config.y_resolution:
+        logger.info(
+            "Adjusted point-preserving raster resolution: x_resolution=%s->%s y_resolution=%s->%s",
+            config.x_resolution,
+            resolved_x,
+            config.y_resolution,
+            resolved_y,
+        )
+    else:
+        logger.info(
+            "Point-preserving raster resolution already satisfied: x_resolution=%s y_resolution=%s",
+            resolved_x,
+            resolved_y,
+        )
+    return resolved_x, resolved_y
+
+
 def _prepare_spatial_frame(
     df: pd.DataFrame,
     config: ConversionConfig,
@@ -741,6 +874,10 @@ def _prepare_spatial_frame(
 ) -> pd.DataFrame:
     columns = [config.x_column, config.y_column, *value_columns]
     frame = _transform_coordinate_frame(df[columns].copy(), config)
+    for column in value_columns:
+        coerced_numeric = _coerce_numeric_series(frame[column], column)
+        if coerced_numeric is not None:
+            frame[column] = coerced_numeric
 
     if config.x_resolution is not None:
         frame[config.x_column] = _snap_to_resolution(
@@ -1125,6 +1262,8 @@ def _grid_dataset(
         coords["band"] = np.asarray(value_columns, dtype=str)
 
     dataset = xr.Dataset(data_vars=data_vars, coords=coords)
+    dataset.attrs["source_input_rows"] = int(len(df.index))
+    dataset.attrs["source_output_rows"] = int(len(spatial_df.index))
     dataset[config.x_dim].attrs["axis"] = "X"
     dataset[config.y_dim].attrs["axis"] = "Y"
     if config.layout == "bands":
@@ -1163,6 +1302,37 @@ def _grid_dataset(
         [name for name in dataset.data_vars if name != "spatial_ref"],
     )
     return dataset
+
+
+def _build_ingest_summary(
+    *,
+    parquet_uri: str,
+    timestamp: np.datetime64,
+    config: ConversionConfig,
+    value_columns: tuple[str, ...],
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    input_rows: int,
+    output_rows: int,
+) -> dict[str, Any]:
+    stored_variables = ["bands"] if config.layout == "bands" else list(value_columns)
+    return {
+        "source": parquet_uri,
+        "timestamp": str(timestamp),
+        "variables": stored_variables,
+        "value_columns": list(value_columns),
+        "input_rows": int(input_rows),
+        "output_rows": int(output_rows),
+        "aggregation_ratio": (float(output_rows) / float(input_rows)) if input_rows else None,
+        "x_resolution": config.x_resolution,
+        "y_resolution": config.y_resolution,
+        "preserve_points": config.preserve_points,
+        "shape": {
+            "time": 1,
+            config.y_dim: int(len(y_values)),
+            config.x_dim: int(len(x_values)),
+        },
+    }
 
 
 def _data_chunk_shape(variable: xr.DataArray, dataset: xr.Dataset, chunk_size: int) -> tuple[int, ...] | None:
@@ -1420,16 +1590,16 @@ def _write_sparse_time_slice(
             sort_keys=True,
         )
 
-    return {
-        "source": parquet_uri,
-        "timestamp": str(timestamp),
-        "variables": ["bands"] if config.layout == "bands" else list(value_columns),
-        "shape": {
-            "time": 1,
-            config.y_dim: int(len(y_values)),
-            config.x_dim: int(len(x_values)),
-        },
-    }
+    return _build_ingest_summary(
+        parquet_uri=parquet_uri,
+        timestamp=timestamp,
+        config=config,
+        value_columns=value_columns,
+        x_values=x_values,
+        y_values=y_values,
+        input_rows=len(frame.index),
+        output_rows=len(spatial_df.index),
+    )
 
 
 def _write_sparse_inputs(
@@ -1623,7 +1793,11 @@ def _append_inputs(
             len(expected_y),
         )
     first_uri = normalized_links[0]
-    first_frame = _read_partitioned_parquet(filesystem, first_uri, columns=None)
+    first_frame = _read_partitioned_parquet(
+        filesystem,
+        first_uri,
+        columns=_initial_read_columns(config),
+    )
     value_columns = _detect_value_columns(first_frame, config)
     config = replace(config, value_columns=value_columns)
     if existing_context is not None:
@@ -1641,6 +1815,16 @@ def _append_inputs(
         first_frame=first_frame,
         config=config,
         max_workers=read_workers,
+    )
+    resolved_x_resolution, resolved_y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=normalized_links,
+        config=config,
+    )
+    config = replace(
+        config,
+        x_resolution=resolved_x_resolution,
+        y_resolution=resolved_y_resolution,
     )
     if existing_context is not None:
         resolved_x_origin = _existing_grid_snap_origin(existing_context.x_values)
@@ -1769,16 +1953,16 @@ def _append_inputs(
             expected_y = dataset[config.y_dim].values
             batch_datasets.append(dataset)
             summaries.append(
-                {
-                    "source": time_slice.source_uri,
-                    "timestamp": str(dataset["time"].values[0]),
-                    "variables": [name for name in dataset.data_vars if name != "spatial_ref"],
-                    "shape": {
-                        "time": int(dataset.sizes["time"]),
-                        config.y_dim: int(dataset.sizes[config.y_dim]),
-                        config.x_dim: int(dataset.sizes[config.x_dim]),
-                    },
-                }
+                _build_ingest_summary(
+                    parquet_uri=time_slice.source_uri,
+                    timestamp=dataset["time"].values[0],
+                    config=config,
+                    value_columns=config.value_columns or (),
+                    x_values=np.asarray(dataset[config.x_dim].values, dtype=np.float64),
+                    y_values=np.asarray(dataset[config.y_dim].values, dtype=np.float64),
+                    input_rows=int(dataset.attrs.get("source_input_rows", len(frame.index))),
+                    output_rows=int(dataset.attrs.get("source_output_rows", len(frame.index))),
+                )
             )
             logger.info(
                 "Completed time slice %d of %d: %s @ %s",
@@ -1878,6 +2062,7 @@ def main() -> None:
         source_crs=args.source_crs,
         x_snap_origin=args.x_snap_origin,
         y_snap_origin=args.y_snap_origin,
+        preserve_points=args.preserve_points,
     )
 
     parquet_links = _load_links(args.links_file)

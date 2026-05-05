@@ -7,7 +7,7 @@ import { useMapStore } from "./store/mapStore";
 
 function App() {
   const { data: datasets } = useDatasets();
-  const { datasetId, variable, setDataset, setVariable } = useMapStore();
+  const { datasetId, variable, setDataset, setVariable, setRange, setColormap } = useMapStore();
   const { data: variables } = useVariables(datasetId);
 
   useEffect(() => {
@@ -22,6 +22,23 @@ function App() {
     }
   }, [setVariable, variable, variables]);
 
+  useEffect(() => {
+    if (!variable || !variables) {
+      return;
+    }
+
+    const selectedVariable = variables.find((item) => item.id === variable);
+    if (!selectedVariable) {
+      return;
+    }
+
+    setRange(
+      selectedVariable.display_vmin ?? selectedVariable.stats.p02,
+      selectedVariable.display_vmax ?? selectedVariable.stats.p98,
+    );
+    setColormap(selectedVariable.default_colormap ?? "viridis");
+  }, [setColormap, setRange, variable, variables]);
+
   return (
     <div className="app-shell">
       <Sidebar />
@@ -33,4 +50,3 @@ function App() {
 }
 
 export default App;
-

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from collections import OrderedDict
+from threading import Lock
 
 import fsspec
 import oci
@@ -32,6 +33,8 @@ class OCIObjectStorageConnector:
         self._text_cache: OrderedDict[str, str] = OrderedDict()
         self._bytes_cache: OrderedDict[str, bytes] = OrderedDict()
         self._bytes_cache_size = 0
+        self._text_cache_lock = Lock()
+        self._bytes_cache_lock = Lock()
 
     def _build_auth(self) -> OCIAuthContext:
         return get_oci_auth_context(
@@ -97,20 +100,23 @@ class OCIObjectStorageConnector:
         *,
         use_cache: bool = True,
     ) -> str:
-        resolved = object_path.removeprefix("oci://")
-        if use_cache and resolved in self._text_cache:
-            self._text_cache.move_to_end(resolved)
-            return self._text_cache[resolved]
+        resolved = self._filesystem_path(object_path)
+        if use_cache:
+            with self._text_cache_lock:
+                if resolved in self._text_cache:
+                    self._text_cache.move_to_end(resolved)
+                    return self._text_cache[resolved]
 
         try:
             payload = self.get_filesystem().cat_file(resolved).decode("utf-8")
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._text_cache[resolved] = payload
-            self._text_cache.move_to_end(resolved)
-            while len(self._text_cache) > 256:
-                self._text_cache.popitem(last=False)
+            with self._text_cache_lock:
+                self._text_cache[resolved] = payload
+                self._text_cache.move_to_end(resolved)
+                while len(self._text_cache) > 256:
+                    self._text_cache.popitem(last=False)
         return payload
 
     def read_bytes(
@@ -119,23 +125,74 @@ class OCIObjectStorageConnector:
         *,
         use_cache: bool = False,
     ) -> bytes:
-        resolved = object_path.removeprefix("oci://")
-        if use_cache and resolved in self._bytes_cache:
-            self._bytes_cache.move_to_end(resolved)
-            return self._bytes_cache[resolved]
+        resolved = self._filesystem_path(object_path)
+        if use_cache:
+            with self._bytes_cache_lock:
+                if resolved in self._bytes_cache:
+                    self._bytes_cache.move_to_end(resolved)
+                    return self._bytes_cache[resolved]
 
         try:
             payload = self.get_filesystem().cat_file(resolved)
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[resolved] = payload
-            self._bytes_cache.move_to_end(resolved)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[resolved] = payload
+                self._bytes_cache.move_to_end(resolved)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
+
+    def write_bytes(
+        self,
+        object_path: str,
+        payload: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        resolved = object_path.removeprefix("oci://")
+        self.client.put_object(
+            namespace_name=self.namespace,
+            bucket_name=self._settings.oci_bucket,
+            object_name=self._object_name_from_path(resolved),
+            put_object_body=payload,
+            content_type=content_type,
+        )
+        self._evict_cached_object(resolved)
+
+    def write_text(
+        self,
+        object_path: str,
+        payload: str,
+        *,
+        content_type: str = "application/json",
+    ) -> None:
+        resolved = object_path.removeprefix("oci://")
+        self.client.put_object(
+            namespace_name=self.namespace,
+            bucket_name=self._settings.oci_bucket,
+            object_name=self._object_name_from_path(resolved),
+            put_object_body=payload.encode("utf-8"),
+            content_type=content_type,
+        )
+        self._evict_cached_object(resolved)
+
+    def object_exists(self, object_path: str) -> bool:
+        resolved = object_path.removeprefix("oci://")
+        try:
+            self.client.head_object(
+                namespace_name=self.namespace,
+                bucket_name=self._settings.oci_bucket,
+                object_name=self._object_name_from_path(resolved),
+            )
+            return True
+        except oci.exceptions.ServiceError as error:
+            if error.status == 404:
+                return False
+            raise
 
     def read_byte_range(
         self,
@@ -145,23 +202,26 @@ class OCIObjectStorageConnector:
         end: int | None = None,
         use_cache: bool = False,
     ) -> bytes:
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         cache_key = f"{resolved}::{start if start is not None else ''}:{end if end is not None else ''}"
-        if use_cache and cache_key in self._bytes_cache:
-            self._bytes_cache.move_to_end(cache_key)
-            return self._bytes_cache[cache_key]
+        if use_cache:
+            with self._bytes_cache_lock:
+                if cache_key in self._bytes_cache:
+                    self._bytes_cache.move_to_end(cache_key)
+                    return self._bytes_cache[cache_key]
 
         try:
             payload = self.get_filesystem().cat_file(resolved, start=start, end=end)
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[cache_key] = payload
-            self._bytes_cache.move_to_end(cache_key)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[cache_key] = payload
+                self._bytes_cache.move_to_end(cache_key)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
 
     def read_byte_tail(
@@ -174,11 +234,13 @@ class OCIObjectStorageConnector:
         if length <= 0:
             return b""
 
-        resolved = object_path.removeprefix("oci://")
+        resolved = self._filesystem_path(object_path)
         cache_key = f"{resolved}::tail:{length}"
-        if use_cache and cache_key in self._bytes_cache:
-            self._bytes_cache.move_to_end(cache_key)
-            return self._bytes_cache[cache_key]
+        if use_cache:
+            with self._bytes_cache_lock:
+                if cache_key in self._bytes_cache:
+                    self._bytes_cache.move_to_end(cache_key)
+                    return self._bytes_cache[cache_key]
 
         try:
             payload = self.client.get_object(
@@ -190,12 +252,13 @@ class OCIObjectStorageConnector:
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
         if use_cache:
-            self._bytes_cache[cache_key] = payload
-            self._bytes_cache.move_to_end(cache_key)
-            self._bytes_cache_size += len(payload)
-            while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                _, evicted = self._bytes_cache.popitem(last=False)
-                self._bytes_cache_size -= len(evicted)
+            with self._bytes_cache_lock:
+                self._bytes_cache[cache_key] = payload
+                self._bytes_cache.move_to_end(cache_key)
+                self._bytes_cache_size += len(payload)
+                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
+                    _, evicted = self._bytes_cache.popitem(last=False)
+                    self._bytes_cache_size -= len(evicted)
         return payload
 
     def _object_name_from_path(self, object_path: str) -> str:
@@ -203,9 +266,34 @@ class OCIObjectStorageConnector:
         bucket_prefix = f"{self._settings.oci_bucket}@{self.namespace}/"
         if resolved.startswith(bucket_prefix):
             return resolved[len(bucket_prefix) :]
+        bucket_name_prefix = f"{self._settings.oci_bucket}/"
+        if resolved.startswith(bucket_name_prefix):
+            return resolved[len(bucket_name_prefix) :]
         if "/" in resolved and "@" in resolved.split("/", 1)[0]:
             return resolved.split("/", 1)[1]
         return resolved
+
+    def _filesystem_path(self, object_path: str) -> str:
+        resolved = object_path.removeprefix("oci://").lstrip("/")
+        bucket_prefix = f"{self._settings.oci_bucket}@{self.namespace}/"
+        if resolved.startswith(bucket_prefix):
+            return resolved
+        bucket_name_prefix = f"{self._settings.oci_bucket}/"
+        if resolved.startswith(bucket_name_prefix):
+            return f"{bucket_prefix}{resolved[len(bucket_name_prefix):]}"
+        if "/" in resolved and "@" in resolved.split("/", 1)[0]:
+            return resolved
+        return f"{bucket_prefix}{resolved}"
+
+    def _evict_cached_object(self, resolved_path: str) -> None:
+        with self._text_cache_lock:
+            self._text_cache.pop(resolved_path, None)
+        with self._bytes_cache_lock:
+            keys_to_remove = [key for key in self._bytes_cache if key == resolved_path or key.startswith(f"{resolved_path}::")]
+            for key in keys_to_remove:
+                removed = self._bytes_cache.pop(key, None)
+                if removed is not None:
+                    self._bytes_cache_size -= len(removed)
 
     def list_objects(self, prefix: str | None = None, limit: int = 200) -> list[OCIObjectSummary]:
         effective_prefix = self._settings.oci_prefix if prefix is None else prefix

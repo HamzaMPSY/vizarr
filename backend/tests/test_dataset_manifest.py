@@ -4,9 +4,11 @@ from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import build_catalog_index
 from app.core.dataset_catalog import build_dataset_manifest
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
+from app.core.dataset_catalog import has_direct_store_target
 from app.core.dataset_catalog import warm_catalog_index
 from app.core.oci_object_storage import ZarrStoreSummary
 from app.models.dataset import DatasetMeta
+from app.models.dataset import VariableMeta
 
 
 def test_build_dataset_manifest_returns_detached_meta_copies() -> None:
@@ -72,6 +74,59 @@ def test_warm_catalog_index_populates_catalog_and_manifest(monkeypatch) -> None:
     assert app.state.dataset_catalog is catalog
     assert app.state.dataset_manifest is not None
     assert [item.id for item in app.state.dataset_manifest] == ["dataset-1"]
+
+
+def test_warm_catalog_index_can_eagerly_ready_entries(monkeypatch) -> None:
+    catalog = {
+        "dataset-1": CatalogEntry(
+            id="dataset-1",
+            path="cubes/example.zarr",
+            meta=DatasetMeta(
+                id="dataset-1",
+                name="example.zarr",
+                description="Example dataset",
+                variables=[],
+            ),
+            zarr_format=3,
+            consolidated=False,
+            data_array_name="bands",
+            band_array_name="band",
+            band_names=[],
+            band_indices={},
+        )
+    }
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            settings=object(),
+            storage_connector=object(),
+            dataset_catalog=None,
+            dataset_manifest=None,
+        )
+    )
+
+    monkeypatch.setattr("app.core.dataset_catalog.build_catalog_index", lambda **_kwargs: catalog)
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.ensure_catalog_entry_ready",
+        lambda entry, _connector: entry.meta.variables.append(
+            VariableMeta(
+                id="band-1",
+                name="Band 1",
+                unit="DN",
+                time_steps=1,
+                stats={
+                    "min": 0.0,
+                    "max": 1.0,
+                    "p02": 0.0,
+                    "p98": 1.0,
+                },
+            )
+        ),
+    )
+
+    result = warm_catalog_index(app, eager_entry_state=True)
+
+    assert result is catalog
+    assert len(app.state.dataset_manifest[0].variables) == 1
 
 
 def test_ensure_catalog_entry_metadata_ready_does_not_load_coordinates(monkeypatch) -> None:
@@ -189,3 +244,75 @@ def test_build_catalog_index_skips_unsupported_store(monkeypatch) -> None:
 
     assert len(catalog) == 1
     assert next(iter(catalog.values())).path == "cubes/good.zarr"
+
+
+def test_build_catalog_index_accepts_direct_store_prefix_without_listing(monkeypatch) -> None:
+    connector = SimpleNamespace()
+    settings = SimpleNamespace(
+        oci_prefix="cubes/example.zarr",
+        oci_zarr_path="",
+    )
+
+    monkeypatch.setattr(
+        connector,
+        "list_zarr_stores",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("direct store path should skip prefix listing")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.core.dataset_catalog.read_consolidated_metadata",
+        lambda *, store_path, **_kwargs: (
+            {"zarr_format": 3, "consolidated_metadata": {"metadata": {}}},
+            {
+                "cube": {
+                    "shape": [1, 2, 4, 4],
+                    "dimension_names": ["time", "bandish", "y", "x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [1, 1, 2, 2]}},
+                    "data_type": "uint16",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "bandish": {
+                    "shape": [2],
+                    "dimension_names": ["bandish"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [2]}},
+                    "data_type": {"name": "fixed_length_utf32", "configuration": {"length_bytes": 8}},
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "x": {
+                    "shape": [4],
+                    "dimension_names": ["x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "y": {
+                    "shape": [4],
+                    "dimension_names": ["y"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+            },
+        ),
+    )
+
+    catalog = build_catalog_index(settings=settings, connector=connector)  # type: ignore[arg-type]
+
+    assert len(catalog) == 1
+    assert next(iter(catalog.values())).path == "cubes/example.zarr"
+
+
+def test_has_direct_store_target_detects_direct_prefix() -> None:
+    settings = SimpleNamespace(oci_prefix="cubes/example.zarr", oci_zarr_path="")
+
+    assert has_direct_store_target(settings) is True
+
+
+def test_has_direct_store_target_detects_explicit_zarr_path() -> None:
+    settings = SimpleNamespace(oci_prefix="cubes", oci_zarr_path="oci://bucket@namespace/cubes/example.zarr")
+
+    assert has_direct_store_target(settings) is True

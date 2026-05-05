@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,7 @@ _DTYPE_MAP = {
 }
 
 _UINT64_MAX = (1 << 64) - 1
+_MAX_PARALLEL_CHUNK_READS = 8
 
 
 @dataclass(frozen=True)
@@ -139,8 +141,10 @@ def load_1d_numeric_array(
 
     chunk_size = metadata.effective_chunk_shape[0]
     chunk_count = int(np.ceil(metadata.shape[0] / chunk_size))
-    values: list[np.ndarray] = []
-    for chunk_index in range(chunk_count):
+    if chunk_count <= 0:
+        return np.asarray([], dtype=metadata.dtype)
+
+    def read_chunk(chunk_index: int) -> np.ndarray:
         decoded = _read_array_chunk_bytes(
             connector=connector,
             store_path=store_path,
@@ -153,10 +157,11 @@ def load_1d_numeric_array(
             chunk_size=chunk_size,
             chunk_index=chunk_index,
         )
-        values.append(np.frombuffer(decoded, dtype=metadata.dtype, count=expected_count).copy())
+        return np.frombuffer(decoded, dtype=metadata.dtype, count=expected_count).copy()
 
-    if not values:
-        return np.asarray([], dtype=metadata.dtype)
+    with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, chunk_count)) as executor:
+        values = list(executor.map(read_chunk, range(chunk_count)))
+
     return np.concatenate(values, axis=0)
 
 
@@ -228,37 +233,52 @@ def load_4d_window(
     x_chunk_start = x_start // chunk_x
     x_chunk_stop = (x_stop - 1) // chunk_x + 1
 
-    for y_chunk_index in range(y_chunk_start, y_chunk_stop):
-        for x_chunk_index in range(x_chunk_start, x_chunk_stop):
-            chunk = load_4d_chunk(
-                connector=connector,
-                store_path=store_path,
-                array_name=array_name,
-                metadata=metadata,
-                chunk_indices=(time_index, band_index, y_chunk_index, x_chunk_index),
-            )
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in range(y_chunk_start, y_chunk_stop)
+        for x_chunk_index in range(x_chunk_start, x_chunk_stop)
+    ]
 
-            chunk_y_start = y_chunk_index * chunk_y
-            chunk_x_start = x_chunk_index * chunk_x
-            chunk_y_stop = chunk_y_start + chunk.shape[2]
-            chunk_x_stop = chunk_x_start + chunk.shape[3]
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_4d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(time_index, band_index, y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
 
-            src_y_start = max(y_start - chunk_y_start, 0)
-            src_y_stop = min(y_stop - chunk_y_start, chunk.shape[2])
-            src_x_start = max(x_start - chunk_x_start, 0)
-            src_x_stop = min(x_stop - chunk_x_start, chunk.shape[3])
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, len(chunk_positions))) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
 
-            dst_y_start = max(chunk_y_start - y_start, 0)
-            dst_y_stop = dst_y_start + (src_y_stop - src_y_start)
-            dst_x_start = max(chunk_x_start - x_start, 0)
-            dst_x_stop = dst_x_start + (src_x_stop - src_x_start)
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
 
-            window[dst_y_start:dst_y_stop, dst_x_start:dst_x_stop] = chunk[
-                0,
-                0,
-                src_y_start:src_y_stop,
-                src_x_start:src_x_stop,
-            ]
+        chunk_y_start = y_chunk_index * chunk_y
+        chunk_x_start = x_chunk_index * chunk_x
+        chunk_y_stop = chunk_y_start + chunk.shape[2]
+        chunk_x_stop = chunk_x_start + chunk.shape[3]
+
+        src_y_start = max(y_start - chunk_y_start, 0)
+        src_y_stop = min(y_stop - chunk_y_start, chunk.shape[2])
+        src_x_start = max(x_start - chunk_x_start, 0)
+        src_x_stop = min(x_stop - chunk_x_start, chunk.shape[3])
+
+        dst_y_start = max(chunk_y_start - y_start, 0)
+        dst_y_stop = dst_y_start + (src_y_stop - src_y_start)
+        dst_x_start = max(chunk_x_start - x_start, 0)
+        dst_x_stop = dst_x_start + (src_x_stop - src_x_start)
+
+        window[dst_y_start:dst_y_stop, dst_x_start:dst_x_stop] = chunk[
+            0,
+            0,
+            src_y_start:src_y_stop,
+            src_x_start:src_x_stop,
+        ]
 
     return window
 

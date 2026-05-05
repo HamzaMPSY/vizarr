@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -5,16 +7,24 @@ import xarray as xr
 
 from app.tools.parquet_to_zarr import ConversionConfig
 from app.tools.parquet_to_zarr import ExistingStoreContext
+from app.tools.parquet_to_zarr import _build_ingest_summary
 from app.tools.parquet_to_zarr import _build_input_time_slices
 from app.tools.parquet_to_zarr import _build_regular_axis
 from app.tools.parquet_to_zarr import _build_to_zarr_kwargs
 from app.tools.parquet_to_zarr import _build_grid_array
 from app.tools.parquet_to_zarr import _build_spatial_ref_attrs
+from app.tools.parquet_to_zarr import _coerce_numeric_series
 from app.tools.parquet_to_zarr import _detect_value_columns
+from app.tools.parquet_to_zarr import _encode_value_column
 from app.tools.parquet_to_zarr import _extract_existing_value_columns
 from app.tools.parquet_to_zarr import _extract_timestamps
+from app.tools.parquet_to_zarr import _initial_read_columns
+from app.tools.parquet_to_zarr import _is_transient_read_error
+from app.tools.parquet_to_zarr import _read_table_with_retries
 from app.tools.parquet_to_zarr import _grid_dataset
+from app.tools.parquet_to_zarr import _minimum_positive_step
 from app.tools.parquet_to_zarr import _prepare_spatial_frame
+from app.tools.parquet_to_zarr import _resolve_point_preserving_resolutions
 from app.tools.parquet_to_zarr import _resolve_snap_origins
 from app.tools.parquet_to_zarr import _resolve_target_grid
 from app.tools.parquet_to_zarr import _regular_step
@@ -29,6 +39,16 @@ from app.tools.parquet_to_zarr import _validate_expected_columns_against_existin
 def test_regular_step_detects_even_spacing() -> None:
     values = np.array([10.0, 20.0, 30.0], dtype=np.float64)
     assert _regular_step(values) == 10.0
+
+
+def test_minimum_positive_step_ignores_duplicate_values() -> None:
+    values = np.array([10.0, 10.0, 10.05, 10.07], dtype=np.float64)
+    assert _minimum_positive_step(values) == pytest.approx(0.02)
+
+
+def test_minimum_positive_step_ignores_sub_precision_jitter() -> None:
+    values = np.array([10.0, 10.0 + 1e-13, 10.05], dtype=np.float64)
+    assert _minimum_positive_step(values) == pytest.approx(0.05)
 
 
 def test_validate_storage_layout_rejects_non_multiple_shard_size() -> None:
@@ -67,6 +87,49 @@ def test_detect_value_columns_skips_coordinate_and_partition_fields() -> None:
     assert _detect_value_columns(frame, config) == ("signal",)
 
 
+def test_coerce_numeric_series_accepts_decimal_objects() -> None:
+    series = pd.Series([Decimal("0.1"), Decimal("0.2"), None], dtype=object)
+
+    coerced = _coerce_numeric_series(series, "NDVI")
+
+    assert coerced is not None
+    assert pd.api.types.is_float_dtype(coerced)
+    assert coerced.tolist()[:2] == pytest.approx([0.1, 0.2])
+
+
+def test_encode_value_column_treats_decimal_objects_as_numeric() -> None:
+    frame = pd.DataFrame({"NDVI": [Decimal("0.1"), Decimal("0.2"), None]}, dtype=object)
+
+    encoded, dtype, attrs = _encode_value_column(frame, "NDVI", "float32")
+
+    assert dtype == "float32"
+    assert attrs == {}
+    np.testing.assert_allclose(encoded[:2], np.array([0.1, 0.2], dtype=np.float32))
+    assert np.isnan(encoded[2])
+
+
+def test_is_transient_read_error_detects_remote_disconnect() -> None:
+    error = ConnectionError("Remote end closed connection without response")
+
+    assert _is_transient_read_error(error) is True
+
+
+def test_read_table_with_retries_retries_transient_failure(monkeypatch) -> None:
+    monkeypatch.setattr("app.tools.parquet_to_zarr.time.sleep", lambda *_args, **_kwargs: None)
+    attempts = {"count": 0}
+
+    def flaky_read():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionError("Connection aborted.")
+        return "ok"
+
+    result = _read_table_with_retries(flaky_read, "oci://Ayoub@test/maize.parquet")
+
+    assert result == "ok"
+    assert attempts["count"] == 2
+
+
 def test_build_spatial_ref_attrs_includes_geotransform() -> None:
     attrs = _build_spatial_ref_attrs(
         x_values=np.array([100.0, 130.0], dtype=np.float64),
@@ -97,6 +160,29 @@ def test_required_columns_include_coords_timestamp_and_explicit_values() -> None
         string_cell_aggregation="first",
     )
     assert _required_columns(config) == ["lon", "lat", "acquired_at", "band_1", "band_2"]
+
+
+def test_initial_read_columns_skips_full_scan_when_values_are_explicit() -> None:
+    config = ConversionConfig(
+        x_column="lon",
+        y_column="lat",
+        value_columns=("band_1", "band_2"),
+        layout="bands",
+        timestamp_column="acquired_at",
+        timestamp_regex=None,
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs=None,
+        max_grid_cells=1_000,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+    )
+
+    assert _initial_read_columns(config) == ["lon", "lat", "acquired_at", "band_1", "band_2"]
 
 
 def test_extract_timestamps_returns_multiple_sorted_values_from_column() -> None:
@@ -321,6 +407,47 @@ def test_build_grid_array_places_values_by_coordinate_index() -> None:
     assert result[0].tolist() == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_build_ingest_summary_reports_source_and_aggregated_rows() -> None:
+    summary = _build_ingest_summary(
+        parquet_uri="oci://Ayoub@test/maize.parquet",
+        timestamp=np.datetime64("2025-01-15T00:00:00.000000000"),
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=0.5,
+            y_resolution=0.5,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+        ),
+        value_columns=("NDVI",),
+        x_values=np.array([10.0, 10.5], dtype=np.float64),
+        y_values=np.array([20.5, 20.0], dtype=np.float64),
+        input_rows=4,
+        output_rows=2,
+    )
+
+    assert summary["source"] == "oci://Ayoub@test/maize.parquet"
+    assert summary["variables"] == ["bands"]
+    assert summary["value_columns"] == ["NDVI"]
+    assert summary["input_rows"] == 4
+    assert summary["output_rows"] == 2
+    assert summary["aggregation_ratio"] == 0.5
+    assert summary["x_resolution"] == 0.5
+    assert summary["y_resolution"] == 0.5
+    assert summary["preserve_points"] is False
+    assert summary["shape"] == {"time": 1, "y": 2, "x": 2}
+
+
 def test_grid_dataset_builds_time_slice_with_spatial_metadata() -> None:
     frame = pd.DataFrame(
         {
@@ -359,6 +486,8 @@ def test_grid_dataset_builds_time_slice_with_spatial_metadata() -> None:
     assert dataset["value"].shape == (1, 2, 2)
     assert dataset["time"].values[0] == np.datetime64("2026-01-17T00:00:00.000000000")
     assert dataset["value"].values[0].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert dataset.attrs["source_input_rows"] == 4
+    assert dataset.attrs["source_output_rows"] == 4
     assert dataset["spatial_ref"].attrs["GeoTransform"] == "5.0 10.0 0.0 55.0 0.0 -10.0"
 
 
@@ -391,7 +520,7 @@ def test_grid_dataset_fails_fast_for_sparse_point_cloud_shape() -> None:
         string_cell_aggregation="first",
     )
 
-    with pytest.raises(ValueError, match="dense regular grid"):
+    with pytest.raises(ValueError, match="Dense grid too large"):
         _grid_dataset(
             frame,
             parquet_uri="oci://Ayoub@test/maize.parquet",
@@ -434,8 +563,8 @@ def test_prepare_spatial_frame_snaps_and_aggregates_duplicate_cells() -> None:
     assert len(prepared.index) == 2
     assert prepared["LONGITUDE"].tolist() == [10.0, 10.5]
     assert prepared["LATITUDE"].tolist() == [20.0, 20.5]
-    assert prepared["NDVI"].tolist() == [0.3, 0.6]
-    assert prepared["FINAL_PREDICTION"].tolist() == [2.0, 5.0]
+    assert prepared["NDVI"].tolist() == pytest.approx([0.3, 0.6])
+    assert prepared["FINAL_PREDICTION"].tolist() == pytest.approx([2.0, 5.0])
 
 
 def test_prepare_coordinate_frame_deduplicates_without_value_columns() -> None:
@@ -509,7 +638,13 @@ def test_grid_dataset_builds_snapped_cube_from_point_rows() -> None:
 
     assert dataset["x"].values.tolist() == [10.0, 10.5]
     assert dataset["y"].values.tolist() == [20.5, 20.0]
-    assert dataset["NDVI"].values[0].tolist() == [[np.nan, 0.7], [0.3, np.nan]]
+    np.testing.assert_allclose(
+        dataset["NDVI"].values[0],
+        np.array([[np.nan, 0.7], [0.3, np.nan]], dtype=np.float32),
+        equal_nan=True,
+    )
+    assert dataset.attrs["source_input_rows"] == 4
+    assert dataset.attrs["source_output_rows"] == 2
 
 
 def test_grid_dataset_encodes_string_value_columns() -> None:
@@ -550,7 +685,11 @@ def test_grid_dataset_encodes_string_value_columns() -> None:
 
     assert dataset["LABEL"].attrs["categorical_encoding"] == {"0": "corn", "1": "soy"}
     assert dataset["LABEL"].attrs["_FillValue"] == -1
-    assert dataset["LABEL"].values[0].tolist() == [[-1.0, 1.0], [0.0, -1.0]]
+    np.testing.assert_allclose(
+        dataset["LABEL"].values[0],
+        np.array([[np.nan, 1.0], [0.0, np.nan]], dtype=np.float32),
+        equal_nan=True,
+    )
 
 
 def test_build_to_zarr_kwargs_defaults_to_v3_shape() -> None:
@@ -654,8 +793,14 @@ def test_grid_dataset_builds_viewer_compatible_bands_cube() -> None:
 
     assert dataset["bands"].shape == (1, 2, 2, 2)
     assert dataset["band"].values.tolist() == ["NDVI", "FINAL_PREDICTION"]
-    assert dataset["bands"].values[0, 0].tolist() == [[0.1, 0.2], [0.3, 0.4]]
-    assert dataset["bands"].values[0, 1].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 0],
+        np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 1],
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+    )
     assert dataset["bands"].attrs["grid_mapping"] == "spatial_ref"
 
 
@@ -722,11 +867,18 @@ def test_grid_dataset_reindexes_to_shared_target_grid() -> None:
     assert dataset["x"].values.tolist() == [10.0, 11.0, 12.0]
     assert dataset["y"].values.tolist() == [50.0, 49.0, 48.0]
     assert dataset["bands"].shape == (1, 1, 3, 3)
-    assert dataset["bands"].values[0, 0].tolist() == [
-        [0.2, np.nan, np.nan],
-        [np.nan, 0.8, np.nan],
-        [np.nan, np.nan, np.nan],
-    ]
+    np.testing.assert_allclose(
+        dataset["bands"].values[0, 0],
+        np.array(
+            [
+                [0.2, np.nan, np.nan],
+                [np.nan, 0.8, np.nan],
+                [np.nan, np.nan, np.nan],
+            ],
+            dtype=np.float32,
+        ),
+        equal_nan=True,
+    )
 
 
 def test_resolve_target_grid_uses_global_resolution_extent(monkeypatch) -> None:
@@ -775,6 +927,91 @@ def test_resolve_target_grid_uses_global_resolution_extent(monkeypatch) -> None:
 
     assert target_x.tolist() == [10.0, 10.5, 11.0, 11.5]
     assert target_y.tolist() == [20.5, 20.0, 19.5, 19.0]
+
+
+def test_resolve_point_preserving_resolutions_clamps_coarse_grid() -> None:
+    coordinate_frames = {
+        "oci://Ayoub@test/first.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.00, 10.05, 10.10],
+                "LATITUDE": [20.00, 20.02, 20.04],
+            }
+        ),
+        "oci://Ayoub@test/second.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.15, 10.20],
+                "LATITUDE": [20.06, 20.08],
+            }
+        ),
+    }
+
+    x_resolution, y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=[
+            "oci://Ayoub@test/first.parquet",
+            "oci://Ayoub@test/second.parquet",
+        ],
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=0.1,
+            y_resolution=0.1,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+            preserve_points=True,
+        ),
+    )
+
+    assert x_resolution == pytest.approx(0.05)
+    assert y_resolution == pytest.approx(0.02)
+
+
+def test_resolve_point_preserving_resolutions_infers_missing_grid() -> None:
+    coordinate_frames = {
+        "oci://Ayoub@test/first.parquet": pd.DataFrame(
+            {
+                "LONGITUDE": [10.00, 10.05, 10.10],
+                "LATITUDE": [20.00, 20.02, 20.04],
+            }
+        ),
+    }
+
+    x_resolution, y_resolution = _resolve_point_preserving_resolutions(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=["oci://Ayoub@test/first.parquet"],
+        config=ConversionConfig(
+            x_column="LONGITUDE",
+            y_column="LATITUDE",
+            value_columns=("NDVI",),
+            layout="bands",
+            timestamp_column="START_DATE",
+            timestamp_regex=None,
+            x_dim="x",
+            y_dim="y",
+            y_descending=True,
+            dtype="float32",
+            crs="EPSG:4326",
+            max_grid_cells=1_000,
+            x_resolution=None,
+            y_resolution=None,
+            cell_aggregation="mean",
+            string_cell_aggregation="first",
+            preserve_points=True,
+        ),
+    )
+
+    assert x_resolution == pytest.approx(0.05)
+    assert y_resolution == pytest.approx(0.02)
 
 
 def test_resolve_snap_origins_projects_and_infers_shared_10m_grid() -> None:

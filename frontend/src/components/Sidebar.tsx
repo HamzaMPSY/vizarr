@@ -11,6 +11,8 @@ export function Sidebar() {
     variable,
     timeIndex,
     colormap,
+    vmin,
+    vmax,
     setDataset,
     setVariable,
     setTimeIndex,
@@ -34,12 +36,16 @@ export function Sidebar() {
           variable,
           timeIndex,
           colormap,
-          vmin: null,
-          vmax: null
+          vmin,
+          vmax
         })
           .replace("{z}", "1")
           .replace("{x}", "1")
           .replace("{y}", "1")
+      : null;
+  const selectedTimeLabel =
+    selectedDataset?.time_values && timeIndex >= 0 && timeIndex < selectedDataset.time_values.length
+      ? selectedDataset.time_values[timeIndex]
       : null;
 
   return (
@@ -93,7 +99,8 @@ export function Sidebar() {
           <div className="stats">
             <span>Unit: {selectedVariable.unit}</span>
             <span>
-              Range: {selectedVariable.stats.p02.toFixed(1)} to {selectedVariable.stats.p98.toFixed(1)}
+              Range: {(vmin ?? selectedVariable.display_vmin ?? selectedVariable.stats.p02).toFixed(2)} to{" "}
+              {(vmax ?? selectedVariable.display_vmax ?? selectedVariable.stats.p98).toFixed(2)}
             </span>
           </div>
         ) : null}
@@ -110,7 +117,9 @@ export function Sidebar() {
           onChange={(event) => setTimeIndex(Number(event.target.value))}
           disabled={!selectedVariable}
         />
-        <p className="muted">Current time index: {timeIndex}</p>
+        <p className="muted">
+          Current time: {selectedTimeLabel ?? `index ${timeIndex}`}
+        </p>
       </section>
 
       <section className="panel">
@@ -133,8 +142,8 @@ export function Sidebar() {
         <ul>
           <li>Backend tiles: live</li>
           <li>Frontend map: live</li>
-          <li>Redis cache: live</li>
-          <li>Cloud Zarr access: pending</li>
+          <li>Redis cache: optional</li>
+          <li>Cloud Zarr access: live</li>
         </ul>
       </section>
 

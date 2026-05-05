@@ -6,4 +6,4 @@ def test_synthetic_registry_contains_expected_dataset() -> None:
     assert registry.meta.id == "demo-global"
     variable_ids = {item.id for item in registry.meta.variables}
     assert variable_ids == {"temperature", "precipitation"}
-
+    assert registry.meta.time_values == ["0", "1", "2", "3"]
