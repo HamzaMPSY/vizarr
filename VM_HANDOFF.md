@@ -116,7 +116,7 @@ If your OCI setup already exists, just confirm the token is valid.
 
 ## 8. Run The Live Backend On The VM
 
-This uses the current live maize cube:
+This uses an OCI Zarr prefix that you provide on the VM:
 
 ```bash
 cd ~/work/vizarr/backend
@@ -124,9 +124,9 @@ cd ~/work/vizarr/backend
 OCI_CONFIG_FILE=$HOME/.oci/config \
 OCI_CONFIG_PROFILE=prof \
 STORAGE_BACKEND=oci_zarr \
-OCI_NAMESPACE=lrdwfp6kyp5x \
-OCI_BUCKET=Ayoub \
-OCI_PREFIX=cubes/maize_2025_live4.zarr \
+OCI_NAMESPACE=<object-storage-namespace> \
+OCI_BUCKET=<bucket-name> \
+OCI_PREFIX=<prefix-or-zarr-store> \
 OCI_BROWSE_PREFIX_ROOT=browse \
 BROWSE_PREWARM_ENABLED=false \
 PYTHONPATH=$PWD \
@@ -156,10 +156,10 @@ Datasets:
 curl http://127.0.0.1:8015/api/datasets
 ```
 
-Variables:
+Variables, after copying a real dataset id from the datasets response:
 
 ```bash
-curl http://127.0.0.1:8015/api/datasets/Y3ViZXMvbWFpemVfMjAyNV9saXZlNC56YXJy/variables
+curl http://127.0.0.1:8015/api/datasets/<dataset-id>/variables
 ```
 
 Frontend:

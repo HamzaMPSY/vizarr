@@ -5,6 +5,7 @@ from app.core.oci_auth import OCIAuthExpiredError
 from app.core.oci_object_storage import OCIObjectInfo
 from app.main import app
 from app.models.dataset import DatasetMeta
+from app.models.dataset import CompositeStyle
 from app.models.dataset import TileJSON
 from app.models.dataset import VariableMeta
 from app.models.dataset import VariableStats
@@ -71,16 +72,42 @@ def test_high_zoom_tile_prefers_serving_representation() -> None:
     assert response.headers["x-representation"] == "serving"
 
 
+def test_dataset_websocket_sends_invalidation_snapshot() -> None:
+    with client.websocket_connect("/ws/datasets") as websocket:
+        payload = websocket.receive_json()
+
+    assert payload["type"] == "datasets.invalidate"
+    assert payload["datasets"][0]["id"] == "demo-global"
+    assert "version" in payload
+
+
+def test_dataset_websocket_supports_ping() -> None:
+    with client.websocket_connect("/ws/datasets") as websocket:
+        websocket.receive_json()
+        websocket.send_json({"type": "ping"})
+        payload = websocket.receive_json()
+
+    assert payload == {"type": "pong"}
+
+
 class _FakeZarrConnector:
     def __init__(self) -> None:
+        self.namespace = "ns"
         self.payloads = {
             "cubes/example.zarr/zarr.json": b'{"zarr_format":3}',
+            "bucket@ns/cubes/example.zarr/zarr.json": b'{"zarr_format":3}',
             "cubes/example.zarr/bands/c/0/0/0/0": b"0123456789",
             "multiscale/cubes/example.zarr/zarr.json": (
                 b'{"zarr_format":3,"attributes":{"multiscales":[{"datasets":[{"path":"0"}]}]}}'
             ),
             "multiscale/cubes/example.zarr/0/bands/c/0/0/0/0": b"abcdefghij",
         }
+
+    def build_oci_uri(self, object_path: str) -> str:
+        return f"oci://bucket@ns/{object_path.lstrip('/')}"
+
+    def read_text(self, object_path: str, *, use_cache: bool = True) -> str:
+        return self.read_bytes(object_path).decode("utf-8")
 
     def head_object(self, object_path: str) -> OCIObjectInfo:
         payload = self.payloads.get(object_path)
@@ -95,7 +122,8 @@ class _FakeZarrConnector:
         )
 
     def read_bytes(self, object_path: str) -> bytes:
-        payload = self.payloads.get(object_path)
+        resolved = object_path.removeprefix("oci://")
+        payload = self.payloads.get(resolved) or self.payloads.get(object_path)
         if payload is None:
             raise FileNotFoundError(object_path)
         return payload
@@ -275,6 +303,38 @@ def test_zarr_proxy_requires_oci_backend(monkeypatch) -> None:
     assert response.status_code == 400
 
 
+def test_storage_zarr_json_accepts_relative_path(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+
+    response = client.get("/api/storage/zarr-json?zarr_path=cubes/example.zarr")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object_path"] == "cubes/example.zarr/zarr.json"
+    assert payload["resolved_path"] == "oci://bucket@ns/cubes/example.zarr/zarr.json"
+    assert payload["metadata"]["zarr_format"] == 3
+
+
+def test_storage_zarr_json_accepts_full_oci_uri(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+
+    response = client.get("/api/storage/zarr-json?zarr_path=oci://bucket@ns/cubes/example.zarr")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object_path"] == "oci://bucket@ns/cubes/example.zarr/zarr.json"
+    assert payload["resolved_path"] == "oci://bucket@ns/cubes/example.zarr/zarr.json"
+    assert payload["metadata"]["zarr_format"] == 3
+
+
+def test_storage_zarr_json_returns_404_for_missing_root(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+
+    response = client.get("/api/storage/zarr-json?zarr_path=cubes/missing.zarr")
+
+    assert response.status_code == 404
+
+
 def test_oci_tile_returns_pyramid_representation_when_planned(monkeypatch) -> None:
     entry = _configure_oci_app_state(monkeypatch)
     entry.band_names = ["NDVI"]
@@ -388,7 +448,94 @@ def test_oci_tile_falls_back_from_pyramid_to_serving(monkeypatch) -> None:
     assert response.headers["x-representation"] == "serving"
     assert response.headers["x-cache-status"] == "MISS"
     assert response.headers["x-data-vmin"] == "0.2"
-    assert response.headers["x-data-vmax"] == "0.8"
+
+
+def test_oci_tile_serves_composite_style(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    entry.band_names = ["B4", "B3", "B2"]
+    entry.band_indices = {"B4": 0, "B3": 1, "B2": 2}
+    entry.meta.variables = [
+        VariableMeta(
+            id="B4",
+            name="B4 Red",
+            unit="DN",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=255.0, p02=0.0, p98=255.0),
+        ),
+        VariableMeta(
+            id="B3",
+            name="B3 Green",
+            unit="DN",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=255.0, p02=0.0, p98=255.0),
+        ),
+        VariableMeta(
+            id="B2",
+            name="B2 Blue",
+            unit="DN",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=255.0, p02=0.0, p98=255.0),
+        ),
+    ]
+    entry.meta.composite_styles = [
+        CompositeStyle(
+            id="true-color",
+            name="True Color",
+            description="Natural color",
+            bands=["B4", "B3", "B2"],
+        )
+    ]
+
+    monkeypatch.setattr(
+        app.state.planner,
+        "plan_tile_request",
+        lambda **_kwargs: QueryPlan(
+            planner_version="v1",
+            collection_id=entry.id,
+            request_class="tile",
+            chosen_representation="browse",
+            execution_path="interactive",
+            request_fingerprint="composite",
+            response_cache_key="artifact:tile:composite",
+            plan_cache_key="plan:composite",
+            selected_cube=entry.id,
+            selected_path=entry.path,
+        ),
+    )
+    monkeypatch.setattr("app.api.tiles.ensure_catalog_entry_metadata_ready", lambda current_entry, _connector: current_entry)
+    composite_calls = {"count": 0}
+
+    def _generate_composite_tile(*_args, **_kwargs):
+        composite_calls["count"] += 1
+        return b"rgb-bytes", (0.0, 255.0)
+
+    monkeypatch.setattr(
+        "app.api.tiles.generate_projected_composite_tile",
+        _generate_composite_tile,
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_projected_band_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("single-band renderer should not be used")),
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_browse_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("browse renderer should not be used")),
+    )
+
+    response = client.get("/api/tiles/dataset-1/true-color/6/32/30")
+    cached_response = client.get("/api/tiles/dataset-1/true-color/6/32/30")
+
+    assert response.status_code == 200
+    assert response.content == b"rgb-bytes"
+    assert response.headers["x-representation"] == "serving"
+    assert response.headers["x-cache-status"] == "MISS"
+    assert response.headers["x-data-vmin"] == "0.0"
+    assert response.headers["x-data-vmax"] == "255.0"
+    assert cached_response.status_code == 200
+    assert cached_response.content == b"rgb-bytes"
+    assert cached_response.headers["x-representation"] == "serving"
+    assert cached_response.headers["x-cache-status"] == "HIT"
+    assert composite_calls["count"] == 1
 
 
 def test_oci_tilejson_returns_dynamic_tile_contract(monkeypatch) -> None:

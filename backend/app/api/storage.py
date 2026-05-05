@@ -160,13 +160,20 @@ async def get_zarr_json(
             detail="Object storage listing is available only when STORAGE_BACKEND=oci_zarr",
         )
 
-    object_path = zarr_path.rstrip("/") + "/zarr.json"
+    cleaned_zarr_path = zarr_path.strip().rstrip("/")
+    if not cleaned_zarr_path:
+        raise HTTPException(status_code=400, detail="zarr_path must not be empty")
+    object_path = f"{cleaned_zarr_path}/zarr.json"
+    resolved_object_path = object_path if object_path.startswith("oci://") else connector.build_oci_uri(object_path)
     try:
-        raw = read_store_json(connector=connector, object_path=connector.build_oci_uri(object_path))
+        raw = read_store_json(connector=connector, object_path=resolved_object_path)
         return {
             "zarr_path": zarr_path,
             "object_path": object_path,
+            "resolved_path": resolved_object_path,
             "metadata": json.loads(raw),
         }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="zarr.json not found") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read zarr.json: {exc}") from exc

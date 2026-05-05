@@ -49,6 +49,7 @@ Purpose:
 - list raw objects and folder-like prefixes
 - detect Zarr v2 and v3 store roots
 - inspect variable, coordinate, and metadata structure before attempting visualization
+- read root `zarr.json` metadata from either relative object paths or full `oci://...` URIs
 - expose read-only dataset-scoped Zarr metadata and chunk objects through Vizarr itself
 
 ## Browser-serving metadata
@@ -83,9 +84,11 @@ This lets frontend code discover whether a dataset can be consumed as a proxied 
 - `seamless_rendering_ready`
 - explicit readiness gaps
 
-## Current Oracle/Object Storage settings
+## Historical verification context
 
-Proven working bucket context:
+The following values document a previously verified private environment. They
+are not public setup defaults and should not be copied into tracked env files:
+
 - namespace: `lrdwfp6kyp5x`
 - bucket: `STAY`
 - top-level prefix: `cubes`
@@ -136,12 +139,18 @@ Therefore it needs:
 - dataset discovery by store path
 - band selection in the frontend
 - projected tile extraction in the backend
-- eventually RGB composites for natural/false color rendering
+- RGB composites for natural/false-color rendering when the required bands are present
 
 The current implementation already supports:
 - discovery of Zarr v3 stores under `cubes`
 - exposing band names as dataset variables
+- direct static projected `y/x` variables as single-step frontend variables
+- direct projected 3D `time/y/x` variables without requiring a synthetic band dimension
+- non-Landsat band dimension names for compatible 4D `time/*/y/x` arrays
+- CRS metadata exposure through `crs_wkt` and normalized `crs_authority`
+- advertising true-color and false-color composite styles for recognized Landsat-style band sets
 - per-band projected tile generation
+- RGB WebP tile generation for advertised composite styles
 - direct Zarr v3 chunk reads for projected imagery without relying on `zarr.open_group()`
 - byte-range-capable proxy serving for raw Zarr metadata and chunk objects
 - skipping unreadable stores during catalog build so one bad store does not fail the whole API
@@ -222,14 +231,15 @@ Live maize target shape:
 
 ## Current implementation limitations
 
-- RGB composites are not implemented yet
-- the current catalog path is tuned toward Landsat-style Zarr v3 stores with a `bands` array
-- generic support for arbitrary projected Zarr layouts still needs more work
+- composite style detection is limited to common Landsat/Sentinel-like red, green, blue, and near-infrared aliases
+- generic support for arbitrary projected Zarr layouts beyond direct `y/x`,
+  `time/y/x`, and banded `time/*/y/x` arrays still needs more work
 
 ## Next recommended steps
 
-1. Verify that discovered OCI datasets appear in the frontend dataset picker.
-2. Verify that selecting a band returns visible projected tiles on the map.
-3. Add RGB composite support for common Landsat band combinations.
-4. Expose dataset bounds and CRS metadata in the API.
-5. Generalize the adapter layer for more Zarr layouts under `cubes`.
+1. Run `python3 scripts/oci_browser_smoke.py` against a live OCI dev stack, then
+   complete the printed browser checklist for the frontend picker, auto-fit, and
+   visible tile preview.
+2. Verify true-color and false-color composite tiles against a live Landsat store.
+3. Verify CRS metadata and direct 3D variables against a live non-Landsat store.
+4. Generalize the adapter layer for more Zarr layouts under `cubes`.

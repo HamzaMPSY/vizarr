@@ -9,12 +9,16 @@ export function Sidebar() {
   const {
     datasetId,
     variable,
+    renderMode,
+    compositeStyle,
     timeIndex,
     colormap,
     vmin,
     vmax,
     setDataset,
     setVariable,
+    setRenderMode,
+    setCompositeStyle,
     setTimeIndex,
     setColormap
   } = useMapStore();
@@ -29,15 +33,21 @@ export function Sidebar() {
     () => variables?.find((item) => item.id === variable) ?? null,
     [variable, variables]
   );
+  const compositeStyles = selectedDataset?.composite_styles ?? [];
+  const selectedComposite = useMemo(
+    () => compositeStyles.find((item) => item.id === compositeStyle) ?? null,
+    [compositeStyle, compositeStyles]
+  );
+  const tileVariable = renderMode === "composite" ? compositeStyle : variable;
   const debugTileUrl =
-    datasetId && variable
+    datasetId && tileVariable
       ? buildTileUrl({
           datasetId,
-          variable,
+          variable: tileVariable,
           timeIndex,
           colormap,
-          vmin,
-          vmax
+          vmin: renderMode === "composite" ? null : vmin,
+          vmax: renderMode === "composite" ? null : vmax
         })
           .replace("{z}", "1")
           .replace("{x}", "1")
@@ -84,7 +94,7 @@ export function Sidebar() {
           id="variable"
           value={variable ?? ""}
           onChange={(event) => setVariable(event.target.value)}
-          disabled={!datasetId || variablesLoading}
+          disabled={!datasetId || variablesLoading || renderMode === "composite"}
         >
           <option value="" disabled>
             {!datasetId ? "Select a dataset first" : variablesLoading ? "Loading variables..." : "Select a variable"}
@@ -105,6 +115,42 @@ export function Sidebar() {
           </div>
         ) : null}
       </section>
+
+      {compositeStyles.length > 0 ? (
+        <section className="panel">
+          <label htmlFor="render-mode">Render Mode</label>
+          <select
+            id="render-mode"
+            value={renderMode}
+            onChange={(event) => setRenderMode(event.target.value === "composite" ? "composite" : "band")}
+          >
+            <option value="band">Single band</option>
+            <option value="composite">RGB composite</option>
+          </select>
+
+          {renderMode === "composite" ? (
+            <>
+              <label htmlFor="composite-style">Composite</label>
+              <select
+                id="composite-style"
+                value={compositeStyle ?? ""}
+                onChange={(event) => setCompositeStyle(event.target.value)}
+              >
+                {compositeStyles.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+              {selectedComposite ? (
+                <p className="muted">
+                  {selectedComposite.description} Bands: {selectedComposite.bands.join(", ")}.
+                </p>
+              ) : null}
+            </>
+          ) : null}
+        </section>
+      ) : null}
 
       <section className="panel">
         <label htmlFor="time-index">Time Step</label>
@@ -135,6 +181,9 @@ export function Sidebar() {
             </option>
           ))}
         </select>
+        {renderMode === "composite" ? (
+          <p className="muted">Composite tiles use RGB channels directly; colormap applies only to single-band rendering.</p>
+        ) : null}
       </section>
 
       <section className="panel panel--status">
@@ -144,6 +193,7 @@ export function Sidebar() {
           <li>Frontend map: live</li>
           <li>Redis cache: optional</li>
           <li>Cloud Zarr access: live</li>
+          <li>RGB composites: {compositeStyles.length > 0 ? "available" : "not advertised"}</li>
         </ul>
       </section>
 

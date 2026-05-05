@@ -206,6 +206,331 @@ def load_fixed_length_utf32_labels(
     return values[: metadata.shape[0]]
 
 
+def load_2d_window(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    *,
+    max_parallel_chunk_reads: int | None = None,
+) -> np.ndarray:
+    if len(metadata.shape) != 2:
+        raise ValueError(f"{array_name} is not a 2D array")
+
+    chunk_y, chunk_x = metadata.effective_chunk_shape
+    fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+    window = np.full((y_stop - y_start, x_stop - x_start), fill_value, dtype=metadata.dtype)
+
+    y_chunk_start = y_start // chunk_y
+    y_chunk_stop = (y_stop - 1) // chunk_y + 1
+    x_chunk_start = x_start // chunk_x
+    x_chunk_stop = (x_stop - 1) // chunk_x + 1
+
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in range(y_chunk_start, y_chunk_stop)
+        for x_chunk_index in range(x_chunk_start, x_chunk_stop)
+    ]
+
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_2d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
+
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
+        chunk_y_start = y_chunk_index * chunk_y
+        chunk_x_start = x_chunk_index * chunk_x
+        chunk_y_stop = chunk_y_start + chunk.shape[0]
+        chunk_x_stop = chunk_x_start + chunk.shape[1]
+
+        src_y_start = max(y_start - chunk_y_start, 0)
+        src_y_stop = min(y_stop - chunk_y_start, chunk.shape[0])
+        src_x_start = max(x_start - chunk_x_start, 0)
+        src_x_stop = min(x_stop - chunk_x_start, chunk.shape[1])
+
+        dst_y_start = max(chunk_y_start - y_start, 0)
+        dst_y_stop = dst_y_start + (src_y_stop - src_y_start)
+        dst_x_start = max(chunk_x_start - x_start, 0)
+        dst_x_stop = dst_x_start + (src_x_stop - src_x_start)
+
+        window[dst_y_start:dst_y_stop, dst_x_start:dst_x_stop] = chunk[
+            src_y_start:src_y_stop,
+            src_x_start:src_x_stop,
+        ]
+
+    return window
+
+
+def load_2d_window_decimated(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    *,
+    y_step: int,
+    x_step: int,
+    max_parallel_chunk_reads: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(metadata.shape) != 2:
+        raise ValueError(f"{array_name} is not a 2D array")
+    if y_step <= 0 or x_step <= 0:
+        raise ValueError("Decimation steps must be positive integers")
+
+    chunk_y, chunk_x = metadata.effective_chunk_shape
+    sampled_y = np.arange(y_start, y_stop, y_step, dtype=np.int64)
+    sampled_x = np.arange(x_start, x_stop, x_step, dtype=np.int64)
+    if sampled_y.size == 0:
+        sampled_y = np.asarray([y_start], dtype=np.int64)
+    if sampled_x.size == 0:
+        sampled_x = np.asarray([x_start], dtype=np.int64)
+    if sampled_y[-1] != (y_stop - 1):
+        sampled_y = np.append(sampled_y, y_stop - 1)
+    if sampled_x[-1] != (x_stop - 1):
+        sampled_x = np.append(sampled_x, x_stop - 1)
+
+    fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+    window = np.full((len(sampled_y), len(sampled_x)), fill_value, dtype=metadata.dtype)
+
+    y_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for row_index, y_value in enumerate(sampled_y.tolist()):
+        y_chunk_index = y_value // chunk_y
+        y_samples_by_chunk.setdefault(y_chunk_index, []).append((row_index, y_value - (y_chunk_index * chunk_y)))
+
+    x_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for col_index, x_value in enumerate(sampled_x.tolist()):
+        x_chunk_index = x_value // chunk_x
+        x_samples_by_chunk.setdefault(x_chunk_index, []).append((col_index, x_value - (x_chunk_index * chunk_x)))
+
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in y_samples_by_chunk
+        for x_chunk_index in x_samples_by_chunk
+    ]
+
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_2d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
+
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
+        row_samples = y_samples_by_chunk[y_chunk_index]
+        col_samples = x_samples_by_chunk[x_chunk_index]
+        row_indices = np.asarray([sample[0] for sample in row_samples], dtype=np.int64)
+        col_indices = np.asarray([sample[0] for sample in col_samples], dtype=np.int64)
+        local_y = np.asarray([sample[1] for sample in row_samples], dtype=np.int64)
+        local_x = np.asarray([sample[1] for sample in col_samples], dtype=np.int64)
+        window[np.ix_(row_indices, col_indices)] = chunk[np.ix_(local_y, local_x)]
+
+    return window, sampled_y.astype(np.float64), sampled_x.astype(np.float64)
+
+
+def load_3d_window(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    time_index: int,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    *,
+    max_parallel_chunk_reads: int | None = None,
+) -> np.ndarray:
+    if len(metadata.shape) != 3:
+        raise ValueError(f"{array_name} is not a 3D array")
+
+    chunk_t, chunk_y, chunk_x = metadata.effective_chunk_shape
+    if chunk_t != 1:
+        raise ValueError(f"{array_name} chunk layout is not supported: {metadata.effective_chunk_shape}")
+
+    fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+    window = np.full((y_stop - y_start, x_stop - x_start), fill_value, dtype=metadata.dtype)
+
+    y_chunk_start = y_start // chunk_y
+    y_chunk_stop = (y_stop - 1) // chunk_y + 1
+    x_chunk_start = x_start // chunk_x
+    x_chunk_stop = (x_stop - 1) // chunk_x + 1
+
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in range(y_chunk_start, y_chunk_stop)
+        for x_chunk_index in range(x_chunk_start, x_chunk_stop)
+    ]
+
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_3d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(time_index, y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
+
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
+        chunk_y_start = y_chunk_index * chunk_y
+        chunk_x_start = x_chunk_index * chunk_x
+        chunk_y_stop = chunk_y_start + chunk.shape[1]
+        chunk_x_stop = chunk_x_start + chunk.shape[2]
+
+        src_y_start = max(y_start - chunk_y_start, 0)
+        src_y_stop = min(y_stop - chunk_y_start, chunk.shape[1])
+        src_x_start = max(x_start - chunk_x_start, 0)
+        src_x_stop = min(x_stop - chunk_x_start, chunk.shape[2])
+
+        dst_y_start = max(chunk_y_start - y_start, 0)
+        dst_y_stop = dst_y_start + (src_y_stop - src_y_start)
+        dst_x_start = max(chunk_x_start - x_start, 0)
+        dst_x_stop = dst_x_start + (src_x_stop - src_x_start)
+
+        window[dst_y_start:dst_y_stop, dst_x_start:dst_x_stop] = chunk[
+            0,
+            src_y_start:src_y_stop,
+            src_x_start:src_x_stop,
+        ]
+
+    return window
+
+
+def load_3d_window_decimated(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    time_index: int,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    *,
+    y_step: int,
+    x_step: int,
+    max_parallel_chunk_reads: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(metadata.shape) != 3:
+        raise ValueError(f"{array_name} is not a 3D array")
+    if y_step <= 0 or x_step <= 0:
+        raise ValueError("Decimation steps must be positive integers")
+
+    chunk_t, chunk_y, chunk_x = metadata.effective_chunk_shape
+    if chunk_t != 1:
+        raise ValueError(f"{array_name} chunk layout is not supported: {metadata.effective_chunk_shape}")
+
+    sampled_y = np.arange(y_start, y_stop, y_step, dtype=np.int64)
+    sampled_x = np.arange(x_start, x_stop, x_step, dtype=np.int64)
+    if sampled_y.size == 0:
+        sampled_y = np.asarray([y_start], dtype=np.int64)
+    if sampled_x.size == 0:
+        sampled_x = np.asarray([x_start], dtype=np.int64)
+    if sampled_y[-1] != (y_stop - 1):
+        sampled_y = np.append(sampled_y, y_stop - 1)
+    if sampled_x[-1] != (x_stop - 1):
+        sampled_x = np.append(sampled_x, x_stop - 1)
+
+    fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+    window = np.full((len(sampled_y), len(sampled_x)), fill_value, dtype=metadata.dtype)
+
+    y_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for row_index, y_value in enumerate(sampled_y.tolist()):
+        y_chunk_index = y_value // chunk_y
+        y_samples_by_chunk.setdefault(y_chunk_index, []).append((row_index, y_value - (y_chunk_index * chunk_y)))
+
+    x_samples_by_chunk: dict[int, list[tuple[int, int]]] = {}
+    for col_index, x_value in enumerate(sampled_x.tolist()):
+        x_chunk_index = x_value // chunk_x
+        x_samples_by_chunk.setdefault(x_chunk_index, []).append((col_index, x_value - (x_chunk_index * chunk_x)))
+
+    chunk_positions = [
+        (y_chunk_index, x_chunk_index)
+        for y_chunk_index in y_samples_by_chunk
+        for x_chunk_index in x_samples_by_chunk
+    ]
+
+    def _load_chunk(position: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+        y_chunk_index, x_chunk_index = position
+        chunk = load_3d_chunk(
+            connector=connector,
+            store_path=store_path,
+            array_name=array_name,
+            metadata=metadata,
+            chunk_indices=(time_index, y_chunk_index, x_chunk_index),
+        )
+        return y_chunk_index, x_chunk_index, chunk
+
+    if len(chunk_positions) <= 1:
+        loaded_chunks = [_load_chunk(position) for position in chunk_positions]
+    else:
+        max_workers = min(
+            _MAX_PARALLEL_CHUNK_READS if max_parallel_chunk_reads is None else max(max_parallel_chunk_reads, 1),
+            len(chunk_positions),
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+
+    for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
+        row_samples = y_samples_by_chunk[y_chunk_index]
+        col_samples = x_samples_by_chunk[x_chunk_index]
+        row_indices = np.asarray([sample[0] for sample in row_samples], dtype=np.int64)
+        col_indices = np.asarray([sample[0] for sample in col_samples], dtype=np.int64)
+        local_y = np.asarray([sample[1] for sample in row_samples], dtype=np.int64)
+        local_x = np.asarray([sample[1] for sample in col_samples], dtype=np.int64)
+        window[np.ix_(row_indices, col_indices)] = chunk[0][np.ix_(local_y, local_x)]
+
+    return window, sampled_y.astype(np.float64), sampled_x.astype(np.float64)
+
+
 def load_4d_window(
     connector: OCIObjectStorageConnector,
     store_path: str,
@@ -375,6 +700,84 @@ def load_4d_window_decimated(
         window[np.ix_(row_indices, col_indices)] = chunk[0, 0][np.ix_(local_y, local_x)]
 
     return window, sampled_y.astype(np.float64), sampled_x.astype(np.float64)
+
+
+def load_2d_chunk(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    chunk_indices: tuple[int, int],
+) -> np.ndarray:
+    chunk_shape = tuple(
+        _resolved_chunk_length(size=size, chunk_size=chunk_size, chunk_index=chunk_index)
+        for size, chunk_size, chunk_index in zip(metadata.shape, metadata.effective_chunk_shape, chunk_indices, strict=True)
+    )
+
+    decoded = _read_array_chunk_bytes(
+        connector=connector,
+        store_path=store_path,
+        array_name=array_name,
+        metadata=metadata,
+        chunk_indices=chunk_indices,
+        missing_ok=True,
+    )
+    if decoded is None:
+        fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+        return np.full(chunk_shape, fill_value, dtype=metadata.dtype)
+
+    flat = np.frombuffer(decoded, dtype=metadata.dtype)
+    expected_size = int(np.prod(chunk_shape))
+    if flat.size == expected_size:
+        return flat.reshape(chunk_shape)
+
+    full_chunk_size = int(np.prod(metadata.effective_chunk_shape))
+    if flat.size == full_chunk_size:
+        return flat.reshape(metadata.effective_chunk_shape)
+
+    raise ValueError(
+        f"Unexpected decoded chunk size for {array_name}: "
+        f"{flat.size} values, expected {expected_size} or {full_chunk_size}"
+    )
+
+
+def load_3d_chunk(
+    connector: OCIObjectStorageConnector,
+    store_path: str,
+    array_name: str,
+    metadata: ZarrV3ArrayMetadata,
+    chunk_indices: tuple[int, int, int],
+) -> np.ndarray:
+    chunk_shape = tuple(
+        _resolved_chunk_length(size=size, chunk_size=chunk_size, chunk_index=chunk_index)
+        for size, chunk_size, chunk_index in zip(metadata.shape, metadata.effective_chunk_shape, chunk_indices, strict=True)
+    )
+
+    decoded = _read_array_chunk_bytes(
+        connector=connector,
+        store_path=store_path,
+        array_name=array_name,
+        metadata=metadata,
+        chunk_indices=chunk_indices,
+        missing_ok=True,
+    )
+    if decoded is None:
+        fill_value = metadata.fill_value if metadata.fill_value is not None else 0
+        return np.full(chunk_shape, fill_value, dtype=metadata.dtype)
+
+    flat = np.frombuffer(decoded, dtype=metadata.dtype)
+    expected_size = int(np.prod(chunk_shape))
+    if flat.size == expected_size:
+        return flat.reshape(chunk_shape)
+
+    full_chunk_size = int(np.prod(metadata.effective_chunk_shape))
+    if flat.size == full_chunk_size:
+        return flat.reshape(metadata.effective_chunk_shape)
+
+    raise ValueError(
+        f"Unexpected decoded chunk size for {array_name}: "
+        f"{flat.size} values, expected {expected_size} or {full_chunk_size}"
+    )
 
 
 def load_4d_chunk(

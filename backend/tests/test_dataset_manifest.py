@@ -280,7 +280,7 @@ def test_build_catalog_index_skips_unsupported_store(monkeypatch) -> None:
             } if store_path.endswith("good.zarr") else {
                 "value": {
                     "shape": [4, 4],
-                    "dimension_names": ["y", "x"],
+                    "dimension_names": ["row", "column"],
                     "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
                     "data_type": "float32",
                     "codecs": [],

@@ -11,6 +11,8 @@ from app.core.dataset_catalog import get_or_build_catalog
 from app.core.multiscale_tiles import generate_and_cache_pyramid_tile
 from app.core.multiscale_tiles import generate_pyramid_tile
 from app.core.projected_tile_generator import generate_projected_band_tile
+from app.core.projected_tile_generator import generate_projected_composite_tile
+from app.core.projected_tile_generator import resolve_composite_band_ids
 from app.core.tile_generator import generate_tile
 from app.core.variable_display import resolve_display_range
 
@@ -54,12 +56,19 @@ async def get_tile(
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
         try:
-            ensure_entry = ensure_catalog_entry_ready if tile_plan.chosen_representation == "browse" else ensure_catalog_entry_metadata_ready
-            await run_in_threadpool(ensure_entry, entry, request.app.state.storage_connector)
+            await run_in_threadpool(ensure_catalog_entry_metadata_ready, entry, request.app.state.storage_connector)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if variable not in entry.band_indices:
+        composite_band_ids = resolve_composite_band_ids(entry, variable)
+        is_composite = composite_band_ids is not None
+        if variable not in entry.band_indices and not is_composite:
             raise HTTPException(status_code=404, detail="Variable not found")
+        if tile_plan.chosen_representation == "browse" and not is_composite:
+            try:
+                await run_in_threadpool(ensure_catalog_entry_ready, entry, request.app.state.storage_connector)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        planned_representation = "serving" if is_composite else tile_plan.chosen_representation
 
         cache_key = build_tile_cache_key(
             {
@@ -72,14 +81,20 @@ async def get_tile(
                 "colormap": colormap,
                 "vmin": vmin,
                 "vmax": vmax,
-                "representation": tile_plan.chosen_representation,
+                "representation": planned_representation,
+                "render_mode": "composite" if is_composite else "band",
+                "composite_bands": composite_band_ids,
                 "planner_version": settings.planner_version,
             }
         )
         cached = await request.app.state.cache.get(cache_key)
-        selected_variable = next(item for item in entry.meta.variables if item.id == variable)
+        selected_variable = next((item for item in entry.meta.variables if item.id == variable), None)
         if cached is not None:
-            cached_vmin, cached_vmax = resolve_display_range(selected_variable, vmin, vmax)
+            cached_vmin, cached_vmax = (
+                resolve_display_range(selected_variable, vmin, vmax)
+                if selected_variable is not None
+                else (0.0 if vmin is None else vmin, 255.0 if vmax is None else vmax)
+            )
             return Response(
                 cached,
                 media_type="image/webp",
@@ -90,26 +105,43 @@ async def get_tile(
                     "X-Data-Vmax": str(cached_vmax),
                     "X-Request-Class": tile_plan.request_class,
                     "X-Execution-Path": tile_plan.execution_path,
-                    "X-Representation": tile_plan.chosen_representation,
+                    "X-Representation": planned_representation,
                 },
             )
 
-        tile_generator = generate_projected_band_tile
-        tile_args = (
-            request.app.state.storage_connector,
-            entry,
-            variable,
-            z,
-            x,
-            y,
-            time_index,
-            colormap,
-            vmin,
-            vmax,
-        )
+        if is_composite:
+            tile_generator = generate_projected_composite_tile
+            tile_args = (
+                request.app.state.storage_connector,
+                entry,
+                variable,
+                z,
+                x,
+                y,
+                time_index,
+                vmin,
+                vmax,
+            )
+        else:
+            tile_generator = generate_projected_band_tile
+            tile_args = (
+                request.app.state.storage_connector,
+                entry,
+                variable,
+                z,
+                x,
+                y,
+                time_index,
+                colormap,
+                vmin,
+                vmax,
+            )
         actual_representation = tile_plan.chosen_representation
         browse_source: str | None = None
-        if tile_plan.chosen_representation == "browse":
+        if is_composite:
+            actual_representation = "serving"
+            tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
+        elif tile_plan.chosen_representation == "browse":
             try:
                 browse_result = await run_in_threadpool(
                     generate_browse_tile,
@@ -169,7 +201,7 @@ async def get_tile(
         else:
             tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
 
-        if actual_representation == tile_plan.chosen_representation:
+        if is_composite or actual_representation == tile_plan.chosen_representation:
             await request.app.state.cache.set(cache_key, tile_bytes)
         headers = {
             "Cache-Control": "public, max-age=3600",

@@ -1,359 +1,244 @@
 # Backend
 
-Python / FastAPI tile server. Reads Zarr arrays from object storage, generates XYZ map tiles on demand, and caches everything aggressively in Redis.
+The backend is a FastAPI service that catalogs datasets, plans requests, renders
+WebP map tiles, and exposes OCI-backed Zarr stores through safe read-only proxy
+routes.
 
----
+## Runtime modes
 
-## Folder structure
+| Mode | Setting | Purpose |
+|---|---|---|
+| Synthetic | `STORAGE_BACKEND=synthetic` | In-memory demo dataset for frontend and backend regression checks |
+| OCI Zarr | `STORAGE_BACKEND=oci_zarr` | OCI Object Storage discovery, metadata hydration, tile rendering, and Zarr proxying |
+
+`USE_SYNTHETIC_DATA` still exists in env examples for compatibility, but route
+behavior is selected by `STORAGE_BACKEND`.
+
+## Current folder structure
 
 ```
 backend/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py                   # FastAPI app + lifespan context
-│   ├── config.py                 # Pydantic settings, loaded from .env
-│   │
+│   ├── main.py                  # FastAPI app, lifespan, runtime state
+│   ├── config.py                # Pydantic settings from environment/.env
 │   ├── api/
-│   │   ├── __init__.py
-│   │   ├── router.py             # Aggregates all sub-routers
-│   │   ├── tiles.py              # GET /tiles/{dataset}/{variable}/{z}/{x}/{y}
-│   │   ├── datasets.py           # GET /datasets, GET /datasets/{id}
-│   │   ├── variables.py          # GET /datasets/{id}/variables
-│   │   └── colormaps.py          # GET /colormaps
-│   │
+│   │   ├── router.py            # Aggregates all /api routers
+│   │   ├── health.py            # /healthz
+│   │   ├── datasets.py          # Dataset, variables, serving profiles
+│   │   ├── colormaps.py         # Colormap names and palettes
+│   │   ├── tilejson.py          # TileJSON documents for map clients
+│   │   ├── tiles.py             # WebP tile endpoint
+│   │   ├── storage.py           # OCI discovery/debug endpoints
+│   │   ├── zarr.py              # Dataset-scoped Zarr proxy
+│   │   ├── websockets.py        # Dataset invalidation WebSocket
+│   │   ├── query.py             # Planner preview/stats/clip endpoints
+│   │   └── exports.py           # Export job creation/status
 │   ├── core/
-│   │   ├── __init__.py
-│   │   ├── zarr_reader.py        # Zarr store open + spatial slicing
-│   │   ├── tile_generator.py     # XYZ → bbox → slice → image
-│   │   ├── cache.py              # Redis wrapper (get/set/invalidate)
-│   │   ├── colormap.py           # Normalization + LUT application + WebP encode
-│   │   └── prefetch.py           # Background tile warming (asyncio tasks)
-│   │
+│   │   ├── cache.py
+│   │   ├── colormap.py
+│   │   ├── datasets.py
+│   │   ├── dataset_catalog.py
+│   │   ├── oci_auth.py
+│   │   ├── oci_object_storage.py
+│   │   ├── zarr_reader.py
+│   │   ├── zarr_v3.py
+│   │   ├── tile_generator.py
+│   │   ├── projected_tile_generator.py
+│   │   ├── browse_tiles.py
+│   │   ├── browse_artifacts.py
+│   │   ├── multiscale_builder.py
+│   │   ├── multiscale_store.py
+│   │   ├── multiscale_tiles.py
+│   │   ├── serving_profile.py
+│   │   └── tilejson.py
+│   ├── index/
+│   │   ├── catalog_store.py
+│   │   └── planner_index.py
 │   ├── models/
-│   │   ├── __init__.py
-│   │   ├── dataset.py            # DatasetMeta, DatasetList Pydantic models
-│   │   ├── tile.py               # TileRequest query params
-│   │   └── variable.py           # VariableMeta, stats
-│   │
-│   └── workers/
-│       ├── __init__.py
-│       └── dask_client.py        # Dask LocalCluster or remote scheduler setup
-│
+│   │   ├── artifacts.py
+│   │   ├── dataset.py
+│   │   ├── jobs.py
+│   │   ├── plans.py
+│   │   ├── requests.py
+│   │   └── tile.py
+│   ├── services/
+│   │   ├── export_jobs.py
+│   │   └── planner.py
+│   └── tools/
+│       ├── generate_browse.py
+│       ├── generate_multiscale.py
+│       └── parquet_to_zarr.py
 ├── tests/
-│   ├── test_tiles.py
-│   ├── test_zarr_reader.py
-│   └── conftest.py               # Fixtures: mock Zarr store, test client
-│
 ├── Dockerfile
 ├── requirements.txt
-├── pyproject.toml
-└── .env.example
+├── .env.example
+└── .env.oci.example
 ```
 
----
+There is no `api/variables.py`, `core/prefetch.py`, or
+`workers/dask_client.py` in the current implementation.
 
-## Key modules
+## Startup behavior
 
-### `app/main.py`
+`app/main.py` registers `app.api.router.router` under `/api` and initializes
+runtime state.
 
-Initialises the FastAPI app and manages the application lifespan. On startup it opens the Zarr store once (so the metadata is warm), starts the Dask client, and connects to Redis. On shutdown it closes all connections cleanly.
+Synthetic mode:
 
-```python
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from app.workers.dask_client import start_dask
-from app.core.zarr_reader import open_store
-from app.core.cache import connect_redis
-from app.api.router import router
+- builds an in-memory demo dataset registry;
+- uses the same tile and metadata routes as the OCI path where possible;
+- does not require OCI credentials.
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.zarr = await open_store()
-    app.state.dask = await start_dask()
-    app.state.redis = await connect_redis()
-    yield
-    await app.state.redis.aclose()
-    app.state.dask.close()
+OCI mode:
 
-app = FastAPI(lifespan=lifespan)
-app.include_router(router, prefix="/api")
-```
+- creates an `OCIObjectStorageConnector`;
+- builds a dataset registry from `OCI_ZARR_PATH` or catalogs stores under
+  `OCI_PREFIX`;
+- recognizes projected variables shaped as static `y/x`, direct `time/y/x`, or
+  banded `time/*/y/x` arrays;
+- optionally warms catalog metadata and browse overviews;
+- connects Redis for tile caching;
+- catches expired OCI session auth and returns `503` with a readable detail.
 
-### `app/config.py`
+## Settings
 
-All settings are read from environment variables (or `.env`) via Pydantic's `BaseSettings`. Nothing is hardcoded.
+Current settings live in `app/config.py`.
 
-```python
-from pydantic_settings import BaseSettings
+Important settings:
 
-class Settings(BaseSettings):
-    zarr_store_url: str           # e.g. s3://bucket/data.zarr
-    redis_url: str = "redis://localhost:6379"
-    tile_cache_ttl: int = 3600    # seconds
-    dask_threads: int = 4
-    colormap_default: str = "viridis"
-    vmin_percentile: float = 2.0
-    vmax_percentile: float = 98.0
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    aws_region: str = "eu-west-1"
+| Setting | Role |
+|---|---|
+| `STORAGE_BACKEND` | `synthetic` or `oci_zarr` |
+| `REDIS_URL` | Redis connection string |
+| `TILE_CACHE_TTL` | Redis tile byte TTL in seconds |
+| `OCI_CONFIG_PROFILE` | OCI CLI profile for local session auth |
+| `OCI_CONFIG_FILE` | Mounted OCI config path |
+| `OCI_NAMESPACE` | Object Storage namespace |
+| `OCI_BUCKET` | Object Storage bucket |
+| `OCI_PREFIX` | Prefix to scan or direct store prefix |
+| `OCI_ZARR_PATH` | Optional direct Zarr store path |
+| `OCI_BROWSE_PREFIX_ROOT` | Browse artifact root |
+| `OCI_MULTISCALE_PREFIX_ROOT` | Multiscale artifact root |
+| `BROWSE_PREWARM_ENABLED` | Startup browse/catalog warming toggle |
 
-    class Config:
-        env_file = ".env"
+The canonical local OCI flow uses OCI session/profile auth from `~/.oci`. The
+tracked examples do not use AWS access keys or generic object-store credentials.
 
-settings = Settings()
-```
+## API route surface
 
-### `app/core/zarr_reader.py`
+All routes below are mounted under `/api`.
 
-Opens the Zarr store lazily with Xarray and exposes a `slice_region()` function that takes array index bounds and returns a NumPy array. This is the only place that touches the object store.
+| Method | Path | Compatibility | Surface | Role |
+|---|---|---|---|---|
+| GET | `/healthz` | synthetic + OCI | public app API | Liveness/readiness probe returning `{ "status": "ok" }` |
+| GET | `/datasets` | synthetic + OCI | public app API | List dataset metadata records |
+| GET | `/datasets/{dataset_id}` | synthetic + OCI | public app API | Return one dataset and hydrate OCI metadata as needed |
+| GET | `/datasets/{dataset_id}/variables` | synthetic + OCI | public app API | Return variables/bands for a dataset |
+| GET | `/datasets/{dataset_id}/serving-profile` | synthetic + OCI | public app API | Report browser/proxy/multiscale readiness and gaps |
+| GET | `/colormaps` | synthetic + OCI | public app API | List supported colormap names |
+| GET | `/colormaps/{name}/palette` | synthetic + OCI | public app API | Return sampled RGBA palette values |
+| GET | `/tilejson/{dataset_id}/{variable}` | synthetic + OCI | public app API | Return TileJSON with backend tile URL template |
+| GET | `/tiles/{dataset_id}/{variable}/{z}/{x}/{y}` | synthetic + OCI | public app API | Return a rendered WebP map tile |
+| POST | `/query/preview` | synthetic + OCI | internal/experimental | Return a planner preview artifact descriptor |
+| POST | `/query/stats` | synthetic + OCI | internal/experimental | Return a planner stats artifact descriptor |
+| POST | `/query/clip` | synthetic + OCI | internal/experimental | Return small clip artifact descriptor or accepted batch export |
+| POST | `/exports` | synthetic + OCI | internal/experimental | Create an export job from a planned request |
+| GET | `/exports/{job_id}` | synthetic + OCI | internal/experimental | Return in-memory export job status |
+| GET | `/storage/objects` | OCI-only | development/debug | List raw OCI objects under a prefix |
+| GET | `/storage/prefixes` | OCI-only | development/debug | List folder-like OCI prefixes |
+| GET | `/storage/zarr-stores` | OCI-only | development/debug | Detect candidate Zarr store roots |
+| GET | `/storage/inspect-zarr` | OCI-only | development/debug | Open a store and summarize variables, coords, and attrs |
+| GET | `/storage/zarr-json` | OCI-only | development/debug | Return a store root `zarr.json` document from a relative object path or full `oci://...` URI |
+| GET | `/zarr/{dataset_id}` | OCI-only | public app API | Return source Zarr proxy metadata |
+| GET/HEAD | `/zarr/{dataset_id}/{object_path}` | OCI-only | public app API | Proxy a source Zarr object with byte-range support |
+| GET | `/zarr/multiscale/{dataset_id}` | OCI-only | public app API | Return multiscale Zarr proxy metadata |
+| GET/HEAD | `/zarr/multiscale/{dataset_id}/{object_path}` | OCI-only | public app API | Proxy a multiscale Zarr object with byte-range support |
 
-```python
-import xarray as xr
-import fsspec
-import numpy as np
-from app.config import settings
+The backend also registers top-level `WS /ws/datasets` outside the `/api`
+prefix. It sends JSON dataset invalidation events and supports `{"type":"ping"}`
+messages with `{"type":"pong"}` responses.
 
-_store: xr.Dataset | None = None
+## Tile endpoint
 
-async def open_store() -> xr.Dataset:
-    global _store
-    fs = fsspec.filesystem(
-        settings.zarr_store_url.split("://")[0],
-        key=settings.aws_access_key_id,
-        secret=settings.aws_secret_access_key,
-    )
-    mapper = fs.get_mapper(settings.zarr_store_url)
-    _store = xr.open_zarr(mapper, chunks="auto", consolidated=True)
-    return _store
+`GET /api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
 
-def slice_region(
-    variable: str,
-    lat_slice: slice,
-    lon_slice: slice,
-    time_index: int = 0,
-    target_shape: tuple[int, int] = (256, 256),
-) -> np.ndarray:
-    arr = _store[variable].isel(time=time_index).sel(
-        lat=lat_slice, lon=lon_slice
-    )
-    data = arr.values  # triggers Dask compute
-    # resize to tile shape if needed
-    from PIL import Image
-    img = Image.fromarray(data).resize(target_shape, Image.BILINEAR)
-    return np.array(img)
-```
+For single-band rendering, `{variable}` is a dataset variable or band id. For
+advertised composites, `{variable}` is the composite style id, such as
+`true-color` or `false-color`. Composite requests bypass browse overviews and
+pyramid artifacts for now, render from the source bands, and return RGB WebP
+bytes with `X-Representation: serving`.
 
-### `app/core/tile_generator.py`
+Query parameters:
 
-The hot path. Converts `(z, x, y)` to a geographic bounding box, maps that to Zarr index slices, and coordinates the read + encode pipeline.
-
-```python
-import math
-import numpy as np
-from app.core.zarr_reader import slice_region
-from app.core.colormap import encode_tile
-
-def tile_to_bbox(z: int, x: int, y: int) -> tuple[float, float, float, float]:
-    """Returns (west, south, east, north) in EPSG:4326."""
-    n = 2 ** z
-    west  = x / n * 360 - 180
-    east  = (x + 1) / n * 360 - 180
-    north = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
-    south = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
-    return west, south, east, north
-
-def generate_tile(
-    variable: str,
-    z: int, x: int, y: int,
-    time_index: int,
-    colormap: str,
-    vmin: float,
-    vmax: float,
-) -> bytes:
-    west, south, east, north = tile_to_bbox(z, x, y)
-    lat_slice = slice(south, north)
-    lon_slice = slice(west, east)
-    data = slice_region(variable, lat_slice, lon_slice, time_index)
-    return encode_tile(data, colormap, vmin, vmax)
-```
-
-### `app/core/colormap.py`
-
-Normalizes float data and encodes to WebP. Colormaps are loaded once at import time from matplotlib and stored as 256×4 uint8 LUTs for zero-overhead lookup.
-
-```python
-import numpy as np
-from PIL import Image
-import io
-import matplotlib.cm as mcm
-
-_luts: dict[str, np.ndarray] = {}
-
-def _load_lut(name: str) -> np.ndarray:
-    if name not in _luts:
-        cmap = mcm.get_cmap(name)
-        _luts[name] = (cmap(np.linspace(0, 1, 256)) * 255).astype(np.uint8)
-    return _luts[name]
-
-def encode_tile(
-    data: np.ndarray,
-    colormap: str,
-    vmin: float,
-    vmax: float,
-    quality: int = 85,
-) -> bytes:
-    lut = _load_lut(colormap)
-    clipped = np.clip(data, vmin, vmax)
-    normalized = ((clipped - vmin) / (vmax - vmin) * 255).astype(np.uint8)
-    rgba = lut[normalized]  # shape (H, W, 4)
-    img = Image.fromarray(rgba, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="WEBP", quality=quality)
-    return buf.getvalue()
-```
-
-### `app/core/cache.py`
-
-A thin async wrapper around `redis.asyncio`. All keys are namespaced and all writes use `SETEX` so nothing accumulates indefinitely.
-
-```python
-import hashlib, json
-import redis.asyncio as aioredis
-from app.config import settings
-
-_redis: aioredis.Redis | None = None
-
-async def connect_redis() -> aioredis.Redis:
-    global _redis
-    _redis = aioredis.from_url(settings.redis_url, decode_responses=False)
-    return _redis
-
-def _tile_key(dataset, variable, z, x, y, time_index, colormap, vmin, vmax) -> str:
-    h = hashlib.sha1(
-        json.dumps([dataset, variable, z, x, y, time_index, colormap, vmin, vmax])
-        .encode()
-    ).hexdigest()[:16]
-    return f"tile:{h}"
-
-async def get_tile(key: str) -> bytes | None:
-    return await _redis.get(key)
-
-async def set_tile(key: str, data: bytes) -> None:
-    await _redis.setex(key, settings.tile_cache_ttl, data)
-```
-
-### `app/api/tiles.py`
-
-The tile endpoint. Checks Redis first, generates on miss, writes back to Redis, returns WebP with appropriate cache headers.
-
-```python
-from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import Response
-from app.core.cache import _tile_key, get_tile, set_tile
-from app.core.tile_generator import generate_tile
-from app.models.tile import TileParams
-
-router = APIRouter()
-
-@router.get("/tiles/{dataset}/{variable}/{z}/{x}/{y}")
-async def serve_tile(
-    request: Request,
-    dataset: str,
-    variable: str,
-    z: int, x: int, y: int,
-    params: TileParams = Depends(),
-) -> Response:
-    key = _tile_key(dataset, variable, z, x, y,
-                    params.time_index, params.colormap,
-                    params.vmin, params.vmax)
-    cached = await get_tile(key)
-    if cached:
-        return Response(cached, media_type="image/webp",
-                        headers={"Cache-Control": "max-age=3600", "X-Cache": "HIT"})
-
-    tile = generate_tile(variable, z, x, y,
-                         params.time_index, params.colormap,
-                         params.vmin, params.vmax)
-    await set_tile(key, tile)
-    return Response(tile, media_type="image/webp",
-                    headers={"Cache-Control": "max-age=3600", "X-Cache": "MISS"})
-```
-
----
-
-## API reference
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/tiles/{dataset}/{variable}/{z}/{x}/{y}` | WebP tile image |
-| GET | `/api/datasets` | List all available datasets |
-| GET | `/api/datasets/{id}` | Dataset metadata (variables, dimensions, CRS) |
-| GET | `/api/datasets/{id}/variables` | Variable list with dtype, shape, units |
-| GET | `/api/colormaps` | Available colormap names |
-| WS | `/ws/datasets` | Push channel for dataset availability events |
-
-### Tile query parameters
-
-| Parameter | Type | Default | Description |
+| Parameter | Type | Default | Role |
 |---|---|---|---|
-| `time_index` | int | 0 | Time step index |
-| `colormap` | string | `viridis` | Matplotlib-compatible colormap name |
-| `vmin` | float | p2 percentile | Data minimum for colormap normalization |
-| `vmax` | float | p98 percentile | Data maximum for colormap normalization |
+| `time_index` | int | `0` | Dataset time index |
+| `colormap` | string | `viridis` | Style name and planner style input |
+| `vmin` | float | dataset/display default | Optional display minimum |
+| `vmax` | float | dataset/display default | Optional display maximum |
 
----
+Response:
 
-## Dependencies (`requirements.txt`)
+- body: `image/webp`;
+- `Cache-Control: public, max-age=3600`;
+- `X-Cache-Status: HIT` or `MISS`;
+- `X-Data-Vmin` and `X-Data-Vmax`;
+- `X-Request-Class`, `X-Execution-Path`, and `X-Representation`;
+- optional `X-Browse-Source` when served from browse artifacts.
 
-```
-fastapi>=0.111
-uvicorn[standard]>=0.29
-gunicorn>=22
-pydantic-settings>=2
-xarray>=2024.1
-zarr>=2.18
-dask[distributed]>=2024.1
-fsspec>=2024.1
-s3fs>=2024.1          # S3 support
-gcsfs>=2024.1         # GCS support (optional)
-adlfs>=2024.1         # Azure support (optional)
-redis[hiredis]>=5
-Pillow>=10
-matplotlib>=3.8
-numpy>=1.26
-httpx>=0.27           # For internal test client
-pytest>=8
-pytest-asyncio>=0.23
-```
+## Dataset metadata
 
----
+`DatasetMeta` includes `variables` for scalar/band rendering and
+`composite_styles` for RGB rendering. Static `y/x` projected arrays are exposed
+as one-step variables. OCI catalog hydration advertises composite styles only
+when all required roles are present:
 
-## Environment variables (`.env.example`)
+- `true-color`: red, green, blue;
+- `false-color`: near infrared, red, green.
 
-```bash
-# Object storage
-ZARR_STORE_URL=s3://your-bucket/path/to/data.zarr
+Each composite style records the concrete band ids used by the tile route so the
+frontend can present style names without hardcoding Landsat band mappings.
 
-# AWS credentials (or use IAM role / workload identity)
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_REGION=eu-west-1
+OCI dataset metadata also exposes CRS fields when the source store has
+`spatial_ref` metadata:
 
-# GCS (alternative)
-# ZARR_STORE_URL=gcs://your-bucket/data.zarr
-# GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
+- `crs_wkt`: raw CRS WKT;
+- `crs_authority`: normalized authority string, such as `EPSG:32629` or
+  `OGC:CRS84`, when resolvable.
 
-# Redis
-REDIS_URL=redis://localhost:6379
-TILE_CACHE_TTL=3600
+The catalog supports the current banded 4D `time/*/y/x` layout, direct 3D
+`time/y/x` projected variables, and static 2D `y/x` projected variables.
+Layouts outside those shapes are skipped with a clear unsupported-layout
+diagnostic during catalog build.
 
-# Dask
-DASK_THREADS=4
-# DASK_SCHEDULER_ADDRESS=tcp://dask-scheduler:8786
+## Storage inspection
 
-# Colormap defaults
-COLORMAP_DEFAULT=viridis
-VMIN_PERCENTILE=2.0
-VMAX_PERCENTILE=98.0
-```
+`GET /api/storage/zarr-json?zarr_path=...` accepts either a relative store path,
+such as `cubes/example.zarr`, or a fully qualified `oci://bucket@namespace/...`
+store URI. Empty paths return `400`; missing root `zarr.json` documents return
+`404`.
+
+## Frontend endpoint alignment
+
+`frontend/src/api/endpoints.ts` currently calls:
+
+- `/api/datasets`
+- `/api/datasets/{dataset_id}`
+- `/api/datasets/{dataset_id}/variables`
+- `/api/datasets/{dataset_id}/serving-profile`
+- `/api/tilejson/{dataset_id}/{variable}`
+- `/api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
+- `/api/colormaps`
+- `/api/colormaps/{name}/palette`
+- `/ws/datasets`
+
+Those names line up with the documented public app API above.
+
+## Dependencies
+
+The backend uses FastAPI, Pydantic settings, Xarray, NumPy, Pillow, Redis,
+OCI/ocifs/fsspec libraries, and test utilities from `requirements.txt`.
+
+Dask is present as a dependency and remains part of the broader data-processing
+toolbox, but the checked-in request path does not start a Dask scheduler or
+worker cluster.

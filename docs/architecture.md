@@ -1,168 +1,239 @@
 # Architecture
 
-## Overview
+## Current system
 
-The system is divided into three layers: object storage, a Python backend that acts as a tile server, and a React frontend that renders tiles on a WebGL map. The key insight is that satellite data in Zarr is already chunked on disk — the backend's job is to map XYZ map tile coordinates to the right Zarr chunks, slice them, apply a colormap, and return a WebP image. The frontend treats that image exactly like any other map tile.
+Vizarr is a tile-based satellite Zarr viewer. The checked-in implementation now
+has two backend storage modes:
 
-```
-┌─────────────────────┐     fsspec      ┌────────────────────────────────────────┐     REST/WS     ┌──────────────────────────────┐
-│                     │ ──────────────► │                                        │ ──────────────► │                              │
-│    Object storage   │                 │          Python backend                │                 │       React frontend          │
-│                     │                 │                                        │ ◄────────────── │                              │
-│  s3://bucket/       │                 │  FastAPI router                        │    requests     │  Deck.gl + MapLibre           │
-│    data.zarr/       │                 │  Tile engine                           │                 │  TanStack Query               │
-│      temperature/   │                 │  Zarr + Dask reader                    │                 │  Zustand store                │
-│      precipitation/ │                 │  Redis cache                           │                 │  Prefetch worker              │
-│      wind/          │                 │  Colormap engine                       │                 │                              │
-│      .zattrs        │                 │                                        │                 │                              │
-└─────────────────────┘                 └────────────────────────────────────────┘                 └──────────────────────────────┘
-```
+- `synthetic`: in-memory demo data for local UI and backend regression checks.
+- `oci_zarr`: OCI Object Storage discovery, catalog construction, Zarr metadata
+  inspection, server-rendered tiles, and dataset-scoped Zarr proxying.
 
----
-
-## Components
-
-### Object storage
-
-The Zarr store lives directly in object storage. No data is copied or pre-processed beyond the initial write. The backend reads chunks on demand via `fsspec`, which abstracts S3, GCS, and Azure behind a common interface. The only requirement is that the Zarr arrays use a chunk layout that aligns well with tile boundaries — see [performance.md](performance.md#zarr-chunking) for the recommended encoding.
-
-### FastAPI router
-
-The entry point for all client requests. Handles three categories of traffic:
-
-- **REST endpoints** — dataset discovery, variable metadata, colormap listing. These are served from Redis or computed once and cached.
-- **Tile endpoints** — `GET /tiles/{dataset}/{variable}/{z}/{x}/{y}` — the hot path. Every parameter is validated via Pydantic, the cache is checked, and the tile engine is called only on a miss.
-- **WebSocket** — `WS /ws/datasets` — pushes dataset availability events to connected clients so they can invalidate their caches without polling.
-
-### Tile engine
-
-The core of the backend. For a given `(z, x, y)` tile coordinate, it:
-
-1. Converts the tile to a geographic bounding box (EPSG:4326).
-2. Translates that bounding box to Zarr array index slices using the coordinate arrays.
-3. Calls the Zarr + Dask reader to fetch only those chunks.
-4. Passes the resulting NumPy array to the colormap engine.
-5. Returns a WebP-encoded image.
-
-The tile engine is stateless — all state (open Zarr stores, colormap definitions) is held in the application lifespan context.
-
-### Zarr + Dask reader
-
-Opens the Zarr store lazily via `xarray.open_zarr()` with `chunks="auto"` so Dask takes over chunk scheduling. When the tile engine calls `.isel()` or `.sel()` to slice a spatial region, Dask computes only the required chunks in parallel. On a 4-core machine this typically means 2–4 simultaneous HTTP range requests to the object store per tile.
-
-The reader maintains a warm connection pool through `fsspec`'s built-in caching (`BlockCache`), which keeps recently read byte ranges in memory. This is particularly valuable for tiles at the same zoom level in the same region, where adjacent tiles share chunk boundaries.
-
-### Redis cache
-
-A three-tier cache keyed by a hash of all parameters that affect the tile output:
+The OCI path is the primary implementation target. Generic S3, GCS, Azure, Dask
+clusters, and predictive prefetch remain architectural ideas unless a ticket
+explicitly implements them.
 
 ```
-tile:{dataset}:{variable}:{z}:{x}:{y}:{time_index}:{colormap}:{vmin}:{vmax}
+OCI Object Storage
+  |
+  | OCI SDK listing, ocifs/fsspec reads, direct byte ranges
+  v
+FastAPI backend
+  - catalog and manifest builder
+  - planner-selected tile representation
+  - browse/pyramid/serving tile paths
+  - Redis tile cache
+  - read-only Zarr proxy
+  - dataset invalidation WebSocket
+  |
+  | REST / TileJSON / WebP tiles / WebSocket invalidation
+  v
+React frontend
+  - dataset and variable selection
+  - MapLibre raster source/layer
+  - TanStack Query metadata cache
+  - Zustand map/UI state
 ```
 
-- **L1** — tile bytes (`SETEX`, default TTL 3600s)
-- **L2** — dataset metadata (`SET` with no expiry, invalidated on WebSocket push)
-- **L3** — variable statistics (p2/p98 percentile range, computed once per variable per time step)
+## Data representations
 
-A Redis hit short-circuits the entire tile engine — the response is served in under 1ms from memory.
+### Source Zarr stores
 
-### Colormap engine
+OCI datasets are discovered under `OCI_BUCKET` and `OCI_PREFIX`. A prefix can
+contain many stores; the prefix itself must not be treated as a Zarr root unless
+it contains store metadata.
 
-Takes a 2D NumPy float32 array and returns a uint8 RGBA image. The pipeline:
+The current adapter is tuned toward projected multiband Zarr v3 stores with a
+main `bands` array and dimensions like `time`, `band`, `y`, and `x`. Generic
+projected layouts are not complete yet.
 
-1. Clip values to `[vmin, vmax]` (defaults to p2/p98 percentile range).
-2. Normalize to `[0, 1]`.
-3. Apply a named colormap (matplotlib-compatible, stored as 256×4 RGBA LUT).
-4. Encode to WebP with quality 85 via Pillow.
+### Browse artifacts
 
-Colormaps are loaded from disk at startup and cached in memory. The client can override the colormap and range per request via query parameters.
+Browse overviews are durable, low/mid zoom artifacts used for fast initial map
+navigation. When a browse artifact exists for the requested dataset, variable,
+time, and zoom, the planner can route tile requests through the `browse` path.
 
-### Deck.gl + MapLibre (frontend)
+### Multiscale artifacts
 
-`DeckGL` hosts a `TileLayer` whose `getTileData` function constructs the tile URL from the current dataset, variable, time step, and colormap from the Zustand store, then fetches it as a bitmap. MapLibre GL renders the base map underneath. The two are composed via Deck.gl's `MapboxMap` interop — they share the same viewport and event loop.
+Generated multiscale stores live separately from source stores, usually under
+`OCI_MULTISCALE_PREFIX_ROOT`. They are exposed at:
 
-Tile transitions use Deck.gl's built-in fade (`transitions: { opacity: 300 }`), so stale tiles linger at reduced opacity while the fresh tile loads, eliminating the blank-flash that plagues most tile viewers.
+- `/api/zarr/multiscale/{dataset_id}`
+- `/api/zarr/multiscale/{dataset_id}/{object_path}`
 
-### TanStack Query
+The backend can serve prebuilt pyramid tiles and can lazily generate/cache some
+pyramid tiles. The frontend contains helper code for browser-native multiscale
+reading, but the active viewer path is still MapLibre raster tiles from the
+backend TileJSON endpoint.
 
-Manages all server state. Key query configurations:
+### Direct serving
 
-- `staleTime: 30_000` for dataset metadata — considered fresh for 30 seconds, then refetched silently in the background.
-- `staleTime: Infinity` for colormap definitions — never changes without a deploy.
-- `gcTime: 300_000` for tile prefetch queries — keeps tile data in the in-memory cache for 5 minutes after it leaves the viewport.
+When no browse or pyramid artifact is available, the backend reads source Zarr
+metadata/chunks and renders the requested band tile directly. This is the
+fallback for high zooms and unsupported artifact states.
 
-Variable statistics queries are seeded on first tile load (the backend embeds them in the tile response headers) so there is never a separate round trip to discover the data range.
+## Backend components
 
-### Zustand store
+### FastAPI app and lifespan
 
-Two stores:
+`backend/app/main.py` creates the app, installs CORS, registers `/api` routes,
+and initializes runtime state:
 
-- `mapStore` — viewport bounding box, active dataset ID, active variable, active time index, colormap name, vmin/vmax override. Anything that changes what tiles are fetched.
-- `uiStore` — sidebar open/closed, filter panel state, loading indicators. UI concerns that should not trigger tile refetches.
+- settings from `backend/app/config.py`;
+- planner and planner index;
+- export job store;
+- storage connector for `oci_zarr`;
+- dataset registry or OCI catalog;
+- Redis cache client.
 
-### Prefetch worker
+In `oci_zarr` mode, startup can warm the catalog and browse overviews when the
+settings allow it. In synthetic mode, it builds a local demo registry.
 
-A Web Worker (`prefetch.worker.ts`) that receives the current viewport and zoom level via `postMessage` whenever the map moves. It computes the surrounding 5×5 tile grid (2 tiles in each direction from the visible tiles), filters out tiles already in the browser cache via the Cache API, and fires low-priority `fetch()` requests for the missing ones. By the time the user's pan animation ends, the next viewport is already cached.
+### Catalog and discovery
 
----
+`backend/app/core/dataset_catalog.py` and
+`backend/app/core/oci_object_storage.py` list OCI objects, identify Zarr stores,
+hydrate metadata, and build dataset records. Unreadable stores are skipped during
+catalog construction so one bad store does not take down the API.
 
-## Data flow: a single tile request
+### Planner
+
+`backend/app/services/planner.py` classifies tile and query requests. Tile
+responses expose planner decisions through headers:
+
+- `X-Request-Class`
+- `X-Execution-Path`
+- `X-Representation`
+
+The tile route currently chooses among `browse`, `pyramid`, and `serving`.
+
+### Tile generation
+
+`backend/app/api/tiles.py` is the hot path:
+
+1. validate dataset, variable, tile coordinate, and display parameters;
+2. plan the request;
+3. check Redis by a key containing every tile-affecting parameter;
+4. render through browse, pyramid, or direct source serving;
+5. return WebP bytes with cache and display-range headers.
+
+Synthetic datasets use `core/tile_generator.py`. OCI projected imagery uses
+`core/projected_tile_generator.py`, browse helpers, and multiscale helpers.
+
+### Zarr proxy
+
+`backend/app/api/zarr.py` provides read-only, dataset-scoped proxy routes for
+source and multiscale stores. It supports `GET`, `HEAD`, `Range`, ETag, content
+type detection, and path traversal protection.
+
+These routes are OCI-only and do not expose raw credentials or raw OCI URLs to
+the frontend.
+
+### Cache
+
+Redis stores rendered tile bytes with TTL. Browser HTTP caching is enabled by
+`Cache-Control: public, max-age=3600` on tile and Zarr object responses.
+
+Metadata caching exists in process through app state and TanStack Query on the
+frontend. `/ws/datasets` sends dataset invalidation snapshots so the frontend
+can refresh dataset, variable, serving-profile, and TileJSON queries when the
+catalog changes.
+
+## Frontend components
+
+The current frontend is a React/Vite app using:
+
+- MapLibre raster `Source`/`Layer` for TileJSON-backed map rendering;
+- TanStack Query for datasets, variables, colormaps, TileJSON, and serving
+  profiles;
+- Zustand for active dataset, variable, time index, colormap, and map state.
+
+Tile URLs are centralized in `frontend/src/api/endpoints.ts`. The active viewer
+requests:
+
+- `/api/datasets`
+- `/api/datasets/{dataset_id}/variables`
+- `/api/datasets/{dataset_id}/serving-profile`
+- `/api/tilejson/{dataset_id}/{variable}`
+- `/api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
+
+Browser-native multiscale code in `frontend/src/lib/multiscale.ts` is wired as
+an opportunistic MapLibre image-source path when the serving profile and level
+metadata are compatible. Server-rendered TileJSON remains the fallback and the
+normal path for unsupported datasets.
+
+## Request flow: active tile path
 
 ```
-User pans map
-  │
-  ▼
-TileLayer computes new (z, x, y) coordinates
-  │
-  ▼
-getTileData() builds URL: /tiles/{dataset}/{var}/{z}/{x}/{y}?time=...&colormap=...
-  │
-  ▼
-Browser checks HTTP cache (Cache-Control: max-age=3600)
-  ├── HIT → render immediately
-  └── MISS ──►
-              FastAPI validates request (Pydantic)
-                │
-                ▼
-              Redis HGET tile:{hash}
-                ├── HIT → return WebP bytes (< 1ms)
-                └── MISS ──►
-                            Tile engine: XYZ → bbox → array slices
-                              │
-                              ▼
-                            Zarr + Dask: fetch chunks from object store
-                              │
-                              ▼
-                            Colormap engine: normalize → WebP
-                              │
-                              ▼
-                            Redis SETEX tile:{hash} (cache for next request)
-                              │
-                              ▼
-                            Return WebP + headers (Cache-Control, ETag)
-                              │
-                              ▼
-                            Deck.gl fades in the new tile
+User selects dataset/variable or pans map
+  |
+  v
+Frontend requests TileJSON for dataset + variable
+  |
+  v
+MapLibre requests /api/tiles/{dataset}/{variable}/{z}/{x}/{y}
+  |
+  v
+FastAPI planner selects browse, pyramid, or serving
+  |
+  v
+Redis HIT -> return cached WebP
+  |
+  v
+Redis MISS -> render tile from browse artifact, multiscale artifact, or source Zarr
+  |
+  v
+FastAPI returns WebP + cache/planner/range headers
 ```
-
----
 
 ## Deployment topology
 
+Production-style compose:
+
 ```
-Internet
-  │
-  ▼
-Nginx (port 80/443)
-  ├── /api/*  → FastAPI (Gunicorn + Uvicorn workers, port 8000)
-  ├── /ws     → FastAPI WebSocket
-  └── /*      → Vite build (static files)
+Browser
+  |
+  v
+Nginx on host port ${APP_PORT:-8000}
+  - /api/tiles/ -> backend:8000 with Nginx disk cache
+  - /api/ -> backend:8000
+  - /ws/  -> backend:8000 with WebSocket upgrade headers
+  - /     -> frontend:80
 
-FastAPI
-  └── Redis (port 6379, internal network only)
-  └── Object store (via fsspec over HTTPS)
-
-Optional: Dask scheduler + workers (for heavy parallel loads)
+Backend
+  - internal-only in production-style compose
+  - Redis on the internal compose network
+  - OCI access through configured profile/resource auth
 ```
 
-For production, run at least 4 Uvicorn workers (`--workers 4`) so concurrent tile requests are handled in parallel. The tile engine is CPU-bound during colormap encoding, so worker count should match available cores.
+Development compose:
+
+```
+Browser -> Vite dev server on ${APP_PORT:-5173}
+Vite /api proxy -> backend:8000
+Vite /ws proxy -> backend:8000
+Host direct API -> http://localhost:${API_PORT:-8001}/api
+```
+
+Nginx reports tile disk-cache state with `X-Cache-Status`. Direct backend tile
+responses still use `X-Cache-Status` for the backend Redis cache.
+
+## Implemented vs planned
+
+| Capability | Status |
+|---|---|
+| Synthetic demo dataset | Implemented |
+| OCI session-profile auth and object listing | Implemented |
+| Zarr v3 metadata/chunk/shard handling | Implemented for current target layouts |
+| Server-rendered WebP tiles | Implemented |
+| Browse overview serving | Implemented |
+| Separate multiscale store discovery/proxying | Implemented |
+| MapLibre raster TileJSON viewer | Implemented |
+| Redis tile cache | Implemented |
+| Browser-native multiscale attempt with server-tile fallback | Implemented |
+| RGB and false-color composites | Implemented for recognized band aliases |
+| Generic projected Zarr layout adapter | Partly implemented for direct `time/y/x` and banded `time/*/y/x` layouts |
+| Debounced frontend tile prefetch | Implemented without a worker |
+| WebSocket dataset invalidation | Implemented |
+| External Dask scheduler | Not implemented |
+| Nginx disk tile cache | Implemented |

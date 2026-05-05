@@ -1,7 +1,9 @@
+import io
 import math
 from functools import lru_cache
 
 import numpy as np
+from PIL import Image
 from pyproj import CRS, Transformer
 
 from app.core.colormap import encode_tile
@@ -10,6 +12,10 @@ from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.variable_display import resolve_display_range
+from app.core.zarr_v3 import load_2d_window
+from app.core.zarr_v3 import load_2d_window_decimated
+from app.core.zarr_v3 import load_3d_window
+from app.core.zarr_v3 import load_3d_window_decimated
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_4d_window_decimated
 
@@ -350,6 +356,92 @@ def resolve_projected_display_range(
     )
 
 
+def resolve_composite_band_ids(entry: CatalogEntry, composite_id: str) -> list[str] | None:
+    for style in entry.meta.composite_styles:
+        if style.id == composite_id:
+            return style.bands
+    return None
+
+
+def _normalize_composite_channel(
+    data: np.ndarray,
+    *,
+    fallback_vmin: float,
+    fallback_vmax: float,
+    vmin: float | None,
+    vmax: float | None,
+) -> np.ndarray:
+    actual_vmin, actual_vmax = _resolve_display_range(
+        data=data,
+        fallback_vmin=fallback_vmin,
+        fallback_vmax=fallback_vmax,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    if actual_vmax <= actual_vmin:
+        actual_vmax = actual_vmin + 1e-6
+    normalized = (np.clip(data, actual_vmin, actual_vmax) - actual_vmin) / (actual_vmax - actual_vmin)
+    return (np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0) * 255).astype(np.uint8)
+
+
+def encode_rgb_tile(rgb_data: np.ndarray) -> bytes:
+    finite_mask = np.all(np.isfinite(rgb_data), axis=-1)
+    rgba = np.zeros((*rgb_data.shape[:2], 4), dtype=np.uint8)
+    rgba[..., :3] = np.nan_to_num(rgb_data, nan=0.0, posinf=255.0, neginf=0.0).astype(np.uint8)
+    rgba[..., 3] = np.where(finite_mask, 255, 0).astype(np.uint8)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="WEBP", quality=85)
+    return buffer.getvalue()
+
+
+def render_projected_composite_array(
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    composite_id: str,
+    bbox: tuple[float, float, float, float],
+    *,
+    width: int,
+    height: int,
+    time_index: int,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    max_source_oversample: float | None = None,
+    max_parallel_chunk_reads: int | None = None,
+) -> np.ndarray:
+    entry = ensure_catalog_entry_metadata_ready(entry, connector)
+    band_ids = resolve_composite_band_ids(entry, composite_id)
+    if band_ids is None:
+        raise ValueError(f"Unknown composite style '{composite_id}'")
+
+    channels: list[np.ndarray] = []
+    for band_id in band_ids:
+        channel = render_projected_band_array(
+            connector=connector,
+            entry=entry,
+            variable=band_id,
+            bbox=bbox,
+            width=width,
+            height=height,
+            time_index=time_index,
+            max_source_oversample=max_source_oversample,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        )
+        selected = next(item for item in entry.meta.variables if item.id == band_id)
+        fallback_vmin, fallback_vmax = resolve_display_range(selected, None, None)
+        channels.append(
+            _normalize_composite_channel(
+                channel,
+                fallback_vmin=fallback_vmin,
+                fallback_vmax=fallback_vmax,
+                vmin=vmin,
+                vmax=vmax,
+            )
+        )
+
+    return np.stack(channels, axis=-1)
+
+
 def sample_web_mercator_array(
     data: np.ndarray,
     data_bbox: tuple[float, float, float, float],
@@ -384,12 +476,15 @@ def render_projected_band_array(
     max_parallel_chunk_reads: int | None = None,
 ) -> np.ndarray:
     entry = ensure_catalog_entry_metadata_ready(entry, connector)
-    assert entry.data_array_meta is not None
+    array_name = entry.variable_array_names.get(variable, entry.data_array_name)
+    data_array_meta = entry.data_array_metas.get(array_name) or entry.data_array_meta
+    assert data_array_meta is not None
 
-    band_index = entry.band_indices[variable]
+    array_rank = len(data_array_meta.shape)
+    band_index = entry.band_indices[variable] if array_rank == 4 else None
     if _is_fast_latlon_entry(entry):
-        source_width = int(entry.data_array_meta.shape[-1])
-        source_height = int(entry.data_array_meta.shape[-2])
+        source_width = int(data_array_meta.shape[-1])
+        source_height = int(data_array_meta.shape[-2])
         mercator_x_axis, mercator_y_axis = _pixel_center_axes(bbox, width=width, height=height)
         lon_values = _web_mercator_x_to_lon(mercator_x_axis)
         lat_values = _web_mercator_y_to_lat(mercator_y_axis)
@@ -462,38 +557,94 @@ def render_projected_band_array(
     if use_decimated_window:
         x_step = max(1, math.ceil((x_stop - x_start) / max(width * max_source_oversample, 1.0)))
         y_step = max(1, math.ceil((y_stop - y_start) / max(height * max_source_oversample, 1.0)))
-        window, sampled_y, sampled_x = load_4d_window_decimated(
-            connector=connector,
-            store_path=entry.path,
-            array_name=entry.data_array_name,
-            metadata=entry.data_array_meta,
-            time_index=time_index,
-            band_index=band_index,
-            y_start=y_start,
-            y_stop=y_stop,
-            x_start=x_start,
-            x_stop=x_stop,
-            y_step=y_step,
-            x_step=x_step,
-            max_parallel_chunk_reads=max_parallel_chunk_reads,
-        )
+        if array_rank == 2:
+            window, sampled_y, sampled_x = load_2d_window_decimated(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                y_step=y_step,
+                x_step=x_step,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            )
+        elif band_index is None:
+            window, sampled_y, sampled_x = load_3d_window_decimated(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                time_index=time_index,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                y_step=y_step,
+                x_step=x_step,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            )
+        else:
+            window, sampled_y, sampled_x = load_4d_window_decimated(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                time_index=time_index,
+                band_index=band_index,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                y_step=y_step,
+                x_step=x_step,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            )
         window = window.astype(np.float32)
         x_idx = _coordinate_to_fractional_index(sampled_x, x_idx_full)
         y_idx = _coordinate_to_fractional_index(sampled_y, y_idx_full)
     else:
-        window = load_4d_window(
-            connector=connector,
-            store_path=entry.path,
-            array_name=entry.data_array_name,
-            metadata=entry.data_array_meta,
-            time_index=time_index,
-            band_index=band_index,
-            y_start=y_start,
-            y_stop=y_stop,
-            x_start=x_start,
-            x_stop=x_stop,
-            max_parallel_chunk_reads=max_parallel_chunk_reads,
-        ).astype(np.float32)
+        if array_rank == 2:
+            window = load_2d_window(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            ).astype(np.float32)
+        elif band_index is None:
+            window = load_3d_window(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                time_index=time_index,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            ).astype(np.float32)
+        else:
+            window = load_4d_window(
+                connector=connector,
+                store_path=entry.path,
+                array_name=array_name,
+                metadata=data_array_meta,
+                time_index=time_index,
+                band_index=band_index,
+                y_start=y_start,
+                y_stop=y_stop,
+                x_start=x_start,
+                x_stop=x_stop,
+                max_parallel_chunk_reads=max_parallel_chunk_reads,
+            ).astype(np.float32)
 
     if x_idx_full is not None and y_idx_full is not None and not use_decimated_window:
         x_idx = x_idx_full - x_start
@@ -539,3 +690,32 @@ def generate_projected_band_tile(
     )
     actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, reprojected, vmin, vmax)
     return encode_tile(reprojected, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)
+
+
+def generate_projected_composite_tile(
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    composite_id: str,
+    z: int,
+    x: int,
+    y: int,
+    time_index: int,
+    vmin: float | None,
+    vmax: float | None,
+) -> tuple[bytes, tuple[float, float]]:
+    rgb_data = render_projected_composite_array(
+        connector=connector,
+        entry=entry,
+        composite_id=composite_id,
+        bbox=xyz_to_web_mercator_bbox(z, x, y),
+        width=TILE_SIZE,
+        height=TILE_SIZE,
+        time_index=time_index,
+        vmin=vmin,
+        vmax=vmax,
+        max_source_oversample=1.0,
+    )
+    finite = rgb_data[np.isfinite(rgb_data)]
+    if finite.size == 0:
+        return encode_rgb_tile(rgb_data), (0.0, 255.0)
+    return encode_rgb_tile(rgb_data), (float(np.nanmin(finite)), float(np.nanmax(finite)))

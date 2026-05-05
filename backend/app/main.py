@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.api.router import router as api_router
+from app.api.websockets import router as websocket_router
 from app.core.browse_tiles import prewarm_browse_overviews
 from app.core.browse_tiles import start_background_browse_prewarm
 from app.config import get_settings
@@ -111,6 +112,7 @@ async def handle_oci_auth_expired(_request: Request, exc: OCIAuthExpiredError) -
 
 
 app.include_router(api_router, prefix="/api")
+app.include_router(websocket_router)
 app.state.settings = settings
 app.state.planner_index = PlannerIndex()
 app.state.planner = PlannerService(settings, app.state.planner_index)

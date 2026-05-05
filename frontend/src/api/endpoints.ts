@@ -1,6 +1,7 @@
 import type { DatasetMeta, DatasetServingProfile, TileJson, VariableMeta } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
+const WS_BASE = import.meta.env.VITE_WS_URL ?? "";
 
 interface TileUrlParams {
   datasetId: string;
@@ -37,6 +38,21 @@ export function buildTileUrl(params: TileUrlParams): string {
     query.set("vmax", String(params.vmax));
   }
   return `${buildApiUrl("/api/tiles")}/${encodeURIComponent(params.datasetId)}/${encodeURIComponent(params.variable)}/{z}/{x}/{y}?${query.toString()}`;
+}
+
+export function buildWebSocketUrl(path: string): string {
+  if (/^wss?:\/\//.test(path)) {
+    return path;
+  }
+
+  if (WS_BASE) {
+    return `${WS_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  }
+
+  const apiBase = API_BASE || window.location.origin;
+  const resolved = new URL(path.startsWith("/") ? path : `/${path}`, apiBase);
+  resolved.protocol = resolved.protocol === "https:" ? "wss:" : "ws:";
+  return resolved.toString();
 }
 
 interface TileJsonParams extends TileUrlParams {}

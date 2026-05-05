@@ -120,6 +120,42 @@ select {
   position: relative;
 }
 
+.realtime-status {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(260px, calc(100% - 32px));
+  padding: 8px 10px;
+  border-radius: 999px;
+  color: #dfeaf2;
+  background: rgba(6, 12, 18, 0.76);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 0.78rem;
+  line-height: 1.2;
+  backdrop-filter: blur(10px);
+}
+
+.realtime-status span:first-child {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #8f9ba6;
+}
+
+.realtime-status[data-status="connected"] span:first-child {
+  background: #3ee08f;
+  box-shadow: 0 0 14px rgba(62, 224, 143, 0.7);
+}
+
+.realtime-status[data-status="connecting"] span:first-child {
+  background: #ffd166;
+}
+
 .map-shell,
 .map-shell > div {
   width: 100%;
@@ -148,6 +184,12 @@ select {
   left: auto;
   right: 24px;
   bottom: auto;
+}
+
+.map-overlay--bottom-right {
+  left: auto;
+  right: 24px;
+  bottom: 24px;
 }
 
 .map-overlay--compact {

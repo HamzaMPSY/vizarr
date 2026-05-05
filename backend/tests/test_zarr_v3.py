@@ -9,6 +9,8 @@ from app.core.zarr_v3 import build_chunk_object_path
 from app.core.zarr_v3 import estimate_4d_nonempty_pixel_bounds
 from app.core.zarr_v3 import estimate_4d_present_shard_pixel_bounds
 from app.core.zarr_v3 import load_1d_numeric_array
+from app.core.zarr_v3 import load_2d_chunk
+from app.core.zarr_v3 import load_2d_window
 from app.core.zarr_v3 import load_4d_chunk
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
@@ -120,6 +122,78 @@ def test_load_fixed_length_utf32_labels_reassembles_multiple_chunks(monkeypatch)
     )
 
     assert labels == ["B1", "B2", "B3"]
+
+
+def test_load_2d_window_reassembles_requested_area(monkeypatch) -> None:
+    metadata = ZarrV3ArrayMetadata(
+        shape=(4, 4),
+        chunk_shape=(2, 2),
+        data_type="uint16",
+        fill_value=0,
+        codecs=[],
+        separator="/",
+        attributes={},
+        dimension_names=("y", "x"),
+    )
+
+    chunks = {
+        (0, 0): np.array([[1, 2], [5, 6]], dtype=np.uint16),
+        (0, 1): np.array([[3, 4], [7, 8]], dtype=np.uint16),
+        (1, 0): np.array([[9, 10], [13, 14]], dtype=np.uint16),
+        (1, 1): np.array([[11, 12], [15, 16]], dtype=np.uint16),
+    }
+
+    monkeypatch.setattr(
+        "app.core.zarr_v3.load_2d_chunk",
+        lambda *, chunk_indices, **_kwargs: chunks[chunk_indices],
+    )
+
+    window = load_2d_window(
+        connector=None,  # type: ignore[arg-type]
+        store_path="cubes/example.zarr",
+        array_name="NDVI",
+        metadata=metadata,
+        y_start=1,
+        y_stop=4,
+        x_start=1,
+        x_stop=4,
+    )
+
+    assert window.tolist() == [
+        [6, 7, 8],
+        [10, 11, 12],
+        [14, 15, 16],
+    ]
+
+
+def test_load_2d_chunk_accepts_full_edge_chunk_payload(monkeypatch) -> None:
+    metadata = ZarrV3ArrayMetadata(
+        shape=(5, 5),
+        chunk_shape=(3, 3),
+        data_type="uint16",
+        fill_value=0,
+        codecs=[],
+        separator="/",
+        attributes={},
+        dimension_names=("y", "x"),
+    )
+
+    full_chunk = np.arange(9, dtype=np.uint16).reshape((3, 3))
+
+    monkeypatch.setattr(
+        "app.core.zarr_v3._read_chunk_bytes",
+        lambda **_kwargs: full_chunk.tobytes(),
+    )
+
+    chunk = load_2d_chunk(
+        connector=None,  # type: ignore[arg-type]
+        store_path="cubes/example.zarr",
+        array_name="NDVI",
+        metadata=metadata,
+        chunk_indices=(1, 1),
+    )
+
+    assert chunk.shape == (3, 3)
 
 
 def test_load_4d_window_reassembles_requested_area(monkeypatch) -> None:

@@ -1,384 +1,273 @@
-# Build guide
+# Build And Run Guide
 
-Step-by-step instructions for local development, testing, and production deployment.
-
----
+This guide reflects the checked-in implementation and compose files.
 
 ## Prerequisites
 
 | Tool | Version | Purpose |
 |---|---|---|
 | Python | 3.11+ | Backend runtime |
-| Node.js | 20+ | Frontend build + dev server |
-| Docker | 24+ | Production containers |
-| Docker Compose | 2.2+ | Multi-container orchestration |
-| Redis | 7+ | Tile cache (or use Docker) |
-| Object store access | — | S3, GCS, or Azure credentials |
+| Node.js | 20+ | Frontend build and dev server |
+| Docker or Podman | Recent stable | Container runtime |
+| Docker Compose or Podman Compose | Recent stable | Multi-container runs |
+| Redis | 7+ | Tile cache when running outside compose |
+| OCI CLI | Current | Local OCI session auth for `oci_zarr` mode |
 
----
+Synthetic mode does not need OCI credentials. OCI mode expects a valid OCI
+profile/session on the host, normally under `~/.oci`.
 
-## 1. Clone and configure
+## Environment files
 
-```bash
-git clone https://github.com/your-org/satellite-zarr-viewer.git
-cd satellite-zarr-viewer
-cp backend/.env.example backend/.env
-```
+| File | Purpose |
+|---|---|
+| `backend/.env.example` | Sanitized synthetic/default backend settings |
+| `backend/.env.oci.example` | Sanitized OCI settings template |
+| `backend/.env.production.example` | Sanitized production-style compose template |
+| `backend/.env` | Local private backend settings, ignored by git |
+| `backend/.env.production` | Private production-style compose settings, ignored by git |
 
-Edit `backend/.env` with your object store credentials and Zarr path:
-
-```bash
-# Minimum required
-ZARR_STORE_URL=s3://your-bucket/path/to/data.zarr
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=eu-west-1
-
-# Optional — defaults are usually fine
-REDIS_URL=redis://localhost:6379
-TILE_CACHE_TTL=3600
-DASK_THREADS=4
-COLORMAP_DEFAULT=viridis
-```
-
-For GCS, replace the AWS variables with:
+For OCI local development:
 
 ```bash
-ZARR_STORE_URL=gcs://your-bucket/data.zarr
-GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+cp backend/.env.oci.example backend/.env
 ```
 
----
+Then fill:
 
-## 2. Backend — local development
+```bash
+OCI_CONFIG_PROFILE=prof
+OCI_CONFIG_FILE=/home/app/.oci/config
+OCI_NAMESPACE=<object-storage-namespace>
+OCI_BUCKET=<bucket-name>
+OCI_PREFIX=<prefix-or-zarr-store>
+```
+
+Refresh local OCI session auth before starting the backend:
+
+```bash
+oci session authenticate --profile-name prof
+```
+
+The tracked examples intentionally do not include AWS access keys, GCS service
+account paths, or live bucket names.
+
+## URL and port matrix
+
+| Mode | Command | Frontend URL | API URL | Health URL | Notes |
+|---|---|---|---|---|---|
+| Backend only local | `uvicorn app.main:app --reload --port 8000` from `backend/` | None | `http://localhost:8000/api` | `http://localhost:8000/api/healthz` | Use Redis locally or rely on cache fallback behavior |
+| Frontend Vite local | `npm run dev` from `frontend/` | `http://localhost:5173` | Proxies to `http://127.0.0.1:8000/api` by default | Backend health above | Override with `VITE_PROXY_TARGET` |
+| Dev compose | `docker compose -f docker-compose.dev.yml up --build` | `http://localhost:5173` | `http://localhost:8001/api` | `http://localhost:8001/api/healthz` | Backend hot reload, Vite HMR, mounts host `~/.oci` |
+| Production-style compose | `docker compose up --build` | `http://localhost:8000` | `http://localhost:8000/api` through Nginx | `http://localhost:8000/api/healthz` | Backend is internal-only; Nginx proxies `/api`, `/api/tiles`, `/ws`, and frontend traffic |
+| VM handoff local backend | See `VM_HANDOFF.md` | `http://<vm-host>:5173` | `http://<vm-host>:8015/api` | `http://<vm-host>:8015/api/healthz` | Uses VM-local OCI profile/session |
+
+There is no `/api/health` alias. Use `/api/healthz`.
+
+## Backend: local development
 
 ```bash
 cd backend
-
-# Create and activate virtual environment
 python -m venv .venv
-source .venv/bin/activate          # macOS / Linux
-# .venv\Scripts\activate           # Windows
-
-# Install dependencies
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# Start the dev server with auto-reload
 uvicorn app.main:app --reload --port 8000 --log-level info
 ```
 
-The API is now available at `http://localhost:8000`. Verify it with:
+Verify:
 
 ```bash
+curl http://localhost:8000/api/healthz
 curl http://localhost:8000/api/datasets
 ```
 
-You should get a JSON list of the datasets discovered from your Zarr store's `.zmetadata`.
-
-### Start Redis locally (if not using Docker)
-
-```bash
-# macOS
-brew install redis && brew services start redis
-
-# Ubuntu
-sudo apt install redis-server && sudo systemctl start redis
-
-# Or just use Docker for Redis alone
-docker run -d -p 6379:6379 redis:7-alpine
-```
-
-### Run tests
+Run tests:
 
 ```bash
 pytest tests/ -v
 ```
 
-The test suite uses a synthetic in-memory Zarr store fixture so no object store credentials are needed to run tests.
-
----
-
-## 3. Frontend — local development
+## Frontend: local development
 
 ```bash
 cd frontend
-
-# Install dependencies
 npm install
-
-# Start the dev server
 npm run dev
 ```
 
-The viewer is at `http://localhost:5173`. It proxies `/api` and `/ws` to the backend on port 8000, so both need to be running.
+Vite defaults to `http://localhost:5173` and proxies `/api` to
+`http://127.0.0.1:8000`. For a different backend:
 
-### Build for production
+```bash
+VITE_PROXY_TARGET=http://127.0.0.1:8001 npm run dev
+```
+
+Build:
 
 ```bash
 npm run build
-# Output is in frontend/dist/
 ```
 
-### Type-check without building
+Type check:
 
 ```bash
 npm run type-check
 ```
 
----
+## Dev compose
 
-## 4. Prepare your Zarr data
-
-If your existing Zarr data has suboptimal chunking, rewrite it before deploying. The recommended chunk layout is `[1, 256, 256]` (time, lat, lon):
-
-```python
-import xarray as xr
-import numcodecs
-
-# Open your existing data
-ds = xr.open_zarr("s3://your-bucket/original.zarr", consolidated=True)
-
-# Rewrite with tile-aligned chunks
-encoding = {
-    var: {
-        "chunks": [1, 256, 256],
-        "compressor": numcodecs.Blosc(cname="zstd", clevel=3,
-                                       shuffle=numcodecs.Blosc.BITSHUFFLE),
-        "dtype": "float32",
-    }
-    for var in ds.data_vars
-}
-
-ds.to_zarr(
-    "s3://your-bucket/data.zarr",
-    encoding=encoding,
-    consolidated=True,
-    mode="w",
-)
-```
-
-This is a one-time operation. Run it on a machine with fast access to the source bucket (ideally in the same cloud region) to minimise transfer time.
-
----
-
-## 5. Docker Compose — production
-
-The `docker-compose.yml` at the project root starts four containers: the FastAPI backend, Redis, the Vite-built frontend served by Nginx, and Nginx as the reverse proxy.
-
-```yaml
-services:
-  backend:
-    build: ./backend
-    env_file: ./backend/.env
-    expose:
-      - "8000"
-    depends_on:
-      - redis
-    deploy:
-      replicas: 1
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-
-  frontend:
-    build: ./frontend
-    expose:
-      - "80"
-
-  nginx:
-    image: nginx:1.25-alpine
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - backend
-      - frontend
-
-volumes:
-  redis_data:
-```
-
-### Backend `Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY app/ ./app/
-
-CMD ["gunicorn", "app.main:app",
-     "--workers", "4",
-     "--worker-class", "uvicorn.workers.UvicornWorker",
-     "--bind", "0.0.0.0:8000",
-     "--timeout", "60"]
-```
-
-### Frontend `Dockerfile`
-
-```dockerfile
-FROM node:20-alpine AS build
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
-FROM nginx:1.25-alpine
-COPY --from=build /app/dist /usr/share/nginx/html
-COPY nginx-frontend.conf /etc/nginx/conf.d/default.conf
-```
-
-### `nginx/nginx.conf`
-
-```nginx
-worker_processes auto;
-
-events { worker_connections 1024; }
-
-http {
-  include mime.types;
-
-  proxy_cache_path /var/cache/nginx/tiles
-      levels=1:2
-      keys_zone=tiles:10m
-      max_size=2g
-      inactive=1h
-      use_temp_path=off;
-
-  upstream backend {
-    server backend:8000;
-    keepalive 32;
-  }
-
-  server {
-    listen 80;
-
-    # Tile requests — cache at Nginx level
-    location /api/tiles/ {
-      proxy_pass         http://backend;
-      proxy_http_version 1.1;
-      proxy_set_header   Connection "";
-      proxy_cache        tiles;
-      proxy_cache_key    "$uri$is_args$args";
-      proxy_cache_valid  200 1h;
-      proxy_cache_use_stale error timeout updating;
-      add_header         X-Cache-Status $upstream_cache_status;
-    }
-
-    # WebSocket
-    location /ws {
-      proxy_pass         http://backend;
-      proxy_http_version 1.1;
-      proxy_set_header   Upgrade $http_upgrade;
-      proxy_set_header   Connection "upgrade";
-    }
-
-    # Other API routes — no Nginx cache
-    location /api/ {
-      proxy_pass         http://backend;
-      proxy_http_version 1.1;
-      proxy_set_header   Connection "";
-    }
-
-    # Frontend static files
-    location / {
-      proxy_pass         http://frontend;
-    }
-  }
-}
-```
-
-### Start everything
+Use dev compose for normal iteration:
 
 ```bash
-docker compose up --build -d
-docker compose logs -f
+docker compose -f docker-compose.dev.yml up --build
 ```
 
-The viewer is at `http://localhost`.
-
----
-
-## 6. Production checklist
-
-Before going live, verify each item:
-
-- [ ] `ZARR_STORE_URL` points to the correctly chunked Zarr store (`[1, 256, 256]`, `consolidated=True`)
-- [ ] Object store credentials are set in the environment (not committed to git)
-- [ ] Redis persistence is configured (`appendonly yes` in redis.conf) if tile cache durability matters
-- [ ] Backend runs with at least 4 Gunicorn workers (`--workers 4`)
-- [ ] Nginx tile cache directory has sufficient disk space (2GB default in the config)
-- [ ] HTTPS is configured (add SSL certs to the Nginx config; consider Certbot)
-- [ ] `TILE_CACHE_TTL` is appropriate for how often your data updates (default 3600s)
-- [ ] CORS is configured in FastAPI if the frontend is on a different domain
-- [ ] Health check endpoint is available (`GET /api/health`) for load balancer probes
-
-### Add a health check endpoint
-
-In `app/api/router.py`:
-
-```python
-@router.get("/health")
-async def health():
-    return {"status": "ok"}
-```
-
----
-
-## 7. Scaling
-
-### Horizontal backend scaling
-
-Run multiple backend replicas behind a load balancer. Because all state is in Redis (not in the process), any replica can serve any request. Update `docker-compose.yml`:
-
-```yaml
-backend:
-  deploy:
-    replicas: 4
-```
-
-Add Nginx upstream balancing:
-
-```nginx
-upstream backend {
-  server backend_1:8000;
-  server backend_2:8000;
-  server backend_3:8000;
-  server backend_4:8000;
-  keepalive 64;
-}
-```
-
-### Dask cluster for heavy loads
-
-For large datasets or high-concurrency tile generation, connect to an external Dask cluster instead of the built-in `LocalCluster`. Set in `.env`:
+or:
 
 ```bash
-DASK_SCHEDULER_ADDRESS=tcp://dask-scheduler:8786
+podman compose -f docker-compose.dev.yml up --build
 ```
 
-Then in `workers/dask_client.py`:
+What it does:
 
-```python
-from dask.distributed import Client
-from app.config import settings
+- backend runs `uvicorn --reload` inside the container on port `8000`;
+- backend is published on host port `${API_PORT:-8001}`;
+- frontend runs Vite on host port `${APP_PORT:-5173}`;
+- frontend proxies `/api` to `http://backend:8000`;
+- Redis is published on host port `6379`;
+- host `${HOME}/.oci` is mounted read-only so OCI session token paths keep
+  working inside the backend container.
 
-async def start_dask() -> Client:
-    if settings.dask_scheduler_address:
-        return await Client(settings.dask_scheduler_address, asynchronous=True)
-    return await Client(
-        n_workers=settings.dask_threads,
-        threads_per_worker=1,
-        asynchronous=True,
-    )
+### Compose proxy and registry settings
+
+If container builds cannot reach public registries from a company network, copy
+the compose env template and fill the proxy or internal registry values:
+
+```bash
+cp .env.compose.example .env
 ```
 
-### Redis cluster
+Common values:
 
-For very high cache hit rates (millions of tiles), Redis Cluster spreads the keyspace across multiple nodes. Point `REDIS_URL` at a Redis Cluster endpoint — the `redis.asyncio` client supports cluster mode transparently.
+```text
+HTTP_PROXY=http://your-proxy-host:port
+HTTPS_PROXY=http://your-proxy-host:port
+NO_PROXY=localhost,127.0.0.1,backend,frontend,redis,nginx
+NPM_CONFIG_REGISTRY=https://your-company-npm-registry/
+PIP_INDEX_URL=https://your-company-pypi/simple
+PIP_TRUSTED_HOST=your-company-pypi
+```
+
+If npm fails because the network intercepts TLS, `NPM_CONFIG_STRICT_SSL=false`
+and `NODE_TLS_REJECT_UNAUTHORIZED=0` can unblock an internal POC. Prefer
+installing the company root CA in container images for longer-lived setups.
+
+## Production-style compose
+
+```bash
+cp backend/.env.production.example backend/.env.production
+BACKEND_ENV_FILE=./backend/.env.production docker compose up --build
+```
+
+For a synthetic demo, the default template is enough and this also works:
+
+```bash
+docker compose up --build
+```
+
+What it does:
+
+- backend is exposed internally on `backend:8000`;
+- backend is not published directly on the host by default;
+- backend runs Uvicorn with `${BACKEND_WORKERS:-2}` workers;
+- frontend serves the production Vite build on the internal compose network;
+- Nginx is published on host port `${APP_PORT:-8000}`;
+- Nginx proxies `/api/` to the backend and `/` to the frontend;
+- Nginx caches successful `/api/tiles/` responses in a named disk cache and
+  reports cache state with `X-Cache-Status`;
+- Nginx proxies `/ws/` to the backend with WebSocket upgrade headers.
+- Redis persists append-only data in the named `redis_data` volume.
+
+## OCI discovery checks
+
+When `STORAGE_BACKEND=oci_zarr`, useful checks are:
+
+```bash
+curl http://localhost:8001/api/storage/prefixes
+curl http://localhost:8001/api/storage/zarr-stores
+curl 'http://localhost:8001/api/storage/inspect-zarr?zarr_path=<path>'
+curl http://localhost:8001/api/datasets
+```
+
+If the backend returns `503` with an OCI auth message, refresh the host OCI
+session and restart the backend container if necessary.
+
+## OCI browser smoke
+
+Use the smoke harness after starting the dev stack in OCI mode:
+
+```bash
+python3 scripts/oci_browser_smoke.py \
+  --api-url http://localhost:8001/api \
+  --frontend-url http://localhost:5173
+```
+
+The script verifies:
+
+- backend health at `/api/healthz`;
+- OCI-backed dataset discovery through `/api/datasets`;
+- variables for the selected OCI dataset;
+- TileJSON bounds and tile URL construction;
+- one center tile request returning `200 image/webp`;
+- the frontend HTML shell.
+
+It exits successfully with a `SKIP:` message when no OCI-backed dataset is
+returned or when the backend reports expired/missing OCI auth. It does not store
+OCI namespace, bucket, profile, token, or dataset values.
+
+Optional selectors:
+
+```bash
+VIZARR_OCI_DATASET_ID=<dataset-id> \
+VIZARR_OCI_VARIABLE=<band-or-composite-id> \
+python3 scripts/oci_browser_smoke.py
+```
+
+Complete the visual browser pass with the checklist printed by the script:
+
+- open the frontend URL;
+- select the same dataset and variable/composite;
+- confirm the map auto-fits the dataset footprint;
+- confirm the visible map raster layer or sidebar tile preview is populated.
+
+## Data preparation guidance
+
+The current OCI implementation supports projected multiband Zarr v3 stores and
+generated browse/multiscale artifacts. The ideal source layout depends on the
+dataset, but tile serving works best when spatial chunks are close to tile size.
+
+For lat/lon scalar datasets, `[1, 256, 256]` time/spatial chunking is still a
+good target. For projected imagery, the adapter reads source chunks and can use
+browse or multiscale artifacts for lower zooms.
+
+## Production checklist
+
+- [ ] Use `/api/healthz` for load balancer probes.
+- [ ] Keep private OCI settings in `backend/.env.production`,
+      `backend/.env`, or deployment secrets, not in tracked example files.
+- [ ] Confirm `STORAGE_BACKEND` is correct for the deployment.
+- [ ] Confirm Redis is reachable by the backend.
+- [ ] Confirm `OCI_CONFIG_FILE` and profile/resource-principal auth match the
+      runtime environment.
+- [ ] Confirm browse or multiscale artifacts exist for datasets that need fast
+      first-view performance.
+- [ ] Add HTTPS and domain-specific CORS policy for production.
+- [ ] Verify Nginx tile cache and `/ws` behavior against the target runtime.
+
+## Scaling notes
+
+The current app keeps request coordination simple: backend processes share tile
+bytes through Redis and serve object data directly from OCI. Horizontal backend
+scaling is possible if every replica has the same OCI auth and Redis settings.
+
+External Dask scheduling is not wired into the checked-in request path. Treat it
+as future architecture until implemented.

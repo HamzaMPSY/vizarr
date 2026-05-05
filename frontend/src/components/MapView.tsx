@@ -4,7 +4,10 @@ import maplibregl from "maplibre-gl";
 import Map, { Layer, Source } from "react-map-gl/maplibre";
 import type { StyleSpecification } from "maplibre-gl";
 
-import { useTileJson } from "../hooks/useDatasets";
+import { useBrowserMultiscale } from "../hooks/useBrowserMultiscale";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { useServingProfile, useTileJson, useVariables } from "../hooks/useDatasets";
+import { useTilePrefetch } from "../hooks/useTilePrefetch";
 import { useMapStore } from "../store/mapStore";
 
 const BASE_STYLE: StyleSpecification = {
@@ -29,22 +32,52 @@ const BASE_STYLE: StyleSpecification = {
 };
 
 export function MapView() {
-  const { datasetId, variable, timeIndex, colormap, vmin, vmax, viewState, setViewState } = useMapStore();
-  const { data: tileJson } = useTileJson(datasetId, variable, timeIndex, colormap, vmin, vmax);
+  const { datasetId, variable, renderMode, compositeStyle, timeIndex, colormap, vmin, vmax, viewState, setViewState } = useMapStore();
+  const tileVariable = renderMode === "composite" ? compositeStyle : variable;
+  const { data: tileJson } = useTileJson(datasetId, tileVariable, timeIndex, colormap, vmin, vmax);
+  const { data: servingProfile } = useServingProfile(datasetId);
+  const { data: variables } = useVariables(datasetId);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const lastFittedBoundsKeyRef = useRef<string | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [tileLoading, setTileLoading] = useState(false);
+  const debouncedViewState = useDebouncedValue(viewState, 180);
 
   const detailMinZoom = tileJson?.detail_minzoom ?? null;
   const minZoom = tileJson?.minzoom ?? null;
+  const maxZoom = tileJson?.maxzoom ?? null;
   const tileTemplate = tileJson?.tiles[0] ?? null;
+  const selectedVariable = variables?.find((item) => item.id === variable) ?? null;
+  const nativeVmin = vmin ?? selectedVariable?.display_vmin ?? selectedVariable?.stats.p02 ?? null;
+  const nativeVmax = vmax ?? selectedVariable?.display_vmax ?? selectedVariable?.stats.p98 ?? null;
+  const browserMultiscale = useBrowserMultiscale({
+    profile: servingProfile,
+    variable: renderMode === "band" ? variable : null,
+    timeIndex,
+    colormap,
+    vmin: nativeVmin,
+    vmax: nativeVmax,
+    zoom: debouncedViewState.zoom
+  });
   const tileSourceId =
-    datasetId && variable
-      ? `vizarr-tiles:${datasetId}:${variable}:${timeIndex}:${colormap}:${vmin ?? "auto"}:${vmax ?? "auto"}`
+    datasetId && tileVariable
+      ? `vizarr-tiles:${datasetId}:${tileVariable}:${timeIndex}:${colormap}:${vmin ?? "auto"}:${vmax ?? "auto"}`
       : null;
   const tileSourceKey = tileSourceId && tileTemplate ? `${tileSourceId}:${tileTemplate}` : tileSourceId;
   const tileLayerId = tileSourceId ? `${tileSourceId}:layer` : null;
+  const nativeSourceId =
+    datasetId && variable && renderMode === "band" && browserMultiscale.image
+      ? `vizarr-native:${datasetId}:${variable}:${timeIndex}:${colormap}:${nativeVmin}:${nativeVmax}`
+      : null;
+  const nativeLayerId = nativeSourceId ? `${nativeSourceId}:layer` : null;
+
+  useTilePrefetch({
+    tileTemplate,
+    viewState: debouncedViewState,
+    minZoom,
+    maxZoom,
+    enabled: browserMultiscale.status !== "native"
+  });
 
   useEffect(() => {
     if (!tileJson?.bounds || !mapRef.current || !mapLoaded) {
@@ -180,7 +213,7 @@ export function MapView() {
           })
         }
       >
-        {tileTemplate && tileSourceId && tileLayerId ? (
+        {tileTemplate && tileSourceId && tileLayerId && !browserMultiscale.image ? (
           <Source
             key={tileSourceKey}
             id={tileSourceId}
@@ -202,20 +235,38 @@ export function MapView() {
             />
           </Source>
         ) : null}
+        {browserMultiscale.image && nativeSourceId && nativeLayerId ? (
+          <Source
+            key={`${nativeSourceId}:${browserMultiscale.image.dataUrl}:${browserMultiscale.image.levelPath}`}
+            id={nativeSourceId}
+            type="image"
+            url={browserMultiscale.image.dataUrl}
+            coordinates={browserMultiscale.image.coordinates}
+          >
+            <Layer
+              id={nativeLayerId}
+              type="raster"
+              paint={{
+                "raster-opacity": 0.9,
+                "raster-fade-duration": 0
+              }}
+            />
+          </Source>
+        ) : null}
       </Map>
-      {!datasetId || !variable ? (
+      {!datasetId || !tileVariable ? (
         <div className="map-overlay">
-          <h2>Select a dataset and variable</h2>
+          <h2>Select a dataset and layer</h2>
           <p>The POC will render synthetic Zarr-like tiles once a variable is active.</p>
         </div>
       ) : null}
-      {datasetId && variable && showOverviewGuard ? (
+      {datasetId && tileVariable && showOverviewGuard ? (
         <div className="map-overlay map-overlay--top-left">
           <h2>Overview Mode</h2>
           <p>Full-resolution tiles start at zoom {detailMinZoom}. Zoom in to switch from browse overviews to native-detail rendering.</p>
         </div>
       ) : null}
-      {datasetId && variable && !tileJson?.has_coarse_fallback && showZoomGuard ? (
+      {datasetId && tileVariable && !tileJson?.has_coarse_fallback && showZoomGuard ? (
         <div className="map-overlay map-overlay--top-left">
           <h2>Zoom In To Load Data</h2>
           <p>This dataset does not expose a useful coarse browse layer. Dynamic detail tiles start at zoom {minZoom}.</p>
@@ -225,6 +276,12 @@ export function MapView() {
         <div className="map-overlay map-overlay--top-right map-overlay--compact">
           <h2>Loading Tiles</h2>
           <p>The backend is rendering on-demand tiles for this view.</p>
+        </div>
+      ) : null}
+      {datasetId && tileVariable && renderMode === "band" ? (
+        <div className="map-overlay map-overlay--bottom-right map-overlay--compact">
+          <h2>{browserMultiscale.status === "native" ? "Browser Native" : "Server Tiles"}</h2>
+          <p>{browserMultiscale.reason}</p>
         </div>
       ) : null}
     </div>

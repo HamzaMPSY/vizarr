@@ -3,8 +3,10 @@ import pytest
 
 from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import _refine_bounds_from_nonempty_data
-from app.core.dataset_catalog import _time_labels_from_values
+from app.core.dataset_catalog import _select_projected_layout
 from app.core.dataset_catalog import _select_projected_array_names
+from app.core.dataset_catalog import _time_labels_from_values
+from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import read_store_metadata
@@ -40,12 +42,78 @@ def test_select_projected_array_names_rejects_missing_supported_4d_layout() -> N
     metadata = {
         "value": {
             "shape": [128, 256],
-            "dimension_names": ["y", "x"],
+            "dimension_names": ["row", "column"],
         }
     }
 
     with pytest.raises(ValueError, match="supported projected 4D array"):
         _select_projected_array_names(metadata)
+
+
+def test_select_projected_layout_accepts_direct_3d_variables() -> None:
+    metadata = {
+        "NDVI": {
+            "shape": [2, 128, 256],
+            "dimension_names": ["time", "y", "x"],
+        },
+        "EVI": {
+            "shape": [2, 128, 256],
+            "dimension_names": ["time", "y", "x"],
+        },
+        "x": {
+            "shape": [256],
+            "dimension_names": ["x"],
+        },
+        "y": {
+            "shape": [128],
+            "dimension_names": ["y"],
+        },
+    }
+
+    layout = _select_projected_layout(metadata)
+
+    assert layout.data_array_name == "EVI"
+    assert layout.band_array_name is None
+    assert layout.variable_array_names == {"EVI": "EVI", "NDVI": "NDVI"}
+
+
+def test_select_projected_layout_accepts_static_2d_variables() -> None:
+    metadata = {
+        "DEM": {
+            "shape": [128, 256],
+            "dimension_names": ["y", "x"],
+        },
+        "slope": {
+            "shape": [128, 256],
+            "dimension_names": ["y", "x"],
+        },
+        "x": {
+            "shape": [256],
+            "dimension_names": ["x"],
+        },
+        "y": {
+            "shape": [128],
+            "dimension_names": ["y"],
+        },
+    }
+
+    layout = _select_projected_layout(metadata)
+
+    assert layout.data_array_name == "DEM"
+    assert layout.band_array_name is None
+    assert layout.variable_array_names == {"DEM": "DEM", "slope": "slope"}
+
+
+def test_select_projected_layout_reports_unsupported_layout() -> None:
+    metadata = {
+        "value": {
+            "shape": [128, 256],
+            "dimension_names": ["row", "column"],
+        }
+    }
+
+    with pytest.raises(ValueError, match="supported projected layout"):
+        _select_projected_layout(metadata)
 
 
 class _StubConnector:
@@ -141,6 +209,158 @@ def test_ensure_catalog_entry_ready_uses_geotransform_without_loading_coordinate
     assert ready.meta.bounds.west == pytest.approx(29.95)
     assert ready.meta.bounds.east == pytest.approx(30.15)
     assert ready.meta.native_resolution_m is not None
+
+
+def test_ensure_catalog_entry_metadata_ready_accepts_direct_3d_variables(monkeypatch) -> None:
+    crs_wkt = (
+        'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
+        'ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],'
+        'CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],'
+        'ANGLEUNIT["degree",0.0174532925199433]]'
+    )
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="NDVI",
+        band_array_name="",
+        band_names=[],
+        band_indices={},
+    )
+
+    monkeypatch.setattr(
+        "app.core.dataset_catalog._read_dataset_metadata",
+        lambda **_kwargs: (
+            {},
+            {
+                "NDVI": {
+                    "shape": [2, 4, 4],
+                    "dimension_names": ["time", "y", "x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [1, 2, 2]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "x": {
+                    "shape": [4],
+                    "dimension_names": ["x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "y": {
+                    "shape": [4],
+                    "dimension_names": ["y"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "spatial_ref": {
+                    "attributes": {
+                        "crs_wkt": crs_wkt,
+                        "GeoTransform": "29.95 0.1 0.0 10.05 0.0 -0.1",
+                    }
+                },
+            },
+        ),
+    )
+
+    ready = ensure_catalog_entry_metadata_ready(entry, connector=object())  # type: ignore[arg-type]
+
+    assert [item.id for item in ready.meta.variables] == ["NDVI"]
+    assert ready.variable_array_names == {"NDVI": "NDVI"}
+    assert ready.data_array_metas["NDVI"].shape == (2, 4, 4)
+    assert ready.meta.crs_wkt == crs_wkt
+    assert ready.meta.crs_authority == "OGC:CRS84"
+
+
+def test_ensure_catalog_entry_metadata_ready_accepts_static_2d_variables(monkeypatch) -> None:
+    crs_wkt = (
+        'GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
+        'ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],'
+        'CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],'
+        'ANGLEUNIT["degree",0.0174532925199433]]'
+    )
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/static.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="static.zarr",
+            description="Static dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="DEM",
+        band_array_name="",
+        band_names=[],
+        band_indices={},
+    )
+
+    monkeypatch.setattr(
+        "app.core.dataset_catalog._read_dataset_metadata",
+        lambda **_kwargs: (
+            {},
+            {
+                "DEM": {
+                    "shape": [4, 4],
+                    "dimension_names": ["y", "x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "slope": {
+                    "shape": [4, 4],
+                    "dimension_names": ["y", "x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [2, 2]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "x": {
+                    "shape": [4],
+                    "dimension_names": ["x"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "y": {
+                    "shape": [4],
+                    "dimension_names": ["y"],
+                    "chunk_grid": {"configuration": {"chunk_shape": [4]}},
+                    "data_type": "float32",
+                    "codecs": [],
+                    "attributes": {},
+                },
+                "spatial_ref": {
+                    "attributes": {
+                        "crs_wkt": crs_wkt,
+                        "GeoTransform": "29.95 0.1 0.0 10.05 0.0 -0.1",
+                    }
+                },
+            },
+        ),
+    )
+
+    ready = ensure_catalog_entry_metadata_ready(entry, connector=object())  # type: ignore[arg-type]
+
+    assert [item.id for item in ready.meta.variables] == ["DEM", "slope"]
+    assert [item.time_steps for item in ready.meta.variables] == [1, 1]
+    assert ready.variable_array_names == {"DEM": "DEM", "slope": "slope"}
+    assert ready.data_array_metas["DEM"].shape == (4, 4)
+    assert ready.meta.crs_authority == "OGC:CRS84"
 
 
 def test_refine_bounds_from_nonempty_data_prefers_source_window_over_browse(monkeypatch) -> None:

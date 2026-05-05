@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DatasetBounds(BaseModel):
@@ -26,13 +26,23 @@ class VariableMeta(BaseModel):
     default_colormap: str | None = None
 
 
+class CompositeStyle(BaseModel):
+    id: str
+    name: str
+    description: str
+    bands: list[str]
+
+
 class DatasetMeta(BaseModel):
     id: str
     name: str
     description: str
     variables: list[VariableMeta]
+    composite_styles: list[CompositeStyle] = Field(default_factory=list)
     bounds: DatasetBounds | None = None
     native_resolution_m: float | None = None
+    crs_wkt: str | None = None
+    crs_authority: str | None = None
     time_values: list[str] | None = None
     zarr_format: int | None = None
     zarr_consolidated: bool | None = None

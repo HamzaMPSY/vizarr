@@ -10,6 +10,7 @@ export interface MultiscaleLevelDescriptor {
   compressor: unknown;
   filters: unknown | null;
   order: string | null;
+  dimensionSeparator: "." | "/";
 }
 
 interface ZarrV2ArrayMetadata {
@@ -19,6 +20,7 @@ interface ZarrV2ArrayMetadata {
   compressor: unknown;
   filters?: unknown | null;
   order?: string;
+  dimension_separator?: "." | "/";
 }
 
 interface ZarrV2MetadataEnvelope {
@@ -63,19 +65,23 @@ export async function loadMultiscaleMetadata(proxyRoot: string, dataArrayName: s
       : Array.isArray(levelAttrs.bbox_wgs84)
         ? levelAttrs.bbox_wgs84
         : null;
+    const bboxIsWebMercator = Array.isArray(levelAttrs.bbox_epsg3857);
     if (!bboxRaw || bboxRaw.length !== 4) {
       continue;
     }
     levels.push({
       path,
       browseZoom: Number.isFinite(browseZoomLevels[index]) ? browseZoomLevels[index] : null,
-      bbox: webMercatorBBoxToLonLat(bboxRaw.map((value) => Number(value)) as [number, number, number, number]),
+      bbox: bboxIsWebMercator
+        ? webMercatorBBoxToLonLat(bboxRaw.map((value) => Number(value)) as [number, number, number, number])
+        : bboxRaw.map((value) => Number(value)) as [number, number, number, number],
       shape: arrayMeta.shape.map((value) => Number(value)) as [number, number, number, number],
       chunks: arrayMeta.chunks.map((value) => Number(value)) as [number, number, number, number],
       dtype: arrayMeta.dtype,
       compressor: arrayMeta.compressor,
       filters: arrayMeta.filters ?? null,
-      order: typeof arrayMeta.order === "string" ? arrayMeta.order : null
+      order: typeof arrayMeta.order === "string" ? arrayMeta.order : null,
+      dimensionSeparator: arrayMeta.dimension_separator === "/" ? "/" : "."
     });
   }
 
@@ -116,11 +122,14 @@ export function levelSupportsDirectChunkRead(level: MultiscaleLevelDescriptor): 
     level.compressor === null &&
     level.filters === null &&
     level.order === "C" &&
-    level.shape.every((value, index) => value === level.chunks[index])
+    level.chunks[0] === 1 &&
+    level.chunks[1] === 1 &&
+    level.chunks[2] === 256 &&
+    level.chunks[3] === 256
   );
 }
 
-export async function loadLevelChunk(
+export async function loadLevelPlane(
   proxyRoot: string,
   dataArrayName: string,
   level: MultiscaleLevelDescriptor,
@@ -132,25 +141,45 @@ export async function loadLevelChunk(
     bandIndex: number;
   }
 ): Promise<Float32Array> {
-  const response = await fetch(buildApiUrl(`${proxyRoot}/${level.path}/${dataArrayName}/0.0.0.0`));
-  if (!response.ok) {
-    throw new Error(`Failed to load multiscale chunk: ${response.status}`);
-  }
-
-  const buffer = await response.arrayBuffer();
-  const values = new Float32Array(buffer);
   const [timeCount, bandCount, height, width] = level.shape;
-  const planeSize = height * width;
-  const expectedSize = timeCount * bandCount * planeSize;
-  if (values.length !== expectedSize) {
-    throw new Error(`Unexpected chunk length: received ${values.length}, expected ${expectedSize}`);
+  const [timeChunkSize, bandChunkSize, chunkHeight, chunkWidth] = level.chunks;
+  if (!levelSupportsDirectChunkRead(level)) {
+    throw new Error("Selected multiscale level is not directly readable by the browser");
   }
   if (timeIndex < 0 || timeIndex >= timeCount || bandIndex < 0 || bandIndex >= bandCount) {
     throw new Error("Requested band/time index is outside the multiscale chunk bounds");
   }
 
-  const offset = ((timeIndex * bandCount) + bandIndex) * planeSize;
-  return values.slice(offset, offset + planeSize);
+  const timeChunk = Math.floor(timeIndex / timeChunkSize);
+  const bandChunk = Math.floor(bandIndex / bandChunkSize);
+  const timeOffset = timeIndex % timeChunkSize;
+  const bandOffset = bandIndex % bandChunkSize;
+  const chunksY = Math.ceil(height / chunkHeight);
+  const chunksX = Math.ceil(width / chunkWidth);
+  const plane = new Float32Array(height * width);
+
+  for (let chunkY = 0; chunkY < chunksY; chunkY += 1) {
+    for (let chunkX = 0; chunkX < chunksX; chunkX += 1) {
+      const yStart = chunkY * chunkHeight;
+      const xStart = chunkX * chunkWidth;
+      const actualHeight = Math.min(chunkHeight, height - yStart);
+      const actualWidth = Math.min(chunkWidth, width - xStart);
+      const chunk = await loadChunk(proxyRoot, dataArrayName, level, [timeChunk, bandChunk, chunkY, chunkX]);
+      const expectedSize = timeChunkSize * bandChunkSize * actualHeight * actualWidth;
+      if (chunk.length !== expectedSize) {
+        throw new Error(`Unexpected chunk length: received ${chunk.length}, expected ${expectedSize}`);
+      }
+
+      const sourcePlaneOffset = ((timeOffset * bandChunkSize) + bandOffset) * actualHeight * actualWidth;
+      for (let row = 0; row < actualHeight; row += 1) {
+        const sourceOffset = sourcePlaneOffset + row * actualWidth;
+        const targetOffset = (yStart + row) * width + xStart;
+        plane.set(chunk.subarray(sourceOffset, sourceOffset + actualWidth), targetOffset);
+      }
+    }
+  }
+
+  return plane;
 }
 
 export function renderChunkToDataUrl(
@@ -206,6 +235,21 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+async function loadChunk(
+  proxyRoot: string,
+  dataArrayName: string,
+  level: MultiscaleLevelDescriptor,
+  coordinates: [number, number, number, number]
+): Promise<Float32Array> {
+  const chunkKey = level.dimensionSeparator === "/"
+    ? coordinates.join("/")
+    : coordinates.join(".");
+  const response = await fetch(buildApiUrl(`${proxyRoot}/${level.path}/${dataArrayName}/${chunkKey}`));
+  if (!response.ok) {
+    throw new Error(`Failed to load multiscale chunk ${chunkKey}: ${response.status}`);
+  }
+  return new Float32Array(await response.arrayBuffer());
+}
 
 function webMercatorBBoxToLonLat(
   bbox: [number, number, number, number]

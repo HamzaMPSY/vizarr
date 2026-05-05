@@ -2,6 +2,7 @@ import base64
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from dataclasses import field
 
 import numpy as np
 from pyproj import CRS, Geod, Transformer
@@ -21,7 +22,7 @@ from app.core.zarr_v3 import load_fixed_length_utf32_labels
 from app.core.zarr_v3 import parse_array_metadata
 from app.core.zarr_v3 import read_consolidated_metadata
 from app.core.zarr_v3 import read_store_metadata
-from app.models.dataset import DatasetBounds, DatasetMeta, VariableMeta
+from app.models.dataset import CompositeStyle, DatasetBounds, DatasetMeta, VariableMeta
 
 
 LANDSAT_BAND_NAMES = {
@@ -34,9 +35,38 @@ LANDSAT_BAND_NAMES = {
     "7": "SWIR 2",
 }
 
+COMPOSITE_STYLE_DEFINITIONS = (
+    {
+        "id": "true-color",
+        "name": "True Color",
+        "description": "Natural-color RGB composite using red, green, and blue bands.",
+        "bands": ("red", "green", "blue"),
+    },
+    {
+        "id": "false-color",
+        "name": "False Color",
+        "description": "Vegetation-focused composite using near infrared, red, and green bands.",
+        "bands": ("nir", "red", "green"),
+    },
+)
+
+_BAND_ALIASES = {
+    "blue": {"B2", "B02", "2", "BLUE"},
+    "green": {"B3", "B03", "3", "GREEN"},
+    "red": {"B4", "B04", "4", "RED"},
+    "nir": {"B5", "B05", "5", "NIR", "NIR1", "NEAR INFRARED", "NEAR_INFRARED"},
+}
+
 
 logger = logging.getLogger(__name__)
 _MAX_PARALLEL_BAND_SAMPLES = 4
+
+
+@dataclass
+class ProjectedLayout:
+    data_array_name: str
+    band_array_name: str | None
+    variable_array_names: dict[str, str]
 
 
 @dataclass
@@ -50,6 +80,8 @@ class CatalogEntry:
     band_array_name: str
     band_names: list[str]
     band_indices: dict[str, int]
+    variable_array_names: dict[str, str] = field(default_factory=dict)
+    data_array_metas: dict[str, ZarrV3ArrayMetadata] = field(default_factory=dict)
     data_array_meta: ZarrV3ArrayMetadata | None = None
     x_meta: ZarrV3ArrayMetadata | None = None
     y_meta: ZarrV3ArrayMetadata | None = None
@@ -71,6 +103,45 @@ def _build_label(raw_label: str) -> tuple[str, str]:
     if friendly:
         return normalized, f"{normalized} {friendly}"
     return normalized, normalized
+
+
+def _normalized_band_token(value: str) -> str:
+    return value.strip().upper().replace("-", " ").replace("_", " ")
+
+
+def _band_ids_by_role(band_names: list[str]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for band_name in band_names:
+        band_id, band_title = _build_label(band_name)
+        candidates = {
+            _normalized_band_token(band_name),
+            _normalized_band_token(band_id),
+            _normalized_band_token(band_title),
+        }
+        candidates.update(item.replace(" ", "") for item in tuple(candidates))
+        for role, aliases in _BAND_ALIASES.items():
+            alias_tokens = {_normalized_band_token(alias) for alias in aliases}
+            alias_tokens.update(item.replace(" ", "") for item in tuple(alias_tokens))
+            if role not in resolved and candidates.intersection(alias_tokens):
+                resolved[role] = band_id
+    return resolved
+
+
+def build_composite_styles(band_names: list[str]) -> list[CompositeStyle]:
+    ids_by_role = _band_ids_by_role(band_names)
+    styles: list[CompositeStyle] = []
+    for definition in COMPOSITE_STYLE_DEFINITIONS:
+        roles = tuple(definition["bands"])
+        if all(role in ids_by_role for role in roles):
+            styles.append(
+                CompositeStyle(
+                    id=str(definition["id"]),
+                    name=str(definition["name"]),
+                    description=str(definition["description"]),
+                    bands=[ids_by_role[role] for role in roles],
+                )
+            )
+    return styles
 
 
 def _default_band_names(count: int) -> list[str]:
@@ -97,6 +168,39 @@ def _select_projected_array_names(metadata: dict[str, dict]) -> tuple[str, str]:
 
     candidates.sort(key=lambda item: item[0])
     return candidates[0]
+
+
+def _select_projected_layout(metadata: dict[str, dict]) -> ProjectedLayout:
+    try:
+        data_array_name, band_array_name = _select_projected_array_names(metadata)
+        return ProjectedLayout(
+            data_array_name=data_array_name,
+            band_array_name=band_array_name,
+            variable_array_names={},
+        )
+    except ValueError:
+        pass
+
+    variable_arrays: dict[str, str] = {}
+    for array_name, node in sorted(metadata.items()):
+        shape = node.get("shape")
+        dimension_names = tuple(node.get("dimension_names", []))
+        if not isinstance(shape, list):
+            continue
+        if len(shape) == 3 and dimension_names == ("time", "y", "x"):
+            variable_arrays[array_name] = array_name
+        elif len(shape) == 2 and dimension_names == ("y", "x"):
+            variable_arrays[array_name] = array_name
+
+    if variable_arrays:
+        first_array_name = next(iter(variable_arrays.values()))
+        return ProjectedLayout(
+            data_array_name=first_array_name,
+            band_array_name=None,
+            variable_array_names=variable_arrays,
+        )
+
+    raise ValueError("Dataset does not expose a supported projected layout with dims time/*/y/x, time/y/x, or y/x")
 
 
 def _build_variable_meta(
@@ -408,6 +512,8 @@ def _refine_bounds_from_nonempty_source_data(
 ) -> DatasetBounds | None:
     if entry.data_array_meta is None or entry.geo_transform is None:
         return None
+    if len(entry.data_array_meta.shape) != 4:
+        return None
 
     band_index = entry.band_indices.get(variable_id)
     if band_index is None:
@@ -442,6 +548,28 @@ def _parse_geo_transform(value: str | None) -> tuple[float, float, float, float,
     if len(parts) != 6:
         return None
     return tuple(float(part) for part in parts)  # type: ignore[return-value]
+
+
+def _crs_authority_from_wkt(crs_wkt: str | None) -> str | None:
+    if not crs_wkt:
+        return None
+    try:
+        crs = CRS.from_wkt(crs_wkt)
+    except Exception:
+        return None
+    epsg = crs.to_epsg()
+    if epsg is not None:
+        return f"EPSG:{epsg}"
+    authority = crs.to_authority()
+    if authority is None:
+        return None
+    name, code = authority
+    return f"{name}:{code}"
+
+
+def _apply_crs_metadata(entry: CatalogEntry) -> None:
+    entry.meta.crs_wkt = entry.crs_wkt
+    entry.meta.crs_authority = _crs_authority_from_wkt(entry.crs_wkt)
 
 
 def _estimate_native_resolution_from_geotransform(
@@ -533,7 +661,7 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             zarr_format = int(store_metadata.get("zarr_format", store_zarr_format or 0))
             if zarr_format != 3:
                 continue
-            data_array_name, band_array_name = _select_projected_array_names(metadata)
+            layout = _select_projected_layout(metadata)
         except Exception as exc:
             logger.warning("Skipping unsupported dataset store %s: %s", store_path, exc)
             continue
@@ -560,17 +688,23 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             consolidated=bool(
                 store_consolidated if store_consolidated is not None else "consolidated_metadata" in store_metadata
             ),
-            data_array_name=data_array_name,
-            band_array_name=band_array_name,
-            band_names=[],
-            band_indices={},
-            data_array_meta=parse_array_metadata(metadata[data_array_name]),
+            data_array_name=layout.data_array_name,
+            band_array_name=layout.band_array_name or "",
+            band_names=list(layout.variable_array_names.keys()),
+            band_indices={name: index for index, name in enumerate(layout.variable_array_names.keys())},
+            variable_array_names=layout.variable_array_names,
+            data_array_metas={
+                array_name: parse_array_metadata(metadata[array_name])
+                for array_name in {layout.data_array_name, *layout.variable_array_names.values()}
+            },
+            data_array_meta=parse_array_metadata(metadata[layout.data_array_name]),
             x_meta=parse_array_metadata(metadata["x"]) if "x" in metadata else None,
             y_meta=parse_array_metadata(metadata["y"]) if "y" in metadata else None,
             crs_wkt=metadata.get("spatial_ref", {}).get("attributes", {}).get("crs_wkt"),
             geo_transform=_parse_geo_transform(metadata.get("spatial_ref", {}).get("attributes", {}).get("GeoTransform")),
         )
         entry = catalog[dataset_id]
+        _apply_crs_metadata(entry)
         multiscale_summary = probe_multiscale_store(
             connector=connector,
             store_path=multiscale_store_path(settings, store_path),
@@ -583,7 +717,7 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             entry.meta.multiscale_population_strategy = multiscale_summary.population_strategy
             entry.meta.multiscale_prepopulated_zoom_max = multiscale_summary.prepopulated_zoom_max
             entry.meta.multiscale_max_zoom = multiscale_summary.max_zoom
-        if entry.data_array_meta is not None and len(entry.data_array_meta.shape) >= 4:
+        if entry.data_array_meta is not None and len(entry.data_array_meta.shape) >= 3:
             bounds = _compute_bounds_from_grid_shape(
                 width=int(entry.data_array_meta.shape[-1]),
                 height=int(entry.data_array_meta.shape[-2]),
@@ -648,43 +782,58 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
             connector=connector,
             store_path=entry.path,
         )
-        data_array_name, band_array_name = _select_projected_array_names(metadata)
-        if band_array_name not in metadata:
-            raise ValueError(f"Dataset {entry.id} is missing band coordinate array '{band_array_name}'")
+        layout = _select_projected_layout(metadata)
+        if layout.band_array_name is not None and layout.band_array_name not in metadata:
+            raise ValueError(f"Dataset {entry.id} is missing band coordinate array '{layout.band_array_name}'")
         if "x" not in metadata or "y" not in metadata:
             raise ValueError(f"Dataset {entry.id} is missing x/y coordinate arrays")
 
-        entry.data_array_name = data_array_name
-        entry.band_array_name = band_array_name
-        entry.data_array_meta = parse_array_metadata(metadata[data_array_name])
-        band_meta = parse_array_metadata(metadata[band_array_name])
+        entry.data_array_name = layout.data_array_name
+        entry.band_array_name = layout.band_array_name or ""
+        entry.variable_array_names = layout.variable_array_names
+        entry.data_array_metas = {
+            array_name: parse_array_metadata(metadata[array_name])
+            for array_name in {layout.data_array_name, *layout.variable_array_names.values()}
+        }
+        entry.data_array_meta = entry.data_array_metas[layout.data_array_name]
+        band_meta = parse_array_metadata(metadata[layout.band_array_name]) if layout.band_array_name is not None else None
         entry.x_meta = parse_array_metadata(metadata["x"])
         entry.y_meta = parse_array_metadata(metadata["y"])
         spatial_ref_attrs = metadata.get("spatial_ref", {}).get("attributes", {})
         entry.crs_wkt = spatial_ref_attrs.get("crs_wkt")
         entry.geo_transform = _parse_geo_transform(spatial_ref_attrs.get("GeoTransform"))
+        _apply_crs_metadata(entry)
 
         encoded_band_labels = entry.data_array_meta.attributes.get("band_labels")
         if not isinstance(encoded_band_labels, list):
             encoded_band_labels = None
 
-        try:
-            entry.band_names = load_fixed_length_utf32_labels(
-                connector=connector,
-                store_path=entry.path,
-                array_name=band_array_name,
-                metadata=band_meta,
-            )
-        except (FileNotFoundError, ValueError):
-            if encoded_band_labels:
-                entry.band_names = [str(label) for label in encoded_band_labels]
-            else:
-                entry.band_names = _default_band_names(int(metadata[band_array_name]["shape"][0]))
+        if layout.band_array_name is None:
+            entry.band_names = list(layout.variable_array_names.keys())
+        else:
+            assert band_meta is not None
+            try:
+                entry.band_names = load_fixed_length_utf32_labels(
+                    connector=connector,
+                    store_path=entry.path,
+                    array_name=layout.band_array_name,
+                    metadata=band_meta,
+                )
+            except (FileNotFoundError, ValueError):
+                if encoded_band_labels:
+                    entry.band_names = [str(label) for label in encoded_band_labels]
+                else:
+                    entry.band_names = _default_band_names(int(metadata[layout.band_array_name]["shape"][0]))
 
         if not entry.band_names:
-            entry.band_names = _default_band_names(int(metadata[band_array_name]["shape"][0]))
+            if layout.band_array_name is None:
+                entry.band_names = list(layout.variable_array_names.keys())
+            else:
+                entry.band_names = _default_band_names(int(metadata[layout.band_array_name]["shape"][0]))
 
-        time_steps = int(metadata[data_array_name]["shape"][0]) if metadata[data_array_name]["shape"] else 1
+        data_shape = metadata[layout.data_array_name]["shape"]
+        data_dimension_names = tuple(metadata[layout.data_array_name].get("dimension_names", []))
+        time_steps = int(data_shape[0]) if data_shape and data_dimension_names[0:1] == ("time",) else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
         if "time" in metadata:
             time_meta = parse_array_metadata(metadata["time"])
@@ -703,6 +852,7 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
             stats_samples=None,
             time_steps=time_steps,
         )
+        entry.meta.composite_styles = build_composite_styles(entry.band_names)
 
     return entry
 
@@ -713,7 +863,7 @@ def ensure_catalog_entry_bounds_ready(entry: CatalogEntry, connector: OCIObjectS
     if (
         entry.meta.bounds is None
         and entry.data_array_meta is not None
-        and len(entry.data_array_meta.shape) >= 4
+        and len(entry.data_array_meta.shape) >= 3
         and entry.geo_transform is not None
     ):
         entry.meta.bounds = _compute_bounds_from_grid_shape(

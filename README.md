@@ -1,6 +1,14 @@
 # Satellite Zarr Viewer
 
-A high-performance web application for visualizing satellite data stored in [Zarr](https://zarr.dev/) format on object storage. The current implementation is OCI-first and combines server-side tile rendering with a browser-native multiscale path backed by dataset-scoped Zarr proxy endpoints.
+Vizarr is a web viewer for satellite data stored as Zarr on object storage. The
+current implementation is OCI-first, with a synthetic demo mode for local
+regression checks.
+
+The app has two serving paths:
+
+- server-rendered WebP map tiles from FastAPI;
+- read-only, dataset-scoped Zarr proxy endpoints for browser/native multiscale
+  experiments.
 
 ---
 
@@ -8,96 +16,146 @@ A high-performance web application for visualizing satellite data stored in [Zar
 
 ```
 /
-├── backend/              # Python / FastAPI tile server
-├── frontend/             # React / TypeScript viewer
+├── backend/              # Python / FastAPI tile server and OCI adapters
+├── frontend/             # React / TypeScript MapLibre viewer
 ├── nginx/
-│   └── nginx.conf        # Reverse proxy + tile cache
-├── docker-compose.yml
-└── README.md             ← you are here
+│   └── nginx.conf        # Reverse proxy for production-style compose
+├── docker-compose.yml    # Production-style stack behind Nginx
+├── docker-compose.dev.yml
+└── README.md
 ```
 
 ## Documentation
 
 | Document | Description |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | System design, component roles, data flow |
-| [docs/backend.md](docs/backend.md) | Backend folder structure, API reference, key modules |
-| [docs/frontend.md](docs/frontend.md) | Frontend folder structure, component guide, state management |
-| [docs/performance.md](docs/performance.md) | Caching layers, prefetch strategy, tile encoding |
-| [docs/build.md](docs/build.md) | Step-by-step setup for local dev and production |
+| [docs/architecture.md](docs/architecture.md) | Current system architecture and implemented/planned boundaries |
+| [docs/backend.md](docs/backend.md) | Backend modules, route surface, and runtime modes |
+| [docs/frontend.md](docs/frontend.md) | Frontend component guide and state model |
+| [docs/performance.md](docs/performance.md) | Implemented caching paths and planned performance work |
+| [docs/build.md](docs/build.md) | Local dev, compose, OCI, and VM setup |
+| [docs/oci-integration.md](docs/oci-integration.md) | OCI-specific discovery and live-store notes |
+
+Operational files:
+
+- [AGENTS.md](AGENTS.md): repository instructions for coding agents.
+- [WORKFLOW.md](WORKFLOW.md): Symphony/Linear orchestration prompt template.
+- [VM_HANDOFF.md](VM_HANDOFF.md): local-only source bundle and VM runbook.
 
 ---
 
-## Quick start (Docker)
+## Quick start: development compose
+
+Use this while changing code. It gives backend hot reload and Vite HMR.
 
 ```bash
-# 1. Clone and configure
-cp backend/.env.example backend/.env
-# edit backend/.env with your object store credentials
+cp backend/.env.oci.example backend/.env
+# Fill OCI_NAMESPACE, OCI_BUCKET, OCI_PREFIX, and refresh your OCI session.
 
-# 2. Start everything
-docker compose up --build
-
-# 3. Open
-open http://localhost
+docker compose -f docker-compose.dev.yml up --build
 ```
 
-The viewer will be at `http://localhost`, the API at `http://localhost/api`, and the WebSocket at `ws://localhost/ws`.
+Default URLs:
 
-## Quick start (local dev)
+- frontend: `http://localhost:5173`
+- backend API: `http://localhost:8001/api`
+- health: `http://localhost:8001/api/healthz`
+
+The Vite dev server proxies `/api` to the backend.
+
+For OCI browser smoke verification after the stack is up:
 
 ```bash
-# Terminal 1 — backend
+python3 scripts/oci_browser_smoke.py
+```
+
+The smoke command skips cleanly when OCI auth or OCI-backed datasets are not
+available. See [docs/build.md](docs/build.md) for the full checklist.
+
+## Quick start: production-style compose
+
+```bash
+docker compose up --build
+```
+
+Default URLs:
+
+- viewer through Nginx: `http://localhost:8000`
+- API through Nginx: `http://localhost:8000/api`
+- direct backend API: `http://localhost:8001/api`
+- health: `http://localhost:8000/api/healthz`
+
+The default tracked `backend/.env.example` is safe for synthetic mode. For OCI,
+copy `backend/.env.oci.example` to `backend/.env` and update compose to load it,
+or run the dev stack which already treats `backend/.env` as optional.
+
+## Local backend and frontend without compose
+
+```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
+```
 
-# Terminal 2 — frontend
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend runs at `http://localhost:5173`, proxying `/api` and `/ws` to the backend on port 8000.
+Default URLs:
+
+- frontend: `http://localhost:5173`
+- backend API: `http://localhost:8000/api`
+- health: `http://localhost:8000/api/healthz`
 
 ---
 
-## Browser-servable Zarr proxy
+## Current API highlights
 
-When `STORAGE_BACKEND=oci_zarr`, Vizarr now exposes dataset-scoped proxy endpoints for remote Zarr stores:
+- `GET /api/healthz`
+- `GET /api/datasets`
+- `GET /api/datasets/{dataset_id}`
+- `GET /api/datasets/{dataset_id}/variables`
+- `GET /api/datasets/{dataset_id}/serving-profile`
+- `GET /api/tilejson/{dataset_id}/{variable}`
+- `GET /api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
+- `GET /api/colormaps`
+- `GET /api/colormaps/{name}/palette`
+- `POST /api/query/preview`, `/api/query/stats`, `/api/query/clip`
+- `POST /api/exports`, `GET /api/exports/{job_id}`
+- `GET /api/storage/*` for OCI-only discovery/debug workflows
+- `GET` and `HEAD /api/zarr/*` for OCI-only dataset-scoped Zarr proxying
 
-- `GET /api/zarr/{dataset_id}`
-- `GET /api/zarr/{dataset_id}/zarr.json`
-- `GET /api/zarr/{dataset_id}/{object_path}`
+See [docs/backend.md](docs/backend.md) for route classification and response
+roles.
 
-These endpoints are read-only, return dataset metadata and raw Zarr objects, and support byte-range requests for chunk and shard access.
+## Tech stack
 
-Dataset responses also include:
-
-- `zarr_format`
-- `zarr_consolidated`
-- `zarr_proxy_root`
-- `multiscale_store_path`
-- `multiscale_zarr_format`
-- `multiscale_zarr_consolidated`
-- `multiscale_proxy_root`
-
-For datasets that satisfy the current browser contract, the frontend reads consolidated metadata from the multiscale proxy, fetches the selected chunk directly in the browser, colorizes it client-side, and falls back to server-rendered tiles when needed.
-
----
-
-## Tech stack at a glance
-
-| Layer | Technology | Why |
+| Layer | Technology | Current role |
 |---|---|---|
-| Object store | OCI Object Storage via fsspec / ocifs | Cloud-native remote Zarr access without copying data into the app |
-| Data format | Zarr v3 + browse overviews | Chunked, random-access storage plus lower-zoom overview serving |
-| Backend framework | FastAPI + Uvicorn | Async, fast, WebSocket native |
-| Array engine | Xarray + NumPy | Lazy metadata access plus direct chunk reads for projected imagery |
-| Tile cache | Redis | Sub-millisecond tile cache with TTL |
-| Tile encoding | Pillow → WebP | ~40% smaller than PNG |
-| Map rendering | Deck.gl + MapLibre GL | WebGL2, handles thousands of tiles |
-| Data fetching | TanStack Query | stale-while-revalidate, background sync |
-| State | Zustand | Minimal, no unnecessary re-renders |
-| Build tool | Vite | Fast HMR, native Web Worker support |
+| Object store | OCI Object Storage | Primary remote Zarr backend |
+| Data format | Zarr v3 source stores, generated browse/multiscale artifacts | Random access and map-tile serving |
+| Backend | FastAPI, Xarray, NumPy, Pillow | Catalog, planning, tile rendering, proxy routes |
+| Cache | Redis plus browser HTTP cache | Tile byte cache and repeat navigation speed |
+| Frontend | React, TypeScript, Vite, MapLibre | Dataset picker and raster tile viewer |
+| Query/state | TanStack Query, Zustand | Server metadata cache and map/UI state |
+| Reverse proxy | Nginx | Production-style app/API routing |
+
+## Known planned work
+
+- browser-native multiscale rendering is attempted for explicitly compatible
+  serving profiles and falls back to server tiles otherwise;
+- debounced adjacent-tile prefetch is implemented without a worker;
+- RGB true-color and false-color composites are available when dataset metadata
+  advertises the required bands;
+- WebSocket dataset invalidation is implemented at `/ws/datasets`;
+- direct projected `y/x`, `time/y/x`, and compatible banded `time/*/y/x`
+  stores are supported; arbitrary projected Zarr layouts beyond those shapes
+  remain backlog work;
+- Nginx proxies `/api`, `/api/tiles/`, `/ws`, and frontend traffic; the tile
+  route has a named disk cache in production-style compose;
+- production-style compose keeps the backend internal-only by default, runs
+  multiple Uvicorn workers, and persists Redis data in a named volume.

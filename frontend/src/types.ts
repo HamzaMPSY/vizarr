@@ -16,6 +16,13 @@ export interface VariableMeta {
   default_colormap?: string | null;
 }
 
+export interface CompositeStyle {
+  id: string;
+  name: string;
+  description: string;
+  bands: string[];
+}
+
 export interface DatasetBounds {
   west: number;
   south: number;
@@ -28,7 +35,11 @@ export interface DatasetMeta {
   name: string;
   description: string;
   variables: VariableMeta[];
+  composite_styles: CompositeStyle[];
   bounds?: DatasetBounds | null;
+  native_resolution_m?: number | null;
+  crs_wkt?: string | null;
+  crs_authority?: string | null;
   time_values?: string[] | null;
   zarr_format?: number | null;
   zarr_consolidated?: boolean | null;
