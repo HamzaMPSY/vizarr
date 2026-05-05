@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     oci_bucket: str = ""
     oci_prefix: str = ""
     oci_browse_prefix_root: str = "browse"
+    oci_multiscale_prefix_root: str = "multiscale"
     oci_dataset_id: str = ""
     oci_dataset_name: str = ""
     oci_dataset_description: str = ""

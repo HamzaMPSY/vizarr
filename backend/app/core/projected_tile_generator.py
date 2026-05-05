@@ -11,6 +11,7 @@ from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.variable_display import resolve_display_range
 from app.core.zarr_v3 import load_4d_window
+from app.core.zarr_v3 import load_4d_window_decimated
 
 
 WEB_MERCATOR_HALF_WORLD = 20037508.342789244
@@ -379,6 +380,8 @@ def render_projected_band_array(
     width: int,
     height: int,
     time_index: int,
+    max_source_oversample: float | None = None,
+    max_parallel_chunk_reads: int | None = None,
 ) -> np.ndarray:
     entry = ensure_catalog_entry_metadata_ready(entry, connector)
     assert entry.data_array_meta is not None
@@ -446,31 +449,65 @@ def render_projected_band_array(
         return np.full((height, width), np.nan, dtype=np.float32)
 
     x_start, x_stop, y_start, y_stop = window_bounds
-    window = load_4d_window(
-        connector=connector,
-        store_path=entry.path,
-        array_name=entry.data_array_name,
-        metadata=entry.data_array_meta,
-        time_index=time_index,
-        band_index=band_index,
-        y_start=y_start,
-        y_stop=y_stop,
-        x_start=x_start,
-        x_stop=x_stop,
-    ).astype(np.float32)
+    use_decimated_window = (
+        x_idx_full is not None
+        and y_idx_full is not None
+        and max_source_oversample is not None
+        and max_source_oversample > 0
+        and (
+            (x_stop - x_start) > (width * max_source_oversample)
+            or (y_stop - y_start) > (height * max_source_oversample)
+        )
+    )
+    if use_decimated_window:
+        x_step = max(1, math.ceil((x_stop - x_start) / max(width * max_source_oversample, 1.0)))
+        y_step = max(1, math.ceil((y_stop - y_start) / max(height * max_source_oversample, 1.0)))
+        window, sampled_y, sampled_x = load_4d_window_decimated(
+            connector=connector,
+            store_path=entry.path,
+            array_name=entry.data_array_name,
+            metadata=entry.data_array_meta,
+            time_index=time_index,
+            band_index=band_index,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            y_step=y_step,
+            x_step=x_step,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        )
+        window = window.astype(np.float32)
+        x_idx = _coordinate_to_fractional_index(sampled_x, x_idx_full)
+        y_idx = _coordinate_to_fractional_index(sampled_y, y_idx_full)
+    else:
+        window = load_4d_window(
+            connector=connector,
+            store_path=entry.path,
+            array_name=entry.data_array_name,
+            metadata=entry.data_array_meta,
+            time_index=time_index,
+            band_index=band_index,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        ).astype(np.float32)
 
-    if x_idx_full is not None and y_idx_full is not None:
+    if x_idx_full is not None and y_idx_full is not None and not use_decimated_window:
         x_idx = x_idx_full - x_start
         y_idx = y_idx_full - y_start
     else:
-        assert source_xs is not None
-        assert source_ys is not None
-        assert x_values is not None
-        assert y_values is not None
-        local_x_values = x_values[x_start:x_stop]
-        local_y_values = y_values[y_start:y_stop]
-        x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
-        y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
+        if not use_decimated_window:
+            assert source_xs is not None
+            assert source_ys is not None
+            assert x_values is not None
+            assert y_values is not None
+            local_x_values = x_values[x_start:x_stop]
+            local_y_values = y_values[y_start:y_stop]
+            x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
+            y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
     return _bilinear_sample(
         data=window,
         y_idx=y_idx,
@@ -498,6 +535,7 @@ def generate_projected_band_tile(
         width=TILE_SIZE,
         height=TILE_SIZE,
         time_index=time_index,
+        max_source_oversample=1.0,
     )
     actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, reprojected, vmin, vmax)
     return encode_tile(reprojected, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)

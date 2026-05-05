@@ -1,6 +1,6 @@
 # Satellite Zarr Viewer
 
-A high-performance, tile-based web application for visualizing satellite data stored in [Zarr](https://zarr.dev/) format on object storage (S3, GCS, Azure Blob). Designed to feel instant — stacked caching, predictive prefetching, and WebGL rendering ensure the viewer never makes the user wait.
+A high-performance web application for visualizing satellite data stored in [Zarr](https://zarr.dev/) format on object storage. The current implementation is OCI-first and combines server-side tile rendering with a browser-native multiscale path backed by dataset-scoped Zarr proxy endpoints.
 
 ---
 
@@ -63,14 +63,38 @@ Frontend runs at `http://localhost:5173`, proxying `/api` and `/ws` to the backe
 
 ---
 
+## Browser-servable Zarr proxy
+
+When `STORAGE_BACKEND=oci_zarr`, Vizarr now exposes dataset-scoped proxy endpoints for remote Zarr stores:
+
+- `GET /api/zarr/{dataset_id}`
+- `GET /api/zarr/{dataset_id}/zarr.json`
+- `GET /api/zarr/{dataset_id}/{object_path}`
+
+These endpoints are read-only, return dataset metadata and raw Zarr objects, and support byte-range requests for chunk and shard access.
+
+Dataset responses also include:
+
+- `zarr_format`
+- `zarr_consolidated`
+- `zarr_proxy_root`
+- `multiscale_store_path`
+- `multiscale_zarr_format`
+- `multiscale_zarr_consolidated`
+- `multiscale_proxy_root`
+
+For datasets that satisfy the current browser contract, the frontend reads consolidated metadata from the multiscale proxy, fetches the selected chunk directly in the browser, colorizes it client-side, and falls back to server-rendered tiles when needed.
+
+---
+
 ## Tech stack at a glance
 
 | Layer | Technology | Why |
 |---|---|---|
-| Object store | S3 / GCS / Azure via fsspec | Cloud-native Zarr access, no data copy |
-| Data format | Zarr v2 + Blosc-zstd | Chunked, compressed, random-access |
+| Object store | OCI Object Storage via fsspec / ocifs | Cloud-native remote Zarr access without copying data into the app |
+| Data format | Zarr v3 + browse overviews | Chunked, random-access storage plus lower-zoom overview serving |
 | Backend framework | FastAPI + Uvicorn | Async, fast, WebSocket native |
-| Array engine | Xarray + Dask | Lazy parallel reads, dimension-aware |
+| Array engine | Xarray + NumPy | Lazy metadata access plus direct chunk reads for projected imagery |
 | Tile cache | Redis | Sub-millisecond tile cache with TTL |
 | Tile encoding | Pillow → WebP | ~40% smaller than PNG |
 | Map rendering | Deck.gl + MapLibre GL | WebGL2, handles thousands of tiles |

@@ -19,8 +19,12 @@ from app.core.browse_artifacts import read_browse_manifest
 from app.core.browse_artifacts import write_browse_manifest
 from app.core.colormap import encode_tile
 from app.core.dataset_catalog import CatalogEntry
+from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.projected_tile_generator import (
+    TILE_SIZE,
+    WEB_MERCATOR_HALF_WORLD,
     WEB_MERCATOR_RADIUS,
+    _is_fast_latlon_entry,
     render_projected_band_array,
     resolve_projected_display_range,
     sample_web_mercator_array,
@@ -35,6 +39,10 @@ _OVERVIEW_CACHE_LOCK = Lock()
 _OVERVIEW_CACHE_MAX_ENTRIES = 16
 _BUILD_LOCKS: dict[str, Lock] = {}
 _BUILD_LOCKS_LOCK = Lock()
+_BROWSE_OVERVIEW_SAMPLES_PER_SHARD_AXIS = 2.0
+_MIN_OVERVIEW_MOSAIC_TILES = 16
+_MAX_OVERVIEW_MOSAIC_TILES = 64
+_MAX_OVERVIEW_MOSAIC_EXTRA_ZOOM = 4
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,7 @@ def prewarm_browse_overviews(
                 variable=variable,
                 time_index=0,
                 zoom=settings.browse_tile_max_zoom,
+                exact=True,
             ):
                 continue
             get_or_create_browse_overview(
@@ -141,14 +150,23 @@ def browse_overview_exists(
     variable: str,
     time_index: int,
     zoom: int,
+    exact: bool = False,
+    max_zoom_override: int | None = None,
 ) -> bool:
-    resolved_zoom = _resolved_browse_zoom(settings, zoom)
+    resolved_zoom = _resolved_browse_zoom(settings, zoom, max_zoom_override=max_zoom_override)
     cache_path = _overview_cache_path(settings, entry, variable, time_index, resolved_zoom)
     if cache_path.exists():
         return True
     if _overview_cache_get(str(cache_path)) is not None:
         return True
     manifest = read_browse_manifest(connector, settings, entry)
+    if exact:
+        available_levels = _available_manifest_zoom_levels(
+            manifest,
+            variable=variable,
+            time_index=time_index,
+        )
+        return resolved_zoom in available_levels
     if browse_manifest_contains_overview(manifest, variable=variable, time_index=time_index, zoom=resolved_zoom):
         return True
     return bool(_available_manifest_zoom_levels(manifest, variable=variable, time_index=time_index))
@@ -171,12 +189,20 @@ def _run_background_browse_prewarm(
         logger.exception("Background browse prewarm failed")
 
 
-def _resolved_browse_zoom(settings: Settings, zoom: int) -> int:
-    return max(0, min(int(zoom), settings.browse_tile_max_zoom))
+def _resolved_browse_zoom(settings: Settings, zoom: int, *, max_zoom_override: int | None = None) -> int:
+    ceiling = _browse_zoom_ceiling(settings, max_zoom_override=max_zoom_override)
+    return max(0, min(int(zoom), ceiling))
 
 
-def _default_browse_zoom_levels(settings: Settings) -> list[int]:
-    return list(range(0, settings.browse_tile_max_zoom + 1))
+def _default_browse_zoom_levels(settings: Settings, *, max_zoom_override: int | None = None) -> list[int]:
+    return list(range(0, _browse_zoom_ceiling(settings, max_zoom_override=max_zoom_override) + 1))
+
+
+def _browse_zoom_ceiling(settings: Settings, *, max_zoom_override: int | None = None) -> int:
+    ceiling = int(settings.browse_tile_max_zoom)
+    if max_zoom_override is None:
+        return ceiling
+    return max(ceiling, int(max_zoom_override))
 
 
 def _available_manifest_zoom_levels(
@@ -252,8 +278,9 @@ def get_or_create_browse_overview(
     time_index: int,
     zoom: int,
     allow_build: bool = True,
+    max_zoom_override: int | None = None,
 ) -> tuple[np.ndarray, tuple[float, float, float, float], str]:
-    resolved_zoom = _resolved_browse_zoom(settings, zoom)
+    resolved_zoom = _resolved_browse_zoom(settings, zoom, max_zoom_override=max_zoom_override)
     cache_path = _overview_cache_path(settings, entry, variable, time_index, resolved_zoom)
     cache_key = str(cache_path)
 
@@ -348,6 +375,7 @@ def build_and_store_browse_overviews(
     time_indices: list[int],
     zoom_levels: list[int] | None = None,
     overwrite: bool = False,
+    max_zoom_override: int | None = None,
 ) -> dict[str, object]:
     manifest = read_browse_manifest(connector, settings, entry, use_cache=False) or build_browse_manifest(
         settings,
@@ -357,7 +385,11 @@ def build_and_store_browse_overviews(
     variables_payload = dict(manifest.get("variables", {}))
     generated = 0
     reused = 0
-    requested_zoom_levels = [_resolved_browse_zoom(settings, zoom) for zoom in (zoom_levels or _default_browse_zoom_levels(settings))]
+    requested_zoom_levels = [
+        _resolved_browse_zoom(settings, zoom, max_zoom_override=max_zoom_override)
+        for zoom in (zoom_levels or _default_browse_zoom_levels(settings, max_zoom_override=max_zoom_override))
+    ]
+    generation_zoom_levels = sorted(set(requested_zoom_levels), reverse=True)
 
     for variable in variables:
         variable_payload = dict(variables_payload.get(variable, {}))
@@ -365,35 +397,84 @@ def build_and_store_browse_overviews(
         for time_index in time_indices:
             overview_payload = dict(overviews.get(str(time_index), {}))
             levels_payload = dict(overview_payload.get("levels", {}))
-            for zoom in requested_zoom_levels:
+            base_overview: tuple[np.ndarray, tuple[float, float, float, float]] | None = None
+            base_zoom: int | None = None
+            for zoom in generation_zoom_levels:
                 object_path = browse_overview_object_path(settings, entry, variable, time_index, zoom)
                 exists = connector.object_exists(object_path)
                 if exists and not overwrite:
+                    logger.info(
+                        "Reusing browse overview for %s variable=%s time_index=%d z=%d",
+                        entry.id,
+                        variable,
+                        time_index,
+                        zoom,
+                    )
                     reused += 1
                     levels_payload.setdefault(str(zoom), {"path": object_path})
+                    if base_overview is None:
+                        base_overview = _materialize_overview_level(
+                            settings=settings,
+                            connector=connector,
+                            entry=entry,
+                            variable=variable,
+                            time_index=time_index,
+                            zoom=zoom,
+                            object_path=object_path,
+                            allow_build=False,
+                        )
+                        if base_overview is not None:
+                            base_zoom = zoom
                     continue
 
-                built = _build_overview(
-                    settings=settings,
+                if base_overview is not None and base_zoom is not None and zoom < base_zoom:
+                    logger.info(
+                        "Deriving browse overview for %s variable=%s time_index=%d z=%d from z=%d",
+                        entry.id,
+                        variable,
+                        time_index,
+                        zoom,
+                        base_zoom,
+                    )
+                    built = _derive_overview_from_base(
+                        settings=settings,
+                        base=base_overview,
+                        zoom=zoom,
+                    )
+                else:
+                    logger.info(
+                        "Building browse overview for %s variable=%s time_index=%d z=%d",
+                        entry.id,
+                        variable,
+                        time_index,
+                        zoom,
+                    )
+                    built = _build_overview(
+                        settings=settings,
+                        connector=connector,
+                        entry=entry,
+                        variable=variable,
+                        time_index=time_index,
+                        zoom=zoom,
+                    )
+                    if base_zoom is None or zoom >= base_zoom:
+                        base_overview = built
+                        base_zoom = zoom
+
+                _write_overview_level(
                     connector=connector,
-                    entry=entry,
-                    variable=variable,
-                    time_index=time_index,
-                    zoom=zoom,
+                    object_path=object_path,
+                    cache_path=_overview_cache_path(settings, entry, variable, time_index, zoom),
+                    built=built,
                 )
-                connector.write_bytes(
+                logger.info(
+                    "Stored browse overview for %s variable=%s time_index=%d z=%d at %s",
+                    entry.id,
+                    variable,
+                    time_index,
+                    zoom,
                     object_path,
-                    _serialize_overview(*built),
-                    content_type="application/octet-stream",
                 )
-                cache_path = _overview_cache_path(settings, entry, variable, time_index, zoom)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez_compressed(
-                    cache_path,
-                    data=built[0],
-                    bbox=np.asarray(built[1], dtype=np.float64),
-                )
-                _overview_cache_set(str(cache_path), built)
                 levels_payload[str(zoom)] = {
                     "path": object_path,
                     "bbox": [float(value) for value in built[1]],
@@ -435,6 +516,7 @@ def _build_overview(
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     if entry.meta.bounds is None:
         raise ValueError(f"Dataset {entry.id} is missing bounds required for browse overview generation")
+    entry = ensure_catalog_entry_metadata_ready(entry, connector)
 
     overview_bbox = _wgs84_bounds_to_web_mercator(
         entry.meta.bounds.west,
@@ -443,6 +525,41 @@ def _build_overview(
         entry.meta.bounds.north,
     )
     width, height = _overview_dimensions(overview_bbox, settings.browse_overview_max_size, zoom)
+    source_oversample = _browse_overview_source_oversample(
+        entry,
+        width=width,
+        height=height,
+    )
+    if _is_fast_latlon_entry(entry):
+        overview = render_projected_band_array(
+            connector=connector,
+            entry=entry,
+            variable=variable,
+            bbox=overview_bbox,
+            width=width,
+            height=height,
+            time_index=time_index,
+            max_source_oversample=source_oversample,
+            max_parallel_chunk_reads=1,
+        )
+        return overview, overview_bbox
+
+    mosaic_plan = _select_mosaic_tile_range(overview_bbox, zoom)
+    if mosaic_plan is not None:
+        render_zoom, tile_range = mosaic_plan
+        overview = _build_overview_from_tile_mosaic(
+            connector=connector,
+            entry=entry,
+            variable=variable,
+            time_index=time_index,
+            render_zoom=render_zoom,
+            overview_bbox=overview_bbox,
+            width=width,
+            height=height,
+            tile_range=tile_range,
+        )
+        return overview, overview_bbox
+
     overview = render_projected_band_array(
         connector=connector,
         entry=entry,
@@ -451,8 +568,89 @@ def _build_overview(
         width=width,
         height=height,
         time_index=time_index,
+        max_source_oversample=source_oversample,
+        max_parallel_chunk_reads=1,
     )
     return overview, overview_bbox
+
+
+def _build_overview_from_tile_mosaic(
+    *,
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    variable: str,
+    time_index: int,
+    render_zoom: int,
+    overview_bbox: tuple[float, float, float, float],
+    width: int,
+    height: int,
+    tile_range: tuple[int, int, int, int],
+) -> np.ndarray:
+    min_x, max_x, min_y, max_y = tile_range
+    tiles_wide = max_x - min_x + 1
+    tiles_high = max_y - min_y + 1
+    mosaic = np.full((tiles_high * TILE_SIZE, tiles_wide * TILE_SIZE), np.nan, dtype=np.float32)
+
+    top_left_bbox = xyz_to_web_mercator_bbox(render_zoom, min_x, min_y)
+    bottom_right_bbox = xyz_to_web_mercator_bbox(render_zoom, max_x, max_y)
+    mosaic_bbox = (
+        top_left_bbox[0],
+        bottom_right_bbox[1],
+        bottom_right_bbox[2],
+        top_left_bbox[3],
+    )
+    tile_source_oversample = _browse_overview_source_oversample(
+        entry,
+        width=TILE_SIZE,
+        height=TILE_SIZE,
+    )
+
+    for tile_y in range(min_y, max_y + 1):
+        for tile_x in range(min_x, max_x + 1):
+            tile_bbox = xyz_to_web_mercator_bbox(render_zoom, tile_x, tile_y)
+            tile = render_projected_band_array(
+                connector=connector,
+                entry=entry,
+                variable=variable,
+                bbox=tile_bbox,
+                width=TILE_SIZE,
+                height=TILE_SIZE,
+                time_index=time_index,
+                max_source_oversample=tile_source_oversample,
+                max_parallel_chunk_reads=1,
+            )
+            row_offset = (tile_y - min_y) * TILE_SIZE
+            col_offset = (tile_x - min_x) * TILE_SIZE
+            mosaic[
+                row_offset : row_offset + TILE_SIZE,
+                col_offset : col_offset + TILE_SIZE,
+            ] = tile
+
+    return sample_web_mercator_array(
+        mosaic,
+        mosaic_bbox,
+        overview_bbox,
+        width=width,
+        height=height,
+    )
+
+
+def _derive_overview_from_base(
+    *,
+    settings: Settings,
+    base: tuple[np.ndarray, tuple[float, float, float, float]],
+    zoom: int,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    base_data, base_bbox = base
+    width, height = _overview_dimensions(base_bbox, settings.browse_overview_max_size, zoom)
+    derived = sample_web_mercator_array(
+        base_data,
+        base_bbox,
+        base_bbox,
+        width=width,
+        height=height,
+    )
+    return derived, base_bbox
 
 
 def _overview_dimensions(
@@ -471,6 +669,86 @@ def _overview_dimensions(
         width = max(1, math.ceil(width * scale))
         height = max(1, math.ceil(height * scale))
     return width, height
+
+
+def _browse_overview_source_oversample(
+    entry: CatalogEntry,
+    *,
+    width: int,
+    height: int,
+) -> float:
+    metadata = entry.data_array_meta
+    if metadata is None or metadata.sharding is None:
+        return 1.0
+
+    source_width = int(metadata.shape[-1])
+    source_height = int(metadata.shape[-2])
+    shard_width = int(metadata.chunk_shape[-1])
+    shard_height = int(metadata.chunk_shape[-2])
+    if shard_width <= 0 or shard_height <= 0:
+        return 1.0
+
+    shard_columns = math.ceil(source_width / shard_width)
+    shard_rows = math.ceil(source_height / shard_height)
+    x_ratio = (_BROWSE_OVERVIEW_SAMPLES_PER_SHARD_AXIS * shard_columns) / max(width, 1)
+    y_ratio = (_BROWSE_OVERVIEW_SAMPLES_PER_SHARD_AXIS * shard_rows) / max(height, 1)
+    return max(min(max(x_ratio, y_ratio), 1.0), 0.05)
+
+
+def _select_mosaic_tile_range(
+    bbox: tuple[float, float, float, float],
+    zoom: int,
+) -> tuple[int, tuple[int, int, int, int]] | None:
+    best: tuple[int, tuple[int, int, int, int]] | None = None
+    for candidate_zoom in range(zoom, zoom + _MAX_OVERVIEW_MOSAIC_EXTRA_ZOOM + 1):
+        tile_range = _intersecting_xyz_tile_range(bbox, candidate_zoom)
+        if tile_range is None:
+            return best
+
+        min_x, max_x, min_y, max_y = tile_range
+        tile_count = (max_x - min_x + 1) * (max_y - min_y + 1)
+        if tile_count > _MAX_OVERVIEW_MOSAIC_TILES:
+            return best
+
+        best = (candidate_zoom, tile_range)
+        if tile_count >= _MIN_OVERVIEW_MOSAIC_TILES:
+            return best
+
+    return best
+
+
+def _intersecting_xyz_tile_range(
+    bbox: tuple[float, float, float, float],
+    zoom: int,
+) -> tuple[int, int, int, int] | None:
+    west, south, east, north = bbox
+    clamped_west = max(-WEB_MERCATOR_HALF_WORLD, min(WEB_MERCATOR_HALF_WORLD, west))
+    clamped_east = max(-WEB_MERCATOR_HALF_WORLD, min(WEB_MERCATOR_HALF_WORLD, east))
+    clamped_south = max(-WEB_MERCATOR_HALF_WORLD, min(WEB_MERCATOR_HALF_WORLD, south))
+    clamped_north = max(-WEB_MERCATOR_HALF_WORLD, min(WEB_MERCATOR_HALF_WORLD, north))
+    if clamped_east <= clamped_west or clamped_north <= clamped_south:
+        return None
+
+    tile_limit = 2**zoom
+    min_x = _clamp_tile_index(_mercator_x_to_tile_index(clamped_west, zoom), tile_limit)
+    max_x = _clamp_tile_index(_mercator_x_to_tile_index(math.nextafter(clamped_east, -math.inf), zoom), tile_limit)
+    min_y = _clamp_tile_index(_mercator_y_to_tile_index(clamped_north, zoom), tile_limit)
+    max_y = _clamp_tile_index(_mercator_y_to_tile_index(math.nextafter(clamped_south, math.inf), zoom), tile_limit)
+    return min_x, max_x, min_y, max_y
+
+
+def _mercator_x_to_tile_index(value: float, zoom: int) -> int:
+    world_span = 2.0 * WEB_MERCATOR_HALF_WORLD
+    return int(math.floor(((value + WEB_MERCATOR_HALF_WORLD) / world_span) * (2**zoom)))
+
+
+def _mercator_y_to_tile_index(value: float, zoom: int) -> int:
+    world_span = 2.0 * WEB_MERCATOR_HALF_WORLD
+    return int(math.floor(((WEB_MERCATOR_HALF_WORLD - value) / world_span) * (2**zoom)))
+
+
+def _clamp_tile_index(index: int, tile_limit: int) -> int:
+    return max(0, min(tile_limit - 1, index))
 
 
 def _wgs84_bounds_to_web_mercator(
@@ -529,6 +807,80 @@ def _load_overview_from_object_storage(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(payload)
     return loaded
+
+
+def _materialize_overview_level(
+    *,
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    variable: str,
+    time_index: int,
+    zoom: int,
+    object_path: str,
+    allow_build: bool,
+) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
+    cache_path = _overview_cache_path(settings, entry, variable, time_index, zoom)
+    cache_key = str(cache_path)
+
+    cached = _overview_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    if cache_path.exists():
+        loaded = _load_overview(cache_path)
+        _overview_cache_set(cache_key, loaded)
+        return loaded
+
+    if connector.object_exists(object_path):
+        try:
+            loaded = _load_overview_from_object_storage(
+                connector=connector,
+                object_path=object_path,
+                cache_path=cache_path,
+            )
+        except FileNotFoundError:
+            loaded = None
+        if loaded is not None:
+            _overview_cache_set(cache_key, loaded)
+            return loaded
+
+    if not allow_build:
+        return None
+
+    built = _build_overview(
+        settings=settings,
+        connector=connector,
+        entry=entry,
+        variable=variable,
+        time_index=time_index,
+        zoom=zoom,
+    )
+    _write_overview_level(
+        connector=connector,
+        object_path=object_path,
+        cache_path=cache_path,
+        built=built,
+    )
+    return built
+
+
+def _write_overview_level(
+    *,
+    connector: OCIObjectStorageConnector,
+    object_path: str,
+    cache_path: Path,
+    built: tuple[np.ndarray, tuple[float, float, float, float]],
+) -> None:
+    payload = _serialize_overview(*built)
+    connector.write_bytes(
+        object_path,
+        payload,
+        content_type="application/octet-stream",
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(payload)
+    _overview_cache_set(str(cache_path), built)
 
 
 def _overview_cache_get(

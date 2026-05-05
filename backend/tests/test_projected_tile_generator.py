@@ -189,3 +189,159 @@ def test_render_projected_band_array_fast_latlon_path_skips_coordinate_axes(monk
     )
 
     assert rendered.shape == (2, 2)
+
+
+def test_render_projected_band_array_fast_latlon_uses_decimated_window_for_large_overview(monkeypatch) -> None:
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="bands",
+        band_array_name="band",
+        band_names=["NDVI"],
+        band_indices={"NDVI": 0},
+        data_array_meta=ZarrV3ArrayMetadata(
+            shape=(1, 1, 8, 8),
+            chunk_shape=(1, 1, 8, 8),
+            data_type="float32",
+            fill_value=None,
+            codecs=[],
+            separator="/",
+            attributes={},
+            dimension_names=("time", "band", "y", "x"),
+        ),
+        crs_wkt='GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]]',
+        geo_transform=(-0.5, 1.0, 0.0, 7.5, 0.0, -1.0),
+    )
+
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.ensure_catalog_entry_metadata_ready",
+        lambda current_entry, _connector: current_entry,
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.ensure_catalog_entry_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full coordinate hydration should not run")),
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._is_fast_latlon_entry",
+        lambda _entry: True,
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._source_window_bounds_from_axis_indices",
+        lambda **_kwargs: (0, 8, 0, 8),
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.load_4d_window",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("full window load should be skipped for decimated overview reads")),
+    )
+
+    decimated_calls: list[tuple[int, int]] = []
+
+    def _load_decimated(**kwargs):
+        decimated_calls.append((kwargs["y_step"], kwargs["x_step"]))
+        return (
+            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            np.array([0.0, 7.0], dtype=np.float64),
+            np.array([0.0, 7.0], dtype=np.float64),
+        )
+
+    monkeypatch.setattr("app.core.projected_tile_generator.load_4d_window_decimated", _load_decimated)
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._bilinear_sample",
+        lambda data, y_idx, x_idx: np.zeros(y_idx.shape, dtype=np.float32) + data[0, 0],
+    )
+
+    rendered = render_projected_band_array(
+        connector=None,  # type: ignore[arg-type]
+        entry=entry,
+        variable="NDVI",
+        bbox=(-20037508.342789244, -20037508.342789244, 20037508.342789244, 20037508.342789244),
+        width=2,
+        height=2,
+        time_index=0,
+        max_source_oversample=1.0,
+    )
+
+    assert decimated_calls == [(4, 4)]
+    assert rendered.shape == (2, 2)
+
+
+def test_render_projected_band_array_forwards_parallelism_override(monkeypatch) -> None:
+    entry = CatalogEntry(
+        id="dataset-1",
+        path="cubes/example.zarr",
+        meta=DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[],
+        ),
+        zarr_format=3,
+        consolidated=True,
+        data_array_name="bands",
+        band_array_name="band",
+        band_names=["NDVI"],
+        band_indices={"NDVI": 0},
+        data_array_meta=ZarrV3ArrayMetadata(
+            shape=(1, 1, 8, 8),
+            chunk_shape=(1, 1, 8, 8),
+            data_type="float32",
+            fill_value=None,
+            codecs=[],
+            separator="/",
+            attributes={},
+            dimension_names=("time", "band", "y", "x"),
+        ),
+        crs_wkt='GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",ELLIPSOID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],CS[ellipsoidal,2],AXIS["longitude",east],AXIS["latitude",north],ANGLEUNIT["degree",0.0174532925199433]]',
+        geo_transform=(-0.5, 1.0, 0.0, 7.5, 0.0, -1.0),
+    )
+
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator.ensure_catalog_entry_metadata_ready",
+        lambda current_entry, _connector: current_entry,
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._is_fast_latlon_entry",
+        lambda _entry: True,
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._source_window_bounds_from_axis_indices",
+        lambda **_kwargs: (0, 8, 0, 8),
+    )
+    monkeypatch.setattr(
+        "app.core.projected_tile_generator._bilinear_sample",
+        lambda data, y_idx, x_idx: np.zeros(y_idx.shape, dtype=np.float32) + data[0, 0],
+    )
+
+    captured: dict[str, int | None] = {}
+
+    def _load_decimated(**kwargs):
+        captured["max_parallel_chunk_reads"] = kwargs["max_parallel_chunk_reads"]
+        return (
+            np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+            np.array([0.0, 7.0], dtype=np.float64),
+            np.array([0.0, 7.0], dtype=np.float64),
+        )
+
+    monkeypatch.setattr("app.core.projected_tile_generator.load_4d_window_decimated", _load_decimated)
+
+    render_projected_band_array(
+        connector=None,  # type: ignore[arg-type]
+        entry=entry,
+        variable="NDVI",
+        bbox=(-20037508.342789244, -20037508.342789244, 20037508.342789244, 20037508.342789244),
+        width=2,
+        height=2,
+        time_index=0,
+        max_source_oversample=1.0,
+        max_parallel_chunk_reads=1,
+    )
+
+    assert captured["max_parallel_chunk_reads"] == 1

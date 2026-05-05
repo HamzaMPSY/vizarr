@@ -42,3 +42,38 @@ def test_planner_index_prunes_by_collection_bands_bbox_and_time() -> None:
     )
 
     assert [item.cube_id for item in matches] == ["cube-a:serving"]
+
+
+def test_planner_index_keeps_pyramid_candidates_when_style_is_requested() -> None:
+    index = PlannerIndex(
+        [
+            CubeIndexRecord(
+                cube_id="cube-browse:browse:bad-style",
+                collection_id="sentinel2",
+                representation="browse",
+                path="oci://bucket/collections/sentinel2/browse",
+                bands=("B04",),
+                version="v1",
+                bbox_wgs84=DatasetBounds(west=0.0, south=0.0, east=5.0, north=5.0),
+                style="bad-style",
+            ),
+            CubeIndexRecord(
+                cube_id="cube-pyramid:pyramid",
+                collection_id="sentinel2",
+                representation="pyramid",
+                path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                bands=("B04",),
+                version="v1",
+                bbox_wgs84=DatasetBounds(west=0.0, south=0.0, east=5.0, north=5.0),
+            ),
+        ]
+    )
+
+    matches = index.find_candidates(
+        collection_id="sentinel2",
+        bands=["B04"],
+        bbox=(1.0, 1.0, 2.0, 2.0),
+        style="viridis",
+    )
+
+    assert [item.cube_id for item in matches] == ["cube-pyramid:pyramid"]

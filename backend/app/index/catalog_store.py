@@ -67,7 +67,7 @@ def _records_from_catalog_entry(
         collection_id=entry.meta.id,
         meta=entry.meta,
         source_path=entry.path,
-        serving_path=f"{entry.path}#serving",
+        serving_path=entry.meta.zarr_proxy_root or f"/api/zarr/{entry.id}",
         browse_path_root=browse_artifact_root(settings, entry),
         browse_styles=browse_styles,
         version=version,
@@ -123,6 +123,23 @@ def _records_from_meta(
             crs=crs,
         ),
     ]
+    if meta.multiscale_store_path:
+        records.append(
+            CubeIndexRecord(
+                cube_id=f"{collection_id}:pyramid",
+                collection_id=collection_id,
+                representation="pyramid",
+                path=meta.multiscale_store_path,
+                bands=bands,
+                version=version,
+                bbox_wgs84=meta.bounds,
+                native_resolution_m=native_resolution_m if native_resolution_m is not None else meta.native_resolution_m,
+                crs=crs,
+                population_strategy=meta.multiscale_population_strategy,
+                prepopulated_zoom_max=meta.multiscale_prepopulated_zoom_max,
+                multiscale_max_zoom=meta.multiscale_max_zoom,
+            )
+        )
     for style in browse_styles:
         records.append(
             CubeIndexRecord(

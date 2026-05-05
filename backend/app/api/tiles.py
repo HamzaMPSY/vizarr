@@ -8,6 +8,8 @@ from app.core.cache import build_tile_cache_key
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import get_or_build_catalog
+from app.core.multiscale_tiles import generate_and_cache_pyramid_tile
+from app.core.multiscale_tiles import generate_pyramid_tile
 from app.core.projected_tile_generator import generate_projected_band_tile
 from app.core.tile_generator import generate_tile
 from app.core.variable_display import resolve_display_range
@@ -52,9 +54,7 @@ async def get_tile(
         if entry is None:
             raise HTTPException(status_code=404, detail="Dataset not found")
         try:
-            ensure_entry = (
-                ensure_catalog_entry_ready if tile_plan.chosen_representation == "browse" else ensure_catalog_entry_metadata_ready
-            )
+            ensure_entry = ensure_catalog_entry_ready if tile_plan.chosen_representation == "browse" else ensure_catalog_entry_metadata_ready
             await run_in_threadpool(ensure_entry, entry, request.app.state.storage_connector)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -131,6 +131,39 @@ async def get_tile(
                 actual_vmin, actual_vmax = browse_result.display_range
                 browse_source = browse_result.source
             except FileNotFoundError:
+                actual_representation = "serving"
+                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
+        elif tile_plan.chosen_representation == "pyramid":
+            try:
+                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+                    generate_pyramid_tile,
+                    request.app.state.storage_connector,
+                    entry,
+                    variable,
+                    z,
+                    x,
+                    y,
+                    time_index,
+                    colormap,
+                    vmin,
+                    vmax,
+                )
+            except FileNotFoundError:
+                actual_representation = "serving"
+                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+                    generate_and_cache_pyramid_tile,
+                    request.app.state.storage_connector,
+                    entry,
+                    variable,
+                    z,
+                    x,
+                    y,
+                    time_index,
+                    colormap,
+                    vmin,
+                    vmax,
+                )
+            except ValueError:
                 actual_representation = "serving"
                 tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
         else:

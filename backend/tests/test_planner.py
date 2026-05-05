@@ -104,6 +104,271 @@ def test_tile_plan_prefers_browse_below_zoom_threshold() -> None:
     assert plan.selected_cube == "sentinel2:browse"
 
 
+def test_tile_plan_prefers_browse_over_pyramid_when_available() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:pyramid",
+                    collection_id="sentinel2",
+                    representation="pyramid",
+                    path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                    native_resolution_m=10.0,
+                    population_strategy="prepopulated_then_lazy",
+                    prepopulated_zoom_max=12,
+                    multiscale_max_zoom=14,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-10.0, south=-10.0, east=10.0, north=10.0),
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=6,
+        x=32,
+        y=30,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.request_class == "tile"
+    assert plan.chosen_representation == "browse"
+    assert plan.selected_cube == "sentinel2:browse"
+    assert plan.response_cache_key.startswith("artifact:tile:browse:")
+
+
+def test_tile_plan_prefers_serving_over_pyramid_above_browse_zoom() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:pyramid",
+                    collection_id="sentinel2",
+                    representation="pyramid",
+                    path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                    population_strategy="prepopulated_then_lazy",
+                    prepopulated_zoom_max=12,
+                    multiscale_max_zoom=14,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+            ]
+        ),
+    )
+
+    z14_plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=14,
+        x=8192,
+        y=8192,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+    z15_plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=15,
+        x=16384,
+        y=16384,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert z14_plan.chosen_representation == "serving"
+    assert z15_plan.chosen_representation == "serving"
+
+
+def test_tile_plan_prefers_prepopulated_pyramid_above_browse_zoom_within_prepopulated_ceiling() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:pyramid",
+                    collection_id="sentinel2",
+                    representation="pyramid",
+                    path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                    population_strategy="prepopulated_then_lazy",
+                    prepopulated_zoom_max=12,
+                    multiscale_max_zoom=14,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=10,
+        x=512,
+        y=512,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.chosen_representation == "pyramid"
+    assert plan.selected_cube == "sentinel2:pyramid"
+
+
+def test_tile_plan_uses_pyramid_only_as_fallback_when_no_browse_or_serving_exists() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:pyramid",
+                    collection_id="sentinel2",
+                    representation="pyramid",
+                    path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=30.39, south=-2.09, east=30.81, north=-1.05),
+                    native_resolution_m=1.1,
+                    population_strategy="prepopulated_then_lazy",
+                    prepopulated_zoom_max=12,
+                    multiscale_max_zoom=17,
+                ),
+            ]
+        ),
+    )
+
+    z17_plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=17,
+        x=76677,
+        y=66082,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+    assert z17_plan.chosen_representation == "pyramid"
+    assert z17_plan.selected_cube == "sentinel2:pyramid"
+
+
+def test_tile_plan_does_not_prefer_fully_lazy_pyramid_above_browse_zoom() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:pyramid",
+                    collection_id="sentinel2",
+                    representation="pyramid",
+                    path="oci://bucket/collections/sentinel2/multiscale.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                    population_strategy="lazy_on_demand",
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=10.0,
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=10,
+        x=512,
+        y=512,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.chosen_representation == "serving"
+
+
 def test_tile_plan_prefers_serving_above_zoom_threshold() -> None:
     planner = PlannerService(
         Settings(browse_tile_max_zoom=8),
@@ -146,6 +411,50 @@ def test_tile_plan_prefers_serving_above_zoom_threshold() -> None:
     assert plan.selected_cube == "sentinel2:serving"
 
 
+def test_tile_plan_does_not_reuse_browse_above_browse_max_zoom() -> None:
+    planner = PlannerService(
+        Settings(browse_tile_max_zoom=8),
+        PlannerIndex(
+            [
+                CubeIndexRecord(
+                    cube_id="sentinel2:browse",
+                    collection_id="sentinel2",
+                    representation="browse",
+                    path="oci://bucket/collections/sentinel2/browse",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=1.0,
+                ),
+                CubeIndexRecord(
+                    cube_id="sentinel2:serving",
+                    collection_id="sentinel2",
+                    representation="serving",
+                    path="oci://bucket/collections/sentinel2/serving/cube.zarr",
+                    bands=("B04",),
+                    version="v1",
+                    bbox_wgs84=DatasetBounds(west=-180.0, south=-85.0, east=180.0, north=85.0),
+                    native_resolution_m=1.0,
+                ),
+            ]
+        ),
+    )
+
+    plan = planner.plan_tile_request(
+        collection_id="sentinel2",
+        style="viridis",
+        z=10,
+        x=512,
+        y=512,
+        time_index=0,
+        params={"variable": "B04", "band_count": 1},
+    )
+
+    assert plan.request_class == "tile"
+    assert plan.chosen_representation == "serving"
+    assert plan.selected_cube == "sentinel2:serving"
+
+
 def test_tile_plan_uses_native_resolution_to_keep_browse_for_still_coarse_view() -> None:
     planner = PlannerService(
         Settings(browse_tile_max_zoom=8),
@@ -178,15 +487,15 @@ def test_tile_plan_uses_native_resolution_to_keep_browse_for_still_coarse_view()
     plan = planner.plan_tile_request(
         collection_id="sentinel2",
         style="viridis",
-        z=10,
-        x=512,
-        y=512,
+        z=8,
+        x=128,
+        y=128,
         time_index=0,
         params={"variable": "B04", "band_count": 1},
     )
 
     assert plan.chosen_representation == "browse"
-    assert "15.3x coarser" in plan.notes[1]
+    assert "61.1x coarser" in plan.notes[1]
 
 
 def test_tile_plan_uses_native_resolution_to_choose_serving_for_coarse_dataset() -> None:

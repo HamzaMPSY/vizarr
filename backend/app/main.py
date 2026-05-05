@@ -2,7 +2,9 @@ from contextlib import asynccontextmanager
 
 import xarray as xr
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.api.router import router as api_router
@@ -16,6 +18,7 @@ from app.core.dataset_catalog import warm_catalog_index
 from app.core.datasets import build_registry
 from app.core.datasets import build_registry_from_dataset
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.oci_auth import OCIAuthExpiredError
 from app.core.zarr_reader import open_oci_zarr_dataset
 from app.index.catalog_store import build_index_records
 from app.index.planner_index import PlannerIndex
@@ -97,6 +100,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(OCIAuthExpiredError)
+async def handle_oci_auth_expired(_request: Request, exc: OCIAuthExpiredError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": str(exc)},
+    )
+
+
 app.include_router(api_router, prefix="/api")
 app.state.settings = settings
 app.state.planner_index = PlannerIndex()

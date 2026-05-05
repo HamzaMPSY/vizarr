@@ -254,10 +254,61 @@ class PlannerService:
         z: int | None,
         requested_resolution_m: float | None,
     ) -> tuple[str, ...]:
+        pyramid_candidates = [item for item in candidates if item.representation == "pyramid"]
+        non_pyramid_priorities = self._non_pyramid_tile_priorities(
+            candidates=candidates,
+            z=z,
+            requested_resolution_m=requested_resolution_m,
+        )
+        if pyramid_candidates and self._should_prefer_pyramid_for_tile(pyramid_candidates, z):
+            return _prepend_priority(non_pyramid_priorities, "pyramid")
+        if pyramid_candidates:
+            return _append_priority(non_pyramid_priorities, "pyramid")
+        return non_pyramid_priorities
+
+    def _should_prefer_pyramid_for_tile(
+        self,
+        candidates: list[CubeIndexRecord],
+        z: int | None,
+    ) -> bool:
+        if z is None:
+            return False
+        if z <= self._settings.browse_tile_max_zoom:
+            return False
+
+        for candidate in candidates:
+            multiscale_max_zoom = getattr(candidate, "multiscale_max_zoom", None)
+            if multiscale_max_zoom is not None and z > multiscale_max_zoom:
+                continue
+
+            population_strategy = getattr(candidate, "population_strategy", None)
+            if population_strategy not in {"prepopulated_then_lazy", "prepopulated", "eager"}:
+                continue
+
+            prepopulated_zoom_max = getattr(candidate, "prepopulated_zoom_max", None)
+            if prepopulated_zoom_max is not None and z > prepopulated_zoom_max:
+                continue
+
+            return True
+        return False
+
+    def _non_pyramid_tile_priorities(
+        self,
+        *,
+        candidates: list[CubeIndexRecord],
+        z: int | None,
+        requested_resolution_m: float | None,
+    ) -> tuple[str, ...]:
         browse_candidates = [item for item in candidates if item.representation == "browse"]
         serving_candidates = [item for item in candidates if item.representation == "serving"]
         source_candidates = [item for item in candidates if item.representation == "source"]
         native_resolution_m = _native_resolution_meters(serving_candidates or source_candidates or candidates)
+
+        # Browse overviews stop at browse_tile_max_zoom. Above that point we must
+        # switch to serving/source so zooming can keep refining instead of
+        # repeatedly sampling the same top browse level.
+        if z is not None and z > self._settings.browse_tile_max_zoom:
+            return ("serving", "source", "browse")
 
         if requested_resolution_m is not None and native_resolution_m is not None and browse_candidates:
             browse_threshold = native_resolution_m * self._settings.browse_tile_native_resolution_ratio
@@ -267,7 +318,7 @@ class PlannerService:
             if requested_resolution_m <= serving_threshold:
                 return ("serving", "source", "browse")
 
-        if z is None or z > self._settings.browse_tile_max_zoom:
+        if z is None:
             return ("serving", "source", "browse")
         return ("browse", "serving", "source")
 
@@ -360,3 +411,15 @@ def _tile_resolution_note(
         f"Requested tile scale is about {requested_resolution_m:.1f} m/px versus native {native_resolution_m:.1f} m/px "
         f"({ratio:.1f}x coarser)."
     )
+
+
+def _append_priority(priorities: tuple[str, ...], representation: str) -> tuple[str, ...]:
+    if representation in priorities:
+        return priorities
+    return priorities + (representation,)
+
+
+def _prepend_priority(priorities: tuple[str, ...], representation: str) -> tuple[str, ...]:
+    if representation in priorities:
+        return (representation,) + tuple(item for item in priorities if item != representation)
+    return (representation,) + priorities

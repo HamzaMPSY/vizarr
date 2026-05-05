@@ -1,4 +1,4 @@
-import type { DatasetMeta, VariableMeta } from "../types";
+import type { DatasetMeta, DatasetServingProfile, TileJson, VariableMeta } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
 
@@ -18,6 +18,13 @@ async function parseJson<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export function buildApiUrl(path: string): string {
+  if (/^https?:\/\//.test(path)) {
+    return path;
+  }
+  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 export function buildTileUrl(params: TileUrlParams): string {
   const query = new URLSearchParams({
     time_index: String(params.timeIndex),
@@ -29,8 +36,10 @@ export function buildTileUrl(params: TileUrlParams): string {
   if (params.vmax !== null) {
     query.set("vmax", String(params.vmax));
   }
-  return `${API_BASE}/api/tiles/${encodeURIComponent(params.datasetId)}/${encodeURIComponent(params.variable)}/{z}/{x}/{y}?${query.toString()}`;
+  return `${buildApiUrl("/api/tiles")}/${encodeURIComponent(params.datasetId)}/${encodeURIComponent(params.variable)}/{z}/{x}/{y}?${query.toString()}`;
 }
+
+interface TileJsonParams extends TileUrlParams {}
 
 export const api = {
   datasets: async (): Promise<DatasetMeta[]> => {
@@ -41,12 +50,36 @@ export const api = {
     const response = await fetch(`${API_BASE}/api/datasets/${encodeURIComponent(datasetId)}`);
     return parseJson<DatasetMeta>(response);
   },
+  servingProfile: async (datasetId: string): Promise<DatasetServingProfile> => {
+    const response = await fetch(`${API_BASE}/api/datasets/${encodeURIComponent(datasetId)}/serving-profile`);
+    return parseJson<DatasetServingProfile>(response);
+  },
+  tilejson: async (params: TileJsonParams): Promise<TileJson> => {
+    const query = new URLSearchParams({
+      time_index: String(params.timeIndex),
+      colormap: params.colormap
+    });
+    if (params.vmin !== null) {
+      query.set("vmin", String(params.vmin));
+    }
+    if (params.vmax !== null) {
+      query.set("vmax", String(params.vmax));
+    }
+    const response = await fetch(
+      `${API_BASE}/api/tilejson/${encodeURIComponent(params.datasetId)}/${encodeURIComponent(params.variable)}?${query.toString()}`
+    );
+    return parseJson<TileJson>(response);
+  },
   variables: async (datasetId: string): Promise<VariableMeta[]> => {
     const response = await fetch(`${API_BASE}/api/datasets/${encodeURIComponent(datasetId)}/variables`);
     return parseJson<VariableMeta[]>(response);
   },
   colormaps: async (): Promise<string[]> => {
-    const response = await fetch(`${API_BASE}/api/colormaps`);
+    const response = await fetch(buildApiUrl("/api/colormaps"));
     return parseJson<string[]>(response);
+  },
+  colormapPalette: async (name: string, samples = 256): Promise<number[][]> => {
+    const response = await fetch(buildApiUrl(`/api/colormaps/${encodeURIComponent(name)}/palette?samples=${samples}`));
+    return parseJson<number[][]>(response);
   }
 };

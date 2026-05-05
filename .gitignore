@@ -12,3 +12,4 @@ backend/.cache/
 .env
 .env.compose.oracle
 vizarr-vm-bundle.zip
+.aura/

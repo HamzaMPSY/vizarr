@@ -20,6 +20,9 @@ class CubeIndexRecord:
     time_end: date | None = None
     style: str | None = None
     crs: str | None = None
+    population_strategy: str | None = None
+    prepopulated_zoom_max: int | None = None
+    multiscale_max_zoom: int | None = None
 
 
 class PlannerIndex:
