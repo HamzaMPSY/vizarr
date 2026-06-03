@@ -70,6 +70,25 @@ def _parse_range_header(
     return max(object_size - suffix_length, 0), None, min(suffix_length, object_size)
 
 
+def _etag_matches(header_value: str | None, etag: str | None) -> bool:
+    if not header_value or not etag:
+        return False
+    candidates = [item.strip() for item in header_value.split(",")]
+    if "*" in candidates:
+        return True
+    normalized_etag = _normalize_etag(etag)
+    return any(_normalize_etag(candidate) == normalized_etag for candidate in candidates)
+
+
+def _normalize_etag(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("W/"):
+        normalized = normalized[2:].strip()
+    if len(normalized) >= 2 and normalized[0] == '"' and normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    return normalized
+
+
 def _require_oci_proxy(request: Request):
     settings = request.app.state.settings
     connector = getattr(request.app.state, "storage_connector", None)
@@ -138,6 +157,18 @@ async def _proxy_object(dataset_id: str, object_path: str, request: Request, *, 
         object_size=object_info.size,
     )
     status_code = 206 if range_start is not None or request.headers.get("range") is not None else 200
+    content_type = _guess_content_type(object_path, object_info.content_type)
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+        "X-Zarr-Variant": variant,
+    }
+    if object_info.etag:
+        headers["ETag"] = object_info.etag
+
+    if request.headers.get("range") is None and _etag_matches(request.headers.get("if-none-match"), object_info.etag):
+        return Response(status_code=304, media_type=content_type, headers=headers)
 
     if range_start is None and expected_length is None and range_end is None:
         try:
@@ -176,16 +207,12 @@ async def _proxy_object(dataset_id: str, object_path: str, request: Request, *, 
                 end=range_end,
             )
 
-    content_type = _guess_content_type(object_path, object_info.content_type)
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=3600",
-        "X-Zarr-Variant": variant,
-    }
-    if object_info.etag:
-        headers["ETag"] = object_info.etag
-
-    payload_length = expected_length if expected_length is not None else len(payload)
+    if expected_length is not None:
+        payload_length = expected_length
+    elif request.method == "HEAD" and object_info.size is not None:
+        payload_length = object_info.size
+    else:
+        payload_length = len(payload)
     if payload_length >= 0:
         headers["Content-Length"] = str(payload_length)
 

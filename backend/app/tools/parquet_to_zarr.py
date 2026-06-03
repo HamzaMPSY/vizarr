@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -31,9 +33,37 @@ DEFAULT_EXCLUDED_COLUMNS = {
     "month",
     "day",
     "date",
+    "start_date",
+    "end_date",
     "timestamp",
     "time",
+    "quadkey",
 }
+
+DEFAULT_X_COLUMN_CANDIDATES = (
+    "x",
+    "X",
+    "lon",
+    "LON",
+    "longitude",
+    "LONGITUDE",
+    "easting",
+    "EASTING",
+)
+DEFAULT_Y_COLUMN_CANDIDATES = (
+    "y",
+    "Y",
+    "lat",
+    "LAT",
+    "latitude",
+    "LATITUDE",
+    "northing",
+    "NORTHING",
+)
+DEFAULT_PATH_TIMESTAMP_REGEXES = (
+    r"(?P<ts>\d{4}-\d{2}-\d{2})",
+    r"(?P<ts>\d{8})",
+)
 
 DEFAULT_READ_WORKERS = 8
 DEFAULT_WRITE_BATCH = 10
@@ -47,8 +77,8 @@ GRID_COORD_DECIMALS = 12
 
 @dataclass(frozen=True)
 class ConversionConfig:
-    x_column: str
-    y_column: str
+    x_column: str | None
+    y_column: str | None
     value_columns: tuple[str, ...] | None
     layout: str
     timestamp_column: str | None
@@ -85,6 +115,16 @@ class ExistingStoreContext:
     layout: str
 
 
+@dataclass(frozen=True)
+class InferredGrid:
+    x_resolution: float
+    y_resolution: float
+    x_snap_origin: float
+    y_snap_origin: float
+    width: int
+    height: int
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -94,19 +134,44 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--links-file",
-        required=True,
         help="Path to a text file containing one parquet folder URI/path per line.",
     )
     parser.add_argument(
-        "--output-store",
-        required=True,
+        "--parquet-prefix",
+        action="append",
+        dest="parquet_prefixes",
         help=(
-            "Destination Zarr store path. Accepts either an OCI URI "
-            "(oci://bucket@namespace/prefix/output.zarr) or a bucket-relative path."
+            "OCI object prefix or parquet object to ingest. May be passed more than once. "
+            "Bucket-relative values are resolved against --source-bucket when provided."
         ),
     )
-    parser.add_argument("--x-column", required=True, help="Column holding the x/lon coordinate.")
-    parser.add_argument("--y-column", required=True, help="Column holding the y/lat coordinate.")
+    parser.add_argument(
+        "--source-bucket",
+        help=(
+            "OCI source bucket for bucket-relative --parquet-prefix values or links-file entries. "
+            "If omitted, bucket-relative source paths keep the legacy behavior and use OCI_BUCKET."
+        ),
+    )
+    parser.add_argument(
+        "--source-namespace",
+        help="OCI source namespace. Defaults to the configured OCI namespace discovered by the connector.",
+    )
+    parser.add_argument(
+        "--output-store",
+        help=(
+            "Destination Zarr store path. Accepts either an OCI URI "
+            "(oci://bucket@namespace/prefix/output.zarr) or a bucket-relative path. "
+            "If omitted for a single source prefix, writes to cubes/<parquet-name>.zarr in OCI_BUCKET."
+        ),
+    )
+    parser.add_argument(
+        "--x-column",
+        help="Column holding the x/lon coordinate. If omitted, common x/lon/easting names are inferred.",
+    )
+    parser.add_argument(
+        "--y-column",
+        help="Column holding the y/lat coordinate. If omitted, common y/lat/northing names are inferred.",
+    )
     parser.add_argument(
         "--value-columns",
         help="Comma-separated value columns to write. If omitted, numeric non-coordinate columns are used.",
@@ -128,7 +193,8 @@ def _parse_args() -> argparse.Namespace:
         "--timestamp-regex",
         help=(
             "Regex used against the parquet folder path when the timestamp is not stored in a column. "
-            "Use a named group 'ts' or a single capture group."
+            "Use a named group 'ts' or a single capture group. If omitted, the converter tries "
+            "YYYY-MM-DD and YYYYMMDD dates in the source path."
         ),
     )
     parser.add_argument("--x-dim", default="x", help="Output Zarr x dimension name.")
@@ -256,7 +322,10 @@ def _parse_args() -> argparse.Namespace:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Logging verbosity for conversion progress messages. Default: INFO.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.links_file and not args.parquet_prefixes:
+        parser.error("Provide at least one --parquet-prefix or a --links-file.")
+    return args
 
 
 def _load_links(path: str) -> list[str]:
@@ -274,6 +343,22 @@ def _load_links(path: str) -> list[str]:
     return items
 
 
+def _load_parquet_inputs(
+    *,
+    links_file: str | None,
+    parquet_prefixes: Sequence[str] | None,
+) -> list[str]:
+    items: list[str] = []
+    if links_file:
+        items.extend(_load_links(links_file))
+    if parquet_prefixes:
+        items.extend(item.strip() for item in parquet_prefixes if item.strip())
+    if not items:
+        raise ValueError("Provide at least one parquet input via --parquet-prefix or --links-file")
+    logger.info("Resolved %d parquet input(s)", len(items))
+    return items
+
+
 def _normalize_oci_uri(raw_path: str, connector: OCIObjectStorageConnector) -> str:
     if raw_path.startswith("oci://"):
         logger.debug("Using explicit OCI URI: %s", raw_path)
@@ -281,6 +366,55 @@ def _normalize_oci_uri(raw_path: str, connector: OCIObjectStorageConnector) -> s
     normalized = connector.build_oci_uri(raw_path)
     logger.debug("Normalized bucket-relative path %s -> %s", raw_path, normalized)
     return normalized
+
+
+def _build_oci_uri(bucket: str, namespace: str, object_path: str) -> str:
+    cleaned_bucket = bucket.strip()
+    cleaned_namespace = namespace.strip()
+    cleaned_path = object_path.strip().lstrip("/")
+    if not cleaned_bucket:
+        raise ValueError("OCI bucket must not be empty")
+    if not cleaned_namespace:
+        raise ValueError("OCI namespace must not be empty")
+    if not cleaned_path:
+        raise ValueError("OCI object path must not be empty")
+    return f"oci://{cleaned_bucket}@{cleaned_namespace}/{cleaned_path}"
+
+
+def _normalize_source_oci_uri(
+    raw_path: str,
+    connector: OCIObjectStorageConnector,
+    *,
+    source_bucket: str | None,
+    source_namespace: str | None,
+) -> str:
+    if raw_path.startswith("oci://"):
+        logger.debug("Using explicit source OCI URI: %s", raw_path)
+        return raw_path
+    if source_bucket:
+        namespace = source_namespace or connector.namespace
+        normalized = _build_oci_uri(source_bucket, namespace, raw_path)
+        logger.debug(
+            "Normalized source bucket-relative path %s with bucket=%s namespace=%s -> %s",
+            raw_path,
+            source_bucket,
+            namespace,
+            normalized,
+        )
+        return normalized
+    return _normalize_oci_uri(raw_path, connector)
+
+
+def _derive_output_store(parquet_inputs: Sequence[str]) -> str:
+    if len(parquet_inputs) != 1:
+        raise ValueError("Pass --output-store when ingesting more than one parquet input")
+    source = parquet_inputs[0].rstrip("/")
+    name = source.rsplit("/", 1)[-1]
+    if not name:
+        raise ValueError("Unable to derive --output-store from an empty source prefix")
+    if name.endswith(".parquet"):
+        name = name.removesuffix(".parquet")
+    return f"cubes/{name}.zarr"
 
 
 def _mapper_path_from_oci_uri(oci_uri: str) -> str:
@@ -318,6 +452,8 @@ def _validate_storage_layout(chunk_size: int, shard_size: int, zarr_version: int
 def _required_columns(config: ConversionConfig) -> list[str] | None:
     if config.value_columns is None:
         return None
+    if config.x_column is None or config.y_column is None:
+        return None
 
     columns: list[str] = [config.x_column, config.y_column]
     if config.timestamp_column:
@@ -330,6 +466,43 @@ def _initial_read_columns(config: ConversionConfig) -> list[str] | None:
     if config.value_columns is None:
         return None
     return _required_columns(config)
+
+
+def _find_coordinate_column(
+    frame: pd.DataFrame,
+    explicit_column: str | None,
+    candidates: Sequence[str],
+    axis_label: str,
+) -> str:
+    if explicit_column:
+        if explicit_column not in frame.columns:
+            raise ValueError(
+                f"Requested {axis_label} coordinate column '{explicit_column}' was not found. "
+                f"Available columns: {list(frame.columns)}"
+            )
+        return explicit_column
+
+    by_lower = {str(column).lower(): str(column) for column in frame.columns}
+    for candidate in candidates:
+        matched = by_lower.get(candidate.lower())
+        if matched is not None:
+            logger.info("Inferred %s coordinate column: %s", axis_label, matched)
+            return matched
+
+    raise ValueError(
+        f"Unable to infer {axis_label} coordinate column. Pass --{axis_label}-column explicitly. "
+        f"Available columns: {list(frame.columns)}"
+    )
+
+
+def _resolve_coordinate_columns(
+    frame: pd.DataFrame,
+    config: ConversionConfig,
+) -> tuple[str, str]:
+    return (
+        _find_coordinate_column(frame, config.x_column, DEFAULT_X_COLUMN_CANDIDATES, "x"),
+        _find_coordinate_column(frame, config.y_column, DEFAULT_Y_COLUMN_CANDIDATES, "y"),
+    )
 
 
 def _first_value(series: pd.Series) -> Any:
@@ -487,17 +660,21 @@ def _detect_value_columns(df: pd.DataFrame, config: ConversionConfig) -> tuple[s
         logger.info("Using explicit value columns: %s", list(config.value_columns))
         return config.value_columns
 
-    excluded = {
-        config.x_column,
-        config.y_column,
-        config.timestamp_column,
-        *DEFAULT_EXCLUDED_COLUMNS,
-    }
-    numeric = [
+    excluded_exact = {
         column
-        for column in df.columns
-        if column not in excluded and pd.api.types.is_numeric_dtype(df[column])
-    ]
+        for column in (config.x_column, config.y_column, config.timestamp_column)
+        if column is not None
+    }
+    excluded_lower = {
+        str(column).lower()
+        for column in excluded_exact
+    } | DEFAULT_EXCLUDED_COLUMNS
+    numeric: list[str] = []
+    for column in df.columns:
+        if column in excluded_exact or str(column).lower() in excluded_lower:
+            continue
+        if pd.api.types.is_numeric_dtype(df[column]) or _coerce_numeric_series(df[column], str(column)) is not None:
+            numeric.append(str(column))
     if not numeric:
         raise ValueError("Unable to infer value columns. Pass --value-columns explicitly.")
     logger.info("Inferred value columns: %s", numeric)
@@ -542,7 +719,22 @@ def _extract_timestamps(df: pd.DataFrame, parquet_uri: str, config: ConversionCo
         )
         return [timestamp]
 
-    raise ValueError("Provide either --timestamp-column or --timestamp-regex")
+    for default_regex in DEFAULT_PATH_TIMESTAMP_REGEXES:
+        match = re.search(default_regex, parquet_uri)
+        if not match:
+            continue
+        captured = match.groupdict().get("ts") or match.group(1)
+        timestamp = np.datetime64(pd.Timestamp(captured).to_datetime64())
+        logger.info(
+            "Inferred timestamp %s from path using default regex %s",
+            timestamp,
+            default_regex,
+        )
+        return [timestamp]
+
+    raise ValueError(
+        "Provide either --timestamp-column or --timestamp-regex, or include a YYYY-MM-DD/YYYYMMDD date in the source path"
+    )
 
 
 def _extract_timestamp(df: pd.DataFrame, parquet_uri: str, config: ConversionConfig) -> np.datetime64:
@@ -865,6 +1057,111 @@ def _resolve_point_preserving_resolutions(
             resolved_y,
         )
     return resolved_x, resolved_y
+
+
+def _choose_factor_grid_shape(
+    row_count: int,
+    x_span: float,
+    y_span: float,
+) -> tuple[int, int] | None:
+    if row_count < 4 or x_span <= 0.0 or y_span <= 0.0:
+        return None
+
+    aspect = x_span / y_span
+    best: tuple[float, int, int] | None = None
+    for factor in range(1, int(math.sqrt(row_count)) + 1):
+        if row_count % factor != 0:
+            continue
+        paired = row_count // factor
+        for width, height in ((factor, paired), (paired, factor)):
+            if width < 2 or height < 2:
+                continue
+            grid_aspect = width / height
+            score = abs(math.log(grid_aspect / aspect))
+            if best is None or score < best[0]:
+                best = (score, width, height)
+
+    if best is None:
+        return None
+    score, width, height = best
+    if score > math.log(4.0):
+        logger.warning(
+            "Rejected inferred regular grid shape width=%d height=%d for row_count=%d because aspect mismatch is too large",
+            width,
+            height,
+            row_count,
+        )
+        return None
+    return width, height
+
+
+def _infer_regular_grid_from_distribution(
+    coordinate_frames: dict[str, pd.DataFrame],
+    parquet_uris: list[str],
+    config: ConversionConfig,
+) -> InferredGrid | None:
+    if config.x_resolution is not None and config.y_resolution is not None:
+        return None
+    if config.x_column is None or config.y_column is None:
+        return None
+
+    transformed_frames = [
+        _transform_coordinate_frame(coordinate_frames[parquet_uri], config)
+        for parquet_uri in parquet_uris
+    ]
+    x_values = np.concatenate(
+        [frame[config.x_column].to_numpy(dtype=np.float64) for frame in transformed_frames]
+    )
+    y_values = np.concatenate(
+        [frame[config.y_column].to_numpy(dtype=np.float64) for frame in transformed_frames]
+    )
+    if x_values.size == 0 or y_values.size == 0:
+        return None
+
+    unique_x = np.unique(np.round(x_values, decimals=GRID_COORD_DECIMALS)).size
+    unique_y = np.unique(np.round(y_values, decimals=GRID_COORD_DECIMALS)).size
+    exploded_cells = int(unique_x) * int(unique_y)
+    if exploded_cells <= config.max_grid_cells:
+        return None
+
+    row_count = int(x_values.size)
+    x_min = float(np.nanmin(x_values))
+    x_max = float(np.nanmax(x_values))
+    y_min = float(np.nanmin(y_values))
+    y_max = float(np.nanmax(y_values))
+    shape = _choose_factor_grid_shape(
+        row_count=row_count,
+        x_span=x_max - x_min,
+        y_span=y_max - y_min,
+    )
+    if shape is None:
+        return None
+
+    width, height = shape
+    x_resolution = config.x_resolution or float((x_max - x_min) / (width - 1))
+    y_resolution = config.y_resolution or float((y_max - y_min) / (height - 1))
+    if x_resolution <= 0.0 or y_resolution <= 0.0:
+        return None
+
+    logger.info(
+        "Inferred regular grid from point distribution: rows=%d raw_unique_x=%d raw_unique_y=%d raw_estimated_cells=%d target_width=%d target_height=%d x_resolution=%s y_resolution=%s",
+        row_count,
+        unique_x,
+        unique_y,
+        exploded_cells,
+        width,
+        height,
+        x_resolution,
+        y_resolution,
+    )
+    return InferredGrid(
+        x_resolution=x_resolution,
+        y_resolution=y_resolution,
+        x_snap_origin=config.x_snap_origin if config.x_snap_origin is not None else x_min,
+        y_snap_origin=config.y_snap_origin if config.y_snap_origin is not None else y_min,
+        width=width,
+        height=height,
+    )
 
 
 def _prepare_spatial_frame(
@@ -1755,6 +2052,8 @@ def _append_inputs(
     read_workers: int,
     write_batch: int,
     zarr_version: int,
+    source_bucket: str | None = None,
+    source_namespace: str | None = None,
 ) -> list[dict[str, Any]]:
     _validate_storage_layout(
         chunk_size=chunk_size,
@@ -1775,7 +2074,15 @@ def _append_inputs(
         else:
             logger.info("Overwrite requested but output store does not exist yet: %s", output_store_uri)
 
-    normalized_links = [_normalize_oci_uri(parquet_link, connector) for parquet_link in parquet_links]
+    normalized_links = [
+        _normalize_source_oci_uri(
+            parquet_link,
+            connector,
+            source_bucket=source_bucket,
+            source_namespace=source_namespace,
+        )
+        for parquet_link in parquet_links
+    ]
     mapper_path = _mapper_path_from_oci_uri(output_store_uri)
     if append and filesystem.exists(mapper_path):
         existing_context = _load_existing_store_context(
@@ -1798,6 +2105,8 @@ def _append_inputs(
         first_uri,
         columns=_initial_read_columns(config),
     )
+    x_column, y_column = _resolve_coordinate_columns(first_frame, config)
+    config = replace(config, x_column=x_column, y_column=y_column)
     value_columns = _detect_value_columns(first_frame, config)
     config = replace(config, value_columns=value_columns)
     if existing_context is not None:
@@ -1816,6 +2125,19 @@ def _append_inputs(
         config=config,
         max_workers=read_workers,
     )
+    inferred_grid = _infer_regular_grid_from_distribution(
+        coordinate_frames=coordinate_frames,
+        parquet_uris=normalized_links,
+        config=config,
+    )
+    if inferred_grid is not None:
+        config = replace(
+            config,
+            x_resolution=inferred_grid.x_resolution,
+            y_resolution=inferred_grid.y_resolution,
+            x_snap_origin=inferred_grid.x_snap_origin,
+            y_snap_origin=inferred_grid.y_snap_origin,
+        )
     resolved_x_resolution, resolved_y_resolution = _resolve_point_preserving_resolutions(
         coordinate_frames=coordinate_frames,
         parquet_uris=normalized_links,
@@ -2021,9 +2343,17 @@ def main() -> None:
     args = _parse_args()
     _configure_logging(args.log_level)
     settings = get_settings()
+    parquet_links = _load_parquet_inputs(
+        links_file=args.links_file,
+        parquet_prefixes=args.parquet_prefixes,
+    )
+    output_store = args.output_store or _derive_output_store(parquet_links)
     logger.info(
-        "Starting parquet-to-zarr conversion with output=%s, layout=%s, chunk_size=%d, shard_size=%d, read_workers=%d, write_batch=%d, zarr_version=%d, max_grid_cells=%d, x_resolution=%s, y_resolution=%s, source_crs=%s, output_crs=%s, cell_aggregation=%s, string_cell_aggregation=%s, overwrite=%s, append=%s",
-        args.output_store,
+        "Starting parquet-to-zarr conversion with source_bucket=%s, source_namespace=%s, inputs=%d, output=%s, layout=%s, chunk_size=%d, shard_size=%d, read_workers=%d, write_batch=%d, zarr_version=%d, max_grid_cells=%d, x_resolution=%s, y_resolution=%s, source_crs=%s, output_crs=%s, cell_aggregation=%s, string_cell_aggregation=%s, overwrite=%s, append=%s",
+        args.source_bucket,
+        args.source_namespace,
+        len(parquet_links),
+        output_store,
         args.layout,
         args.chunk_size,
         args.shard_size,
@@ -2065,8 +2395,7 @@ def main() -> None:
         preserve_points=args.preserve_points,
     )
 
-    parquet_links = _load_links(args.links_file)
-    output_store_uri = _normalize_oci_uri(args.output_store, connector)
+    output_store_uri = _normalize_oci_uri(output_store, connector)
     summaries = _append_inputs(
         connector=connector,
         parquet_links=parquet_links,
@@ -2079,6 +2408,8 @@ def main() -> None:
         read_workers=args.read_workers,
         write_batch=args.write_batch,
         zarr_version=args.zarr_version,
+        source_bucket=args.source_bucket,
+        source_namespace=args.source_namespace,
     )
     logger.info("Conversion finished successfully for %d parquet link(s)", len(summaries))
     print(

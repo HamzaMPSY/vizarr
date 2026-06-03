@@ -33,8 +33,10 @@ The app has two serving paths:
 | [docs/backend.md](docs/backend.md) | Backend modules, route surface, and runtime modes |
 | [docs/frontend.md](docs/frontend.md) | Frontend component guide and state model |
 | [docs/performance.md](docs/performance.md) | Implemented caching paths and planned performance work |
+| [docs/performance-baselines.md](docs/performance-baselines.md) | CI quality gates and benchmark baseline expectations |
 | [docs/build.md](docs/build.md) | Local dev, compose, OCI, and VM setup |
 | [docs/oci-integration.md](docs/oci-integration.md) | OCI-specific discovery and live-store notes |
+| [docs/compatibility.md](docs/compatibility.md) | GeoZarr, CF, STAC, and serving-profile compatibility contract |
 
 Operational files:
 
@@ -71,6 +73,16 @@ python3 scripts/oci_browser_smoke.py
 
 The smoke command skips cleanly when OCI auth or OCI-backed datasets are not
 available. See [docs/build.md](docs/build.md) for the full checklist.
+
+For live OCI cold/warm tile timing and cache/representation headers:
+
+```bash
+python3 scripts/oci_performance_benchmark.py --output .cache/benchmarks/oci-benchmark.json
+```
+
+Set `TILE_DEBUG_HEADERS_ENABLED=true` on the backend to include tile timing and
+object I/O counters in the report. The benchmark also skips cleanly when the
+current stack is synthetic-only or OCI auth is unavailable.
 
 ## Quick start: production-style compose
 
@@ -143,6 +155,21 @@ roles.
 | Frontend | React, TypeScript, Vite, MapLibre | Dataset picker and raster tile viewer |
 | Query/state | TanStack Query, Zustand | Server metadata cache and map/UI state |
 | Reverse proxy | Nginx | Production-style app/API routing |
+
+## Auth model
+
+Local development keeps `AUTH_ENABLED=false` by default. Production profiles
+must set `APP_ENVIRONMENT=production` or `AUTH_ENABLED=true` and provide
+`AUTH_API_KEYS`.
+
+`AUTH_API_KEYS` accepts comma-separated keys. A bare key has access to all
+datasets and debug/global routes. A scoped key uses
+`key=dataset_id_a|dataset_id_b` and can only access those datasets.
+
+The frontend can pass a key with `VITE_API_KEY` for browser smoke tests and
+private deployments. Tile and WebSocket URLs include the key as `api_key`
+because MapLibre raster requests and browser WebSockets cannot set custom
+headers.
 
 ## Known planned work
 

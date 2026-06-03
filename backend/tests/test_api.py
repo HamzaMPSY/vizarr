@@ -1,8 +1,11 @@
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.core.dataset_catalog import CatalogEntry
 from app.core.oci_auth import OCIAuthExpiredError
 from app.core.oci_object_storage import OCIObjectInfo
+from app.core.tile_observability import record_object_read
+from app.core.tile_observability import record_zarr_chunk_read
 from app.main import app
 from app.models.dataset import DatasetMeta
 from app.models.dataset import CompositeStyle
@@ -10,6 +13,7 @@ from app.models.dataset import TileJSON
 from app.models.dataset import VariableMeta
 from app.models.dataset import VariableStats
 from app.models.plans import QueryPlan
+from app.services.browse_jobs import BrowseGenerationJobStore
 
 
 client = TestClient(app)
@@ -19,6 +23,75 @@ def test_healthcheck() -> None:
     response = client.get("/api/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_auth_enabled_requires_api_key(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "secret-key")
+
+    missing = client.get("/api/datasets")
+    invalid = client.get("/api/datasets", headers={"X-API-Key": "wrong"})
+    valid = client.get("/api/datasets", headers={"X-API-Key": "secret-key"})
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert valid.status_code == 200
+
+
+def test_auth_is_required_by_production_environment(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", False)
+    monkeypatch.setattr(app.state.settings, "app_environment", "production")
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "")
+
+    health = client.get("/api/healthz")
+    protected = client.get("/api/datasets")
+
+    assert health.status_code == 200
+    assert protected.status_code == 503
+    assert "AUTH_API_KEYS" in protected.json()["detail"]
+
+
+def test_dataset_scoped_api_key_filters_dataset_list(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "scoped=demo-global,other=missing-dataset")
+
+    visible = client.get("/api/datasets", headers={"X-API-Key": "scoped"})
+    hidden = client.get("/api/datasets", headers={"X-API-Key": "other"})
+    denied = client.get("/api/datasets/not-demo/variables", headers={"X-API-Key": "scoped"})
+
+    assert visible.status_code == 200
+    assert [item["id"] for item in visible.json()] == ["demo-global"]
+    assert hidden.status_code == 200
+    assert hidden.json() == []
+    assert denied.status_code == 403
+
+
+def test_dataset_scoped_api_key_cannot_use_storage_debug_routes(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "scoped=demo-global,global-key")
+
+    scoped = client.get("/api/storage/objects", headers={"X-API-Key": "scoped"})
+    global_key = client.get("/api/storage/objects", headers={"X-API-Key": "global-key"})
+
+    assert scoped.status_code == 403
+    assert global_key.status_code == 400
+
+
+def test_dataset_websocket_requires_auth_when_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "ws-key=demo-global")
+
+    try:
+        with client.websocket_connect("/ws/datasets"):
+            raise AssertionError("unauthenticated websocket should not connect")
+    except WebSocketDisconnect as exc:
+        assert exc.code == 1008
+
+    with client.websocket_connect("/ws/datasets?api_key=ws-key") as websocket:
+        payload = websocket.receive_json()
+
+    assert payload["type"] == "datasets.invalidate"
+    assert payload["datasets"] == [{"id": "demo-global", "name": "Synthetic Global Weather"}]
 
 
 def test_list_datasets() -> None:
@@ -37,13 +110,35 @@ def test_list_variables() -> None:
     assert ids == {"temperature", "precipitation"}
 
 
-def test_get_tile() -> None:
+def test_get_tile(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", False)
+
     response = client.get("/api/tiles/demo-global/temperature/1/1/1")
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/webp"
     assert response.headers["x-cache-status"] in {"MISS", "HIT"}
     assert response.headers["x-representation"] == "serving"
+    assert "x-tile-time-ms" not in response.headers
     assert len(response.content) > 100
+
+
+def test_tile_debug_headers_are_gated_by_settings(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", False)
+    hidden = client.get("/api/tiles/demo-global/temperature/2/1/1?colormap=magma")
+
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", True)
+    visible = client.get("/api/tiles/demo-global/temperature/2/1/2?colormap=magma")
+
+    assert hidden.status_code == 200
+    assert visible.status_code == 200
+    assert "x-tile-time-ms" not in hidden.headers
+    assert float(visible.headers["x-tile-time-ms"]) >= 0
+    assert float(visible.headers["x-tile-planner-ms"]) >= 0
+    assert float(visible.headers["x-tile-cache-lookup-ms"]) >= 0
+    assert float(visible.headers["x-tile-render-ms"]) >= 0
+    assert float(visible.headers["x-tile-encode-ms"]) >= 0
+    assert visible.headers["x-object-get-count"] == "0"
+    assert visible.headers["x-zarr-chunk-count"] == "0"
 
 
 def test_get_colormap_palette() -> None:
@@ -235,6 +330,42 @@ def test_zarr_proxy_returns_full_object(monkeypatch) -> None:
     assert response.headers["content-type"].startswith("application/json")
     assert response.headers["accept-ranges"] == "bytes"
     assert response.headers["etag"] == "etag-17"
+    assert response.headers["cache-control"] == "public, max-age=3600"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_dataset_scoped_api_key_allows_zarr_proxy_for_allowed_dataset(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "scoped=dataset-1")
+
+    responses = [
+        client.get("/api/zarr/dataset-1", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+        client.head("/api/zarr/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/multiscale/dataset-1", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/multiscale/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+    ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200, 200]
+
+
+def test_dataset_scoped_api_key_denies_zarr_proxy_for_other_dataset(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "scoped=other-dataset")
+
+    missing_key = client.get("/api/zarr/dataset-1/zarr.json")
+    denied = [
+        client.get("/api/zarr/dataset-1", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+        client.head("/api/zarr/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/multiscale/dataset-1", headers={"X-API-Key": "scoped"}),
+        client.get("/api/zarr/multiscale/dataset-1/zarr.json", headers={"X-API-Key": "scoped"}),
+    ]
+
+    assert missing_key.status_code == 401
+    assert [response.status_code for response in denied] == [403, 403, 403, 403, 403]
 
 
 def test_zarr_proxy_supports_byte_ranges(monkeypatch) -> None:
@@ -249,6 +380,34 @@ def test_zarr_proxy_supports_byte_ranges(monkeypatch) -> None:
     assert response.content == b"2345"
     assert response.headers["content-range"] == "bytes 2-5/10"
     assert response.headers["content-length"] == "4"
+
+
+def test_zarr_proxy_supports_head_without_body(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+
+    response = client.head("/api/zarr/dataset-1/zarr.json")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == "17"
+    assert response.headers["etag"] == "etag-17"
+
+
+def test_zarr_proxy_uses_if_none_match_cache_validation(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+    connector = app.state.storage_connector
+
+    def fail_read(*_args, **_kwargs):
+        raise AssertionError("conditional cache validation should not read object bytes")
+
+    monkeypatch.setattr(connector, "read_bytes", fail_read)
+
+    response = client.get("/api/zarr/dataset-1/zarr.json", headers={"If-None-Match": '"etag-17"'})
+
+    assert response.status_code == 304
+    assert response.content == b""
+    assert response.headers["etag"] == "etag-17"
+    assert response.headers["cache-control"] == "public, max-age=3600"
 
 
 def test_multiscale_zarr_proxy_returns_full_object(monkeypatch) -> None:
@@ -284,6 +443,14 @@ def test_zarr_proxy_rejects_invalid_range(monkeypatch) -> None:
     )
 
     assert response.status_code == 416
+
+
+def test_zarr_proxy_rejects_path_traversal(monkeypatch) -> None:
+    _configure_oci_app_state(monkeypatch)
+
+    response = client.get("/api/zarr/dataset-1/../zarr.json")
+
+    assert response.status_code in {400, 404}
 
 
 def test_zarr_proxy_returns_404_for_missing_object(monkeypatch) -> None:
@@ -450,8 +617,74 @@ def test_oci_tile_falls_back_from_pyramid_to_serving(monkeypatch) -> None:
     assert response.headers["x-data-vmin"] == "0.2"
 
 
+def test_oci_direct_tile_returns_503_when_compute_budget_exceeded(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", True)
+    monkeypatch.setattr(app.state.settings, "direct_tile_max_parallel_chunk_reads", 2)
+    monkeypatch.setattr(app.state.settings, "direct_tile_max_zarr_chunks", 1)
+    entry.band_names = ["NDVI"]
+    entry.band_indices = {"NDVI": 0}
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+
+    monkeypatch.setattr(
+        app.state.planner,
+        "plan_tile_request",
+        lambda **_kwargs: QueryPlan(
+            planner_version="v1",
+            collection_id=entry.id,
+            request_class="tile",
+            chosen_representation="serving",
+            execution_path="interactive",
+            request_fingerprint="budget",
+            response_cache_key="artifact:tile:budget",
+            plan_cache_key="plan:budget",
+            selected_cube=entry.id,
+            selected_path=entry.path,
+        ),
+    )
+    monkeypatch.setattr("app.api.tiles.ensure_catalog_entry_metadata_ready", lambda current_entry, _connector: current_entry)
+
+    def _generate_direct_tile(*args):
+        assert args[-1] == 2
+        record_object_read(bytes_read=128, byte_range=True)
+        record_zarr_chunk_read()
+        record_zarr_chunk_read()
+        return b"direct-bytes", (0.2, 0.8)
+
+    monkeypatch.setattr("app.api.tiles.generate_projected_band_tile", _generate_direct_tile)
+
+    response = client.get("/api/tiles/dataset-1/NDVI/9/277/244?colormap=budget-test")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "error": "direct_tile_compute_budget_exceeded",
+            "reason": "chunk_reads 2 exceeded limit 1",
+            "metric": "chunk_reads",
+            "actual": 2,
+            "limit": 1,
+        }
+    }
+    assert response.headers["x-cache-status"] == "BYPASS"
+    assert response.headers["x-representation"] == "serving"
+    assert response.headers["x-tile-budget-status"] == "exceeded"
+    assert response.headers["x-tile-budget-metric"] == "chunk_reads"
+    assert response.headers["x-tile-budget-limit"] == "1"
+    assert response.headers["x-tile-budget-actual"] == "2"
+    assert response.headers["x-zarr-chunk-count"] == "2"
+
+
 def test_oci_tile_serves_composite_style(monkeypatch) -> None:
     entry = _configure_oci_app_state(monkeypatch)
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", True)
     entry.band_names = ["B4", "B3", "B2"]
     entry.band_indices = {"B4": 0, "B3": 1, "B2": 2}
     entry.meta.variables = [
@@ -535,6 +768,10 @@ def test_oci_tile_serves_composite_style(monkeypatch) -> None:
     assert cached_response.content == b"rgb-bytes"
     assert cached_response.headers["x-representation"] == "serving"
     assert cached_response.headers["x-cache-status"] == "HIT"
+    assert float(response.headers["x-tile-time-ms"]) >= 0
+    assert float(response.headers["x-tile-encode-ms"]) >= 0
+    assert cached_response.headers["x-object-get-count"] == "0"
+    assert cached_response.headers["x-zarr-chunk-count"] == "0"
     assert composite_calls["count"] == 1
 
 
@@ -599,6 +836,16 @@ def test_dataset_serving_profile_reports_browser_readiness(monkeypatch) -> None:
             "multiscale_paths": ["0"],
             "browse_overview_zoom_levels": [0],
             "browse_overview_max_zoom": 0,
+            "browse_coverage": {
+                "expected_zoom_levels": list(range(0, 9)),
+                "available_zoom_levels": [0],
+                "missing_variables": [],
+                "missing_time_steps": {},
+                "last_generated_at": None,
+                "generation_status": "partial",
+                "expected_artifact_count": 9,
+                "available_artifact_count": 1,
+            },
             "chunk_layout": {
                 "sharded": True,
                 "shard_shape": [1, 1, 4096, 4096],
@@ -639,3 +886,89 @@ def test_dataset_serving_profile_returns_503_when_oci_token_has_expired(monkeypa
     assert response.json() == {
         "detail": "OCI CLI token has expired. Re-authenticate before starting the backend."
     }
+
+
+def test_create_browse_generation_job_runs_and_reports_status(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+    monkeypatch.setattr(app.state, "browse_generation_job_store", BrowseGenerationJobStore(), raising=False)
+
+    def _build(**kwargs):
+        kwargs["progress_callback"](True)
+        kwargs["progress_callback"](False)
+        return {"manifest_path": "browse/cubes/example.zarr/manifest.json", "generated": 1, "reused": 1}
+
+    monkeypatch.setattr("app.api.datasets.build_and_store_browse_overviews", _build)
+
+    accepted = client.post(
+        "/api/datasets/dataset-1/browse-generation",
+        json={"variables": ["NDVI"], "time_indices": [0], "zoom_levels": [0, 1]},
+    )
+
+    assert accepted.status_code == 202
+    accepted_payload = accepted.json()
+    assert accepted_payload["dataset_id"] == "dataset-1"
+    assert accepted_payload["total_artifacts"] == 2
+
+    status = client.get(f"/api/datasets/dataset-1/browse-generation/{accepted_payload['job_id']}")
+
+    assert status.status_code == 200
+    status_payload = status.json()
+    assert status_payload["status"] == "succeeded"
+    assert status_payload["progress"] == 1.0
+    assert status_payload["generated_artifacts"] == 1
+    assert status_payload["reused_artifacts"] == 1
+    assert status_payload["manifest_path"] == "browse/cubes/example.zarr/manifest.json"
+    assert status_payload["can_retry"] is False
+
+
+def test_browse_generation_job_reports_failure_and_retry_state(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+    monkeypatch.setattr(app.state, "browse_generation_job_store", BrowseGenerationJobStore(), raising=False)
+
+    def _fail(**_kwargs):
+        raise RuntimeError("browse build failed")
+
+    monkeypatch.setattr("app.api.datasets.build_and_store_browse_overviews", _fail)
+
+    accepted = client.post(
+        "/api/datasets/dataset-1/browse-generation",
+        json={"variables": ["NDVI"], "time_indices": [0], "zoom_levels": [0]},
+    )
+    failed = client.get(f"/api/datasets/dataset-1/browse-generation/{accepted.json()['job_id']}")
+
+    retry = client.post(
+        "/api/datasets/dataset-1/browse-generation",
+        json={
+            "variables": ["NDVI"],
+            "time_indices": [0],
+            "zoom_levels": [0],
+            "retry_job_id": accepted.json()["job_id"],
+        },
+    )
+    retry_status = client.get(f"/api/datasets/dataset-1/browse-generation/{retry.json()['job_id']}")
+
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "failed"
+    assert failed.json()["can_retry"] is True
+    assert failed.json()["error_message"] == "browse build failed"
+    assert retry.status_code == 202
+    assert retry_status.json()["attempt"] == 2
+    assert retry_status.json()["retry_of_job_id"] == accepted.json()["job_id"]

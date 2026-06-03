@@ -3,51 +3,128 @@ import { useQuery } from "@tanstack/react-query";
 
 import { useColormapPalette } from "./useDatasets";
 import {
-  levelSupportsDirectChunkRead,
-  loadLevelPlane,
+  chooseReadWindow,
+  explainUnsupportedLevel,
+  estimateReadWindow,
+  loadLevelPlaneWindow,
   loadMultiscaleMetadata,
-  renderChunkToDataUrl,
+  renderCompositeMultiscaleRaster,
+  renderMultiscaleRaster,
   selectMultiscaleLevel
 } from "../lib/multiscale";
+import type { MultiscaleLevelDescriptor, MultiscaleReadBudget, MultiscaleReadWindow } from "../lib/multiscale";
 import type { DatasetServingProfile } from "../types";
 
 const MAX_BROWSER_NATIVE_PIXELS = 1024 * 1024;
 const MAX_BROWSER_NATIVE_CHUNKS = 64;
+const MAX_BROWSER_NATIVE_CHUNK_BYTES = 16 * 1024 * 1024;
+const MAX_BROWSER_NATIVE_CONCURRENT_CHUNKS = 4;
+const BROWSER_NATIVE_BUDGET: MultiscaleReadBudget = {
+  maxPixels: MAX_BROWSER_NATIVE_PIXELS,
+  maxChunks: MAX_BROWSER_NATIVE_CHUNKS,
+  maxChunkBytes: MAX_BROWSER_NATIVE_CHUNK_BYTES,
+  maxConcurrentChunkLoads: MAX_BROWSER_NATIVE_CONCURRENT_CHUNKS
+};
 
 interface UseBrowserMultiscaleOptions {
   profile: DatasetServingProfile | undefined;
   variable: string | null;
+  compositeBands?: BrowserMultiscaleBandInput[] | null;
   timeIndex: number;
   colormap: string;
   vmin: number | null;
   vmax: number | null;
   zoom: number;
+  viewportBounds: [number, number, number, number] | null;
 }
 
-interface BrowserMultiscaleImage {
+export interface BrowserMultiscaleBandInput {
+  variable: string;
+  vmin: number;
+  vmax: number;
+}
+
+export interface BrowserMultiscaleBandPlane {
+  variable: string;
+  rawValues: Float32Array;
+  width: number;
+  height: number;
+  vmin: number;
+  vmax: number;
+}
+
+interface BrowserMultiscaleImageBase {
   dataUrl: string;
   coordinates: [[number, number], [number, number], [number, number], [number, number]];
   levelPath: string;
   browseZoom: number | null;
+  mode: "full-level" | "viewport-window";
+  pixelCount: number;
+  chunkCount: number;
+  loadedBytes: number;
+  estimatedChunkBytes: number;
 }
 
-interface BrowserMultiscaleResult {
+export interface BrowserSingleBandMultiscaleImage extends BrowserMultiscaleImageBase {
+  renderKind: "single-band";
+  rawValues: Float32Array;
+  width: number;
+  height: number;
+  vmin: number;
+  vmax: number;
+  paletteImageData: ImageData;
+}
+
+export interface BrowserCompositeMultiscaleImage extends BrowserMultiscaleImageBase {
+  renderKind: "composite";
+  bands: [BrowserMultiscaleBandPlane, BrowserMultiscaleBandPlane, BrowserMultiscaleBandPlane];
+}
+
+export type BrowserMultiscaleImage = BrowserSingleBandMultiscaleImage | BrowserCompositeMultiscaleImage;
+
+export interface BrowserMultiscaleResult {
   image: BrowserMultiscaleImage | null;
   status: "native" | "native-loading" | "fallback";
   reason: string;
+  debug: BrowserMultiscaleDebug;
+}
+
+interface BrowserMultiscaleDebug {
+  mode: "none" | "full-level" | "viewport-window";
+  status: "native" | "native-loading" | "fallback";
+  reason: string;
+  levelPath: string | null;
+  browseZoom: number | null;
+  pixelCount: number;
+  chunkCount: number;
+  loadedBytes: number;
+  estimatedChunkBytes: number;
+  maxPixels: number;
+  maxChunks: number;
+  maxChunkBytes: number;
+  maxConcurrentChunkLoads: number;
 }
 
 export function useBrowserMultiscale({
   profile,
   variable,
+  compositeBands = null,
   timeIndex,
   colormap,
   vmin,
   vmax,
-  zoom
+  zoom,
+  viewportBounds
 }: UseBrowserMultiscaleOptions): BrowserMultiscaleResult {
-  const gate = useMemo(() => getBrowserNativeGate(profile, variable), [profile, variable]);
-  const { data: palette } = useColormapPalette(gate.enabled ? colormap : null);
+  const requestedVariables = useMemo(
+    () => compositeBands?.map((band) => band.variable) ?? (variable ? [variable] : []),
+    [compositeBands, variable]
+  );
+  const renderKind: BrowserMultiscaleImage["renderKind"] =
+    compositeBands && compositeBands.length > 0 ? "composite" : "single-band";
+  const gate = useMemo(() => getBrowserNativeGate(profile, requestedVariables), [profile, requestedVariables]);
+  const needsPalette = renderKind === "single-band";
+  const { data: palette } = useColormapPalette(gate.enabled && needsPalette ? colormap : null);
 
   const metadataQuery = useQuery({
     queryKey: [
@@ -56,7 +133,8 @@ export function useBrowserMultiscale({
       profile?.multiscale_proxy_root,
       profile?.data_array_name
     ],
-    queryFn: () => loadMultiscaleMetadata(profile?.multiscale_proxy_root ?? "", profile?.data_array_name ?? ""),
+    queryFn: ({ signal }) =>
+      loadMultiscaleMetadata(profile?.multiscale_proxy_root ?? "", profile?.data_array_name ?? "", { signal }),
     enabled: gate.enabled,
     staleTime: 300_000
   });
@@ -65,31 +143,31 @@ export function useBrowserMultiscale({
     queryKey: [
       "browser-multiscale-image",
       profile?.dataset_id,
-      variable,
+      renderKind,
+      requestedVariables.join(","),
       timeIndex,
       colormap,
       vmin,
       vmax,
+      compositeBands?.map((band) => `${band.variable}:${band.vmin}:${band.vmax}`).join(",") ?? "no-composite",
       Math.floor(zoom),
+      viewportBounds?.map((value) => value.toFixed(5)).join(",") ?? "no-viewport",
       metadataQuery.data?.levels.map((level) => `${level.path}:${level.browseZoom}`).join(",")
     ],
-    queryFn: async (): Promise<BrowserMultiscaleImage> => {
-      if (!metadataQuery.data || !palette || !profile || !variable || vmin === null || vmax === null) {
+    queryFn: async ({ signal }): Promise<BrowserMultiscaleImage> => {
+      if (!metadataQuery.data || !profile) {
         throw new Error("Browser-native rendering inputs are incomplete");
       }
       const selectedLevel = selectMultiscaleLevel(metadataQuery.data, zoom);
       if (!selectedLevel) {
         throw new Error("No multiscale level is available");
       }
-      if (!levelSupportsDirectChunkRead(selectedLevel)) {
-        throw new Error("Selected multiscale level uses unsupported compressor, filters, dtype, order, or chunk shape");
+      const unsupported = explainUnsupportedLevel(selectedLevel);
+      if (unsupported.length > 0) {
+        throw new Error(`Selected multiscale level is unsupported: ${unsupported.join("; ")}`);
       }
-      const [timeCount, bandCount, height, width] = selectedLevel.shape;
-      const [timeChunkSize, bandChunkSize, chunkHeight, chunkWidth] = selectedLevel.chunks;
-      const chunkCount = Math.ceil(height / chunkHeight) * Math.ceil(width / chunkWidth);
-      if (height * width > MAX_BROWSER_NATIVE_PIXELS || chunkCount > MAX_BROWSER_NATIVE_CHUNKS) {
-        throw new Error("Selected multiscale level is too large for browser-native full-plane rendering");
-      }
+      const [timeCount, bandCount] = selectedLevel.shape;
+      const [timeChunkSize, bandChunkSize] = selectedLevel.chunks;
       if (timeIndex >= timeCount) {
         throw new Error("Requested time index is outside the selected multiscale level");
       }
@@ -97,64 +175,144 @@ export function useBrowserMultiscale({
         throw new Error("Only one-time, one-band browser chunks are supported");
       }
 
+      const window = chooseReadWindow(selectedLevel, viewportBounds, BROWSER_NATIVE_BUDGET);
+      if (renderKind === "composite") {
+        if (!compositeBands || compositeBands.length !== 3) {
+          throw new Error("Composite rendering requires exactly three bands");
+        }
+        const bandPlanes: BrowserMultiscaleBandPlane[] = [];
+        let loadedBytes = 0;
+        for (const band of compositeBands) {
+          const bandIndex = profile.variable_ids.indexOf(band.variable);
+          if (bandIndex < 0 || bandIndex >= bandCount) {
+            throw new Error(`Composite band ${band.variable} is not present in the multiscale store`);
+          }
+          const plane = await loadLevelPlaneWindow(
+            metadataQuery.data.proxyRoot,
+            metadataQuery.data.dataArrayName,
+            selectedLevel,
+            {
+              timeIndex,
+              bandIndex,
+              window,
+              budget: BROWSER_NATIVE_BUDGET,
+              signal
+            }
+          );
+          loadedBytes += plane.loadedBytes;
+          bandPlanes.push({
+            variable: band.variable,
+            rawValues: plane.values,
+            width: plane.width,
+            height: plane.height,
+            vmin: band.vmin,
+            vmax: band.vmax
+          });
+        }
+        const [red, green, blue] = bandPlanes;
+        if (!red || !green || !blue) {
+          throw new Error("Composite band loading failed");
+        }
+        const rendered = renderCompositeMultiscaleRaster([red, green, blue]);
+        return {
+          renderKind: "composite",
+          dataUrl: rendered.dataUrl,
+          coordinates: bboxToImageCoordinates(window.bbox),
+          levelPath: selectedLevel.path,
+          browseZoom: selectedLevel.browseZoom,
+          mode: window.mode,
+          pixelCount: rendered.width * rendered.height,
+          chunkCount: estimateCompositeChunkCount(selectedLevel, window, compositeBands.length),
+          loadedBytes,
+          estimatedChunkBytes: estimateCompositeBytes(selectedLevel, window, compositeBands.length),
+          bands: [red, green, blue]
+        };
+      }
+
+      if (!palette || !variable || vmin === null || vmax === null) {
+        throw new Error("Single-band browser-native rendering inputs are incomplete");
+      }
       const bandIndex = profile.variable_ids.indexOf(variable);
       if (bandIndex < 0 || bandIndex >= bandCount) {
         throw new Error("Selected variable is not present in the multiscale store");
       }
-
-      const values = await loadLevelPlane(metadataQuery.data.proxyRoot, metadataQuery.data.dataArrayName, selectedLevel, {
+      const plane = await loadLevelPlaneWindow(metadataQuery.data.proxyRoot, metadataQuery.data.dataArrayName, selectedLevel, {
         timeIndex,
-        bandIndex
+        bandIndex,
+        window,
+        budget: BROWSER_NATIVE_BUDGET,
+        signal
       });
-      const dataUrl = renderChunkToDataUrl(values, {
-        width,
-        height,
+      const rendered = renderMultiscaleRaster(plane.values, {
+        width: plane.width,
+        height: plane.height,
         palette,
         vmin,
         vmax
       });
 
       return {
-        dataUrl,
-        coordinates: bboxToImageCoordinates(selectedLevel.bbox),
-        levelPath: selectedLevel.path,
-        browseZoom: selectedLevel.browseZoom
+        renderKind: "single-band",
+        dataUrl: rendered.dataUrl,
+        coordinates: bboxToImageCoordinates(plane.bbox),
+        levelPath: plane.levelPath,
+        browseZoom: plane.browseZoom,
+        mode: plane.mode,
+        pixelCount: plane.pixelCount,
+        chunkCount: plane.chunkCount,
+        loadedBytes: plane.loadedBytes,
+        estimatedChunkBytes: plane.estimatedChunkBytes,
+        rawValues: plane.values,
+        width: plane.width,
+        height: plane.height,
+        vmin,
+        vmax,
+        paletteImageData: rendered.paletteImageData
       };
     },
-    enabled: gate.enabled && Boolean(metadataQuery.data && palette && vmin !== null && vmax !== null),
+    enabled: gate.enabled && Boolean(
+      metadataQuery.data &&
+        (
+          renderKind === "composite"
+            ? compositeBands?.length === 3
+            : palette && vmin !== null && vmax !== null
+        )
+    ),
     staleTime: 60_000,
     retry: false
   });
 
   if (!gate.enabled) {
-    return { image: null, status: "fallback", reason: gate.reason };
+    return result(null, "fallback", gate.reason);
   }
   if (metadataQuery.isError) {
-    return { image: null, status: "fallback", reason: errorToMessage(metadataQuery.error) };
+    return result(null, "fallback", errorToMessage(metadataQuery.error));
   }
   if (imageQuery.isError) {
-    return { image: null, status: "fallback", reason: errorToMessage(imageQuery.error) };
+    return result(null, "fallback", errorToMessage(imageQuery.error));
   }
   if (imageQuery.data) {
+    const reason = imageQuery.data.browseZoom === null
+      ? `browser-native ${imageQuery.data.mode} ${imageQuery.data.levelPath}`
+      : `browser-native ${imageQuery.data.mode} ${imageQuery.data.levelPath} at z${imageQuery.data.browseZoom}`;
     return {
       image: imageQuery.data,
       status: "native",
-      reason: imageQuery.data.browseZoom === null
-        ? `browser-native ${imageQuery.data.levelPath}`
-        : `browser-native ${imageQuery.data.levelPath} at z${imageQuery.data.browseZoom}`
+      reason,
+      debug: debugFromImage(imageQuery.data, "native", reason)
     };
   }
-  return { image: null, status: "native-loading", reason: "loading browser-native multiscale data" };
+  return result(null, "native-loading", "loading browser-native multiscale data");
 }
 
 function getBrowserNativeGate(
   profile: DatasetServingProfile | undefined,
-  variable: string | null
+  variables: string[]
 ): { enabled: boolean; reason: string } {
   if (!profile) {
     return { enabled: false, reason: "serving profile unavailable" };
   }
-  if (!variable) {
+  if (variables.length === 0) {
     return { enabled: false, reason: "no variable selected" };
   }
   if (!profile.browser_multiscale_ready) {
@@ -180,8 +338,9 @@ function getBrowserNativeGate(
   if (!profile.chunk_layout?.inner_chunk_shape || profile.chunk_layout.inner_chunk_shape.length < 4) {
     return { enabled: false, reason: "server tiles: source chunk layout unknown" };
   }
-  if (!profile.variable_ids.includes(variable)) {
-    return { enabled: false, reason: "server tiles: variable missing from serving profile" };
+  const missingVariable = variables.find((item) => !profile.variable_ids.includes(item));
+  if (missingVariable) {
+    return { enabled: false, reason: `server tiles: variable ${missingVariable} missing from serving profile` };
   }
   return { enabled: true, reason: "browser-native eligible" };
 }
@@ -200,4 +359,76 @@ function bboxToImageCoordinates(
 
 function errorToMessage(error: unknown): string {
   return error instanceof Error ? `server tiles: ${error.message}` : "server tiles: browser-native rendering failed";
+}
+
+function estimateCompositeChunkCount(
+  level: MultiscaleLevelDescriptor,
+  window: MultiscaleReadWindow,
+  bandCount: number
+): number {
+  return estimateReadWindow(level, window).chunkCount * bandCount;
+}
+
+function estimateCompositeBytes(
+  level: MultiscaleLevelDescriptor,
+  window: MultiscaleReadWindow,
+  bandCount: number
+): number {
+  return estimateReadWindow(level, window).estimatedChunkBytes * bandCount;
+}
+
+function result(
+  image: BrowserMultiscaleImage | null,
+  status: "native" | "native-loading" | "fallback",
+  reason: string
+): BrowserMultiscaleResult {
+  return {
+    image,
+    status,
+    reason,
+    debug: image ? debugFromImage(image, status, reason) : emptyDebug(status, reason)
+  };
+}
+
+function debugFromImage(
+  image: BrowserMultiscaleImage,
+  status: "native" | "native-loading" | "fallback",
+  reason: string
+): BrowserMultiscaleDebug {
+  return {
+    mode: image.mode,
+    status,
+    reason,
+    levelPath: image.levelPath,
+    browseZoom: image.browseZoom,
+    pixelCount: image.pixelCount,
+    chunkCount: image.chunkCount,
+    loadedBytes: image.loadedBytes,
+    estimatedChunkBytes: image.estimatedChunkBytes,
+    maxPixels: BROWSER_NATIVE_BUDGET.maxPixels,
+    maxChunks: BROWSER_NATIVE_BUDGET.maxChunks,
+    maxChunkBytes: BROWSER_NATIVE_BUDGET.maxChunkBytes,
+    maxConcurrentChunkLoads: BROWSER_NATIVE_BUDGET.maxConcurrentChunkLoads
+  };
+}
+
+function emptyDebug(
+  status: "native" | "native-loading" | "fallback",
+  reason: string
+): BrowserMultiscaleDebug {
+  return {
+    mode: "none",
+    status,
+    reason,
+    levelPath: null,
+    browseZoom: null,
+    pixelCount: 0,
+    chunkCount: 0,
+    loadedBytes: 0,
+    estimatedChunkBytes: 0,
+    maxPixels: BROWSER_NATIVE_BUDGET.maxPixels,
+    maxChunks: BROWSER_NATIVE_BUDGET.maxChunks,
+    maxChunkBytes: BROWSER_NATIVE_BUDGET.maxChunkBytes,
+    maxConcurrentChunkLoads: BROWSER_NATIVE_BUDGET.maxConcurrentChunkLoads
+  };
 }

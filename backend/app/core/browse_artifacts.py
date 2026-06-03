@@ -1,12 +1,15 @@
 import hashlib
 import json
 from collections import OrderedDict
+from datetime import UTC
+from datetime import datetime
 from threading import Lock
 from typing import Any
 
 from app.config import Settings
 from app.core.dataset_catalog import CatalogEntry
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.models.dataset import BrowseCoverage
 
 
 _MANIFEST_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -89,8 +92,62 @@ def build_browse_manifest(
         "store_path": entry.path,
         "planner_version": settings.planner_version,
         "overview_max_size": settings.browse_overview_max_size,
+        "last_generated_at": datetime.now(tz=UTC).isoformat(),
         "variables": variables,
     }
+
+
+def compute_browse_coverage(
+    settings: Settings,
+    entry: CatalogEntry,
+    manifest: dict[str, Any] | None,
+) -> BrowseCoverage:
+    expected_zoom_levels = list(range(0, int(settings.browse_tile_max_zoom) + 1))
+    expected_variables = _expected_browse_variables(entry)
+    available_zoom_levels = _collect_manifest_zoom_levels(manifest)
+    expected_artifact_count = 0
+    available_artifact_count = 0
+    missing_variables: list[str] = []
+    missing_time_steps: dict[str, list[int]] = {}
+
+    for variable in expected_variables:
+        time_indices = _expected_time_indices(entry, variable)
+        variable_available = 0
+        for time_index in time_indices:
+            expected_artifact_count += len(expected_zoom_levels)
+            missing_zoom_levels = [
+                zoom
+                for zoom in expected_zoom_levels
+                if not browse_manifest_contains_overview(
+                    manifest,
+                    variable=variable,
+                    time_index=time_index,
+                    zoom=zoom,
+                )
+            ]
+            present_count = len(expected_zoom_levels) - len(missing_zoom_levels)
+            variable_available += present_count
+            available_artifact_count += present_count
+            if missing_zoom_levels:
+                missing_time_steps.setdefault(variable, []).append(time_index)
+        if variable_available == 0:
+            missing_variables.append(variable)
+
+    status = _browse_generation_status(
+        manifest=manifest,
+        expected_artifact_count=expected_artifact_count,
+        available_artifact_count=available_artifact_count,
+    )
+    return BrowseCoverage(
+        expected_zoom_levels=expected_zoom_levels,
+        available_zoom_levels=available_zoom_levels,
+        missing_variables=missing_variables,
+        missing_time_steps=missing_time_steps,
+        last_generated_at=_manifest_generated_at(manifest),
+        generation_status=status,
+        expected_artifact_count=expected_artifact_count,
+        available_artifact_count=available_artifact_count,
+    )
 
 
 def read_browse_manifest(
@@ -155,3 +212,77 @@ def _manifest_cache_set(path: str, manifest: dict[str, Any]) -> None:
         _MANIFEST_CACHE.move_to_end(path)
         while len(_MANIFEST_CACHE) > _MANIFEST_CACHE_MAX_ENTRIES:
             _MANIFEST_CACHE.popitem(last=False)
+
+
+def _expected_browse_variables(entry: CatalogEntry) -> list[str]:
+    if entry.meta.variables:
+        return [item.id for item in entry.meta.variables]
+    return list(entry.band_names)
+
+
+def _expected_time_indices(entry: CatalogEntry, variable: str) -> list[int]:
+    variable_meta = next((item for item in entry.meta.variables if item.id == variable), None)
+    if variable_meta is not None:
+        count = max(int(variable_meta.time_steps), 1)
+    elif entry.meta.time_values:
+        count = max(len(entry.meta.time_values), 1)
+    else:
+        count = 1
+    return list(range(count))
+
+
+def _collect_manifest_zoom_levels(manifest: dict[str, Any] | None) -> list[int]:
+    if not isinstance(manifest, dict):
+        return []
+    variables = manifest.get("variables")
+    if not isinstance(variables, dict):
+        return []
+
+    levels: set[int] = set()
+    for variable_entry in variables.values():
+        if not isinstance(variable_entry, dict):
+            continue
+        overviews = variable_entry.get("overviews")
+        if not isinstance(overviews, dict):
+            continue
+        for overview_entry in overviews.values():
+            if not isinstance(overview_entry, dict):
+                continue
+            level_entries = overview_entry.get("levels")
+            if not isinstance(level_entries, dict):
+                continue
+            for level in level_entries:
+                try:
+                    levels.add(int(level))
+                except (TypeError, ValueError):
+                    continue
+    return sorted(levels)
+
+
+def _browse_generation_status(
+    *,
+    manifest: dict[str, Any] | None,
+    expected_artifact_count: int,
+    available_artifact_count: int,
+) -> str:
+    if isinstance(manifest, dict):
+        manifest_status = manifest.get("generation_status")
+        if manifest_status in {"queued", "running", "failed"}:
+            return str(manifest_status)
+    if expected_artifact_count <= 0 or available_artifact_count == 0:
+        return "missing"
+    if available_artifact_count < expected_artifact_count:
+        return "partial"
+    return "complete"
+
+
+def _manifest_generated_at(manifest: dict[str, Any] | None) -> datetime | None:
+    if not isinstance(manifest, dict):
+        return None
+    raw_value = manifest.get("last_generated_at") or manifest.get("generated_at")
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

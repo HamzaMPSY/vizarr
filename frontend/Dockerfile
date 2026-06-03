@@ -17,8 +17,8 @@ ENV NPM_CONFIG_STRICT_SSL=${NPM_CONFIG_STRICT_SSL:-true}
 ENV NODE_TLS_REJECT_UNAUTHORIZED=${NODE_TLS_REJECT_UNAUTHORIZED:-1}
 ENV npm_config_loglevel=verbose
 
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
@@ -42,8 +42,8 @@ ENV NPM_CONFIG_STRICT_SSL=${NPM_CONFIG_STRICT_SSL:-true}
 ENV NODE_TLS_REJECT_UNAUTHORIZED=${NODE_TLS_REJECT_UNAUTHORIZED:-1}
 ENV npm_config_loglevel=verbose
 
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 FROM nginx:1.27-alpine
 

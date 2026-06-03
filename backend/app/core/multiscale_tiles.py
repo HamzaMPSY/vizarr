@@ -72,6 +72,7 @@ def generate_and_cache_pyramid_tile(
     colormap: str,
     vmin: float | None,
     vmax: float | None,
+    max_parallel_chunk_reads: int | None = None,
 ) -> tuple[bytes, tuple[float, float]]:
     data = render_projected_band_array(
         connector=connector,
@@ -82,6 +83,7 @@ def generate_and_cache_pyramid_tile(
         height=TILE_SIZE,
         time_index=time_index,
         max_source_oversample=1.0,
+        max_parallel_chunk_reads=max_parallel_chunk_reads,
     )
     store_pyramid_tile_array(
         connector=connector,

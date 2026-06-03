@@ -5,6 +5,8 @@ import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
+from app.core.tile_observability import observe_tile_time
+
 
 CUSTOM_COLORMAPS = {
     "red_green": LinearSegmentedColormap.from_list(
@@ -51,7 +53,8 @@ def encode_tile(data: np.ndarray, colormap: str, vmin: float, vmax: float) -> by
     rgba = (cmap(normalized) * 255).astype(np.uint8)
     rgba[..., 3] = np.where(finite_mask, 255, 0).astype(np.uint8)
 
-    image = Image.fromarray(rgba, mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="WEBP", quality=85)
+    with observe_tile_time("image_encoding"):
+        image = Image.fromarray(rgba, mode="RGBA")
+        buffer = io.BytesIO()
+        image.save(buffer, format="WEBP", quality=85)
     return buffer.getvalue()

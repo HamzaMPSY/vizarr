@@ -299,6 +299,7 @@ def print_manual_browser_checks(frontend_url: str, dataset_id: str, variable_id:
     print(f"  2. Select dataset {dataset_id!r} and variable/composite {variable_id!r}.")
     print("  3. Confirm the map auto-fits the dataset footprint instead of staying at the default world view.")
     print("  4. Confirm either the map raster layer or the sidebar tile preview is visibly populated.")
+    print("  5. For multiscale sidecars, confirm .map-shell reports browser-gpu, browser-native, or a fallback reason.")
 
 
 if __name__ == "__main__":

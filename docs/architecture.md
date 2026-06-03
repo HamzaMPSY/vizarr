@@ -24,13 +24,16 @@ FastAPI backend
   - browse/pyramid/serving tile paths
   - Redis tile cache
   - read-only Zarr proxy
+  - browser-facing multiscale sidecars
   - dataset invalidation WebSocket
   |
-  | REST / TileJSON / WebP tiles / WebSocket invalidation
+  | REST / TileJSON / WebP tiles / read-only Zarr proxy / WebSocket invalidation
   v
 React frontend
   - dataset and variable selection
   - MapLibre raster source/layer
+  - optional browser-native multiscale image source
+  - optional deck.gl browser-GPU raster overlay
   - TanStack Query metadata cache
   - Zustand map/UI state
 ```
@@ -63,14 +66,37 @@ Generated multiscale stores live separately from source stores, usually under
 
 The backend can serve prebuilt pyramid tiles and can lazily generate/cache some
 pyramid tiles. The frontend contains helper code for browser-native multiscale
-reading, but the active viewer path is still MapLibre raster tiles from the
-backend TileJSON endpoint.
+reading and a first deck.gl overlay path for compatible generated sidecars.
+MapLibre raster tiles from the backend TileJSON endpoint remain the fallback.
+
+The browser-GPU path also uses these generated sidecars. It must not read
+arbitrary source Zarr v3/sharded cubes directly from the browser. The initial
+GPU-compatible sidecar contract is:
+
+- Zarr v2 with consolidated metadata;
+- one data array per level with dimensions `time`, `band`, `y`, and `x`;
+- `float32`, C-order chunks with no compressor and no filters;
+- chunks `[1, 1, 256, 256]`;
+- level metadata containing stable level paths, WGS84 or Web Mercator bounds,
+  browse zoom mapping, data array name, CRS/transform metadata where available,
+  and enough shape/chunk/dtype fields for a frontend eligibility decision.
+
+When any part of that contract is missing, the frontend must stay on the
+server-rendered TileJSON path.
 
 ### Direct serving
 
 When no browse or pyramid artifact is available, the backend reads source Zarr
 metadata/chunks and renders the requested band tile directly. This is the
 fallback for high zooms and unsupported artifact states.
+
+Direct serving is in-process today. It can use bounded thread-level source chunk
+parallelism, but the FastAPI lifespan does not start an external Dask scheduler
+or worker cluster. Per-request direct tile object/chunk/byte budgets are the
+runtime guardrail for missing artifacts or unexpectedly expensive source
+windows. OCI object bytes and decoded Zarr shard indexes are cached with bounded
+LRUs so repeated chunks in the same shard avoid repeated index reads and decode
+work.
 
 ## Backend components
 
@@ -162,6 +188,15 @@ an opportunistic MapLibre image-source path when the serving profile and level
 metadata are compatible. Server-rendered TileJSON remains the fallback and the
 normal path for unsupported datasets.
 
+The deck.gl browser-GPU path sits beside that image-source path. The current
+slice reuses the dataset-scoped multiscale proxy, reads a bounded browser
+window, uploads raw float values and a palette texture through
+`ZarrColormapBitmapLayer`, and applies range normalization plus colormap lookup
+in a fragment shader. The CPU-colored data URL is kept for the MapLibre
+image-source fallback. It is an optimization path only: `browser-gpu` may be
+selected for compatible sidecars, while `browser-native` and `server-tiles`
+remain fallback states for existing behavior and unsupported data.
+
 ## Request flow: active tile path
 
 ```
@@ -226,11 +261,14 @@ responses still use `X-Cache-Status` for the backend Redis cache.
 | OCI session-profile auth and object listing | Implemented |
 | Zarr v3 metadata/chunk/shard handling | Implemented for current target layouts |
 | Server-rendered WebP tiles | Implemented |
+| Direct tile compute/read budgets | Implemented |
 | Browse overview serving | Implemented |
 | Separate multiscale store discovery/proxying | Implemented |
 | MapLibre raster TileJSON viewer | Implemented |
+| Deck.gl MapLibre overlay shell | Implemented |
 | Redis tile cache | Implemented |
 | Browser-native multiscale attempt with server-tile fallback | Implemented |
+| Deck.gl browser-GPU Zarr rendering | Partly implemented with raw-float single-band and composite deck.gl layers |
 | RGB and false-color composites | Implemented for recognized band aliases |
 | Generic projected Zarr layout adapter | Partly implemented for direct `time/y/x` and banded `time/*/y/x` layouts |
 | Debounced frontend tile prefetch | Implemented without a worker |

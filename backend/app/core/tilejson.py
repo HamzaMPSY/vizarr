@@ -11,6 +11,12 @@ from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.serving_profile import build_dataset_serving_profile
 from app.core.zarr_v3 import estimate_4d_nonempty_pixel_bounds
 from app.core.zarr_v3 import estimate_4d_present_shard_pixel_bounds
+from app.core.zarr_v3 import build_chunk_object_path
+from app.core.zarr_v3 import load_4d_window
+from app.core.zarr_v3 import _chunks_per_shard
+from app.core.zarr_v3 import _list_present_shard_positions
+from app.core.zarr_v3 import _read_shard_index
+from app.core.zarr_v3 import _UINT64_MAX
 from app.models.dataset import DatasetBounds
 from app.models.dataset import TileJSON
 
@@ -18,6 +24,7 @@ from app.models.dataset import TileJSON
 _BROWSE_FALLBACK_MIN_PIXELS = 64
 _BROWSE_FALLBACK_MIN_COVERAGE_RATIO = 0.005
 _DEFAULT_TILEJSON_BOUNDS = [-180.0, -85.0511, 180.0, 85.0511]
+_FOCUS_CENTER_MAX_CHUNKS = 512
 
 
 def build_dataset_tilejson(
@@ -38,6 +45,13 @@ def build_dataset_tilejson(
         time_index=time_index,
     ) or entry.meta.bounds
     detail_minzoom = _detail_minzoom(settings, profile.browse_overview_max_zoom)
+    center = _time_specific_center(
+        connector=connector,
+        entry=entry,
+        variable=variable,
+        time_index=time_index,
+        zoom=detail_minzoom,
+    )
     has_coarse_fallback = _has_useful_browse_fallback(
         settings=settings,
         connector=connector,
@@ -51,6 +65,7 @@ def build_dataset_tilejson(
         name=f"{entry.meta.name}:{variable}",
         tiles=[tile_template],
         bounds=_tilejson_bounds(bounds),
+        center=center,
         minzoom=0 if has_coarse_fallback else detail_minzoom,
         maxzoom=_maxzoom_for_detail(
             bounds=bounds,
@@ -137,6 +152,122 @@ def _time_specific_bounds(
         crs_wkt=entry.crs_wkt,
         geo_transform=entry.geo_transform,
     )
+
+
+def _time_specific_center(
+    *,
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    variable: str,
+    time_index: int,
+    zoom: int,
+) -> list[float] | None:
+    if entry.data_array_meta is None or entry.geo_transform is None:
+        return None
+    if len(entry.data_array_meta.shape) != 4 or entry.data_array_meta.sharding is None:
+        return None
+
+    band_index = entry.band_indices.get(variable)
+    if band_index is None:
+        return None
+
+    metadata = entry.data_array_meta
+    sharding = metadata.sharding
+    chunks_per_shard = _chunks_per_shard(
+        shard_shape=metadata.chunk_shape,
+        inner_chunk_shape=sharding.chunk_shape,
+    )
+    chunk_y = int(metadata.effective_chunk_shape[2])
+    chunk_x = int(metadata.effective_chunk_shape[3])
+    shape_y = int(metadata.shape[2])
+    shape_x = int(metadata.shape[3])
+
+    shard_positions = _list_present_shard_positions(
+        connector=connector,
+        store_path=entry.path,
+        array_name=entry.data_array_name,
+        metadata=metadata,
+        time_indices=[time_index],
+        band_index=band_index,
+    )
+    if not shard_positions:
+        return None
+
+    checked_chunks = 0
+    for position in sorted(shard_positions, key=lambda item: (item[2], item[3])):
+        _, _, y_shard_index, x_shard_index = position
+        object_path = build_chunk_object_path(
+            store_path=entry.path,
+            array_name=entry.data_array_name,
+            separator=metadata.separator,
+            chunk_indices=position,
+        )
+        try:
+            shard_index = _read_shard_index(
+                connector=connector,
+                object_path=object_path,
+                shard_shape=metadata.chunk_shape,
+                inner_chunk_shape=sharding.chunk_shape,
+                index_codecs=sharding.index_codecs,
+                index_location=sharding.index_location,
+            )
+        except FileNotFoundError:
+            continue
+
+        for local_y in range(shard_index.shape[2]):
+            for local_x in range(shard_index.shape[3]):
+                offset = int(shard_index[0, 0, local_y, local_x, 0])
+                length = int(shard_index[0, 0, local_y, local_x, 1])
+                if offset == _UINT64_MAX and length == _UINT64_MAX:
+                    continue
+                checked_chunks += 1
+                if checked_chunks > _FOCUS_CENTER_MAX_CHUNKS:
+                    return None
+
+                global_y_chunk = y_shard_index * chunks_per_shard[2] + local_y
+                global_x_chunk = x_shard_index * chunks_per_shard[3] + local_x
+                y_start = global_y_chunk * chunk_y
+                x_start = global_x_chunk * chunk_x
+                y_stop = min(y_start + chunk_y, shape_y)
+                x_stop = min(x_start + chunk_x, shape_x)
+                if x_start >= x_stop or y_start >= y_stop:
+                    continue
+
+                window = load_4d_window(
+                    connector=connector,
+                    store_path=entry.path,
+                    array_name=entry.data_array_name,
+                    metadata=metadata,
+                    time_index=time_index,
+                    band_index=band_index,
+                    y_start=y_start,
+                    y_stop=y_stop,
+                    x_start=x_start,
+                    x_stop=x_stop,
+                    max_parallel_chunk_reads=1,
+                ).astype(np.float32)
+                finite = np.isfinite(window)
+                if not np.any(finite):
+                    continue
+
+                rows, cols = np.where(finite)
+                bounds = _bounds_from_pixel_window(
+                    x_start=x_start + int(cols.min()),
+                    x_stop=x_start + int(cols.max()) + 1,
+                    y_start=y_start + int(rows.min()),
+                    y_stop=y_start + int(rows.max()) + 1,
+                    crs_wkt=entry.crs_wkt,
+                    geo_transform=entry.geo_transform,
+                )
+                if bounds is None:
+                    return None
+                return [
+                    (bounds.west + bounds.east) / 2.0,
+                    (bounds.south + bounds.north) / 2.0,
+                    float(zoom),
+                ]
+
+    return None
 
 
 def _bounds_from_pixel_window(

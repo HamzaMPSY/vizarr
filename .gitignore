@@ -19,3 +19,7 @@ vizarr-vm-bundle.zip
 .tickets/
 .codex/
 .cache/
+output/
+.graphify*
+.playwright-cli/
+graphify-out/

@@ -6,6 +6,7 @@ from app.core.zarr_v3 import _crc32c
 from app.core.zarr_v3 import _decode_bytes
 from app.core.zarr_v3 import _resolved_chunk_length
 from app.core.zarr_v3 import build_chunk_object_path
+from app.core.zarr_v3 import clear_zarr_shard_index_cache
 from app.core.zarr_v3 import estimate_4d_nonempty_pixel_bounds
 from app.core.zarr_v3 import estimate_4d_present_shard_pixel_bounds
 from app.core.zarr_v3 import load_1d_numeric_array
@@ -14,6 +15,8 @@ from app.core.zarr_v3 import load_2d_window
 from app.core.zarr_v3 import load_4d_chunk
 from app.core.zarr_v3 import load_4d_window
 from app.core.zarr_v3 import load_fixed_length_utf32_labels
+from app.core.tile_observability import TileRequestMetrics
+from app.core.tile_observability import activate_tile_metrics
 
 
 def test_build_chunk_object_path_uses_v3_separator() -> None:
@@ -164,6 +167,54 @@ def test_load_2d_window_reassembles_requested_area(monkeypatch) -> None:
         [10, 11, 12],
         [14, 15, 16],
     ]
+
+
+def test_parallel_chunk_reads_preserve_tile_metrics_context() -> None:
+    metadata = ZarrV3ArrayMetadata(
+        shape=(4, 4),
+        chunk_shape=(2, 2),
+        data_type="uint16",
+        fill_value=0,
+        codecs=[],
+        separator="/",
+        attributes={},
+        dimension_names=("y", "x"),
+    )
+    chunks = {
+        "bucket@ns/cubes/example.zarr/NDVI/c/0/0": np.array([[1, 2], [5, 6]], dtype=np.uint16).tobytes(),
+        "bucket@ns/cubes/example.zarr/NDVI/c/0/1": np.array([[3, 4], [7, 8]], dtype=np.uint16).tobytes(),
+        "bucket@ns/cubes/example.zarr/NDVI/c/1/0": np.array([[9, 10], [13, 14]], dtype=np.uint16).tobytes(),
+        "bucket@ns/cubes/example.zarr/NDVI/c/1/1": np.array([[11, 12], [15, 16]], dtype=np.uint16).tobytes(),
+    }
+
+    class FakeConnector:
+        def build_oci_uri(self, object_path: str) -> str:
+            return f"oci://bucket@ns/{object_path}"
+
+        def read_bytes(self, object_path: str, *, use_cache: bool = False) -> bytes:
+            return chunks[object_path]
+
+    metrics = TileRequestMetrics()
+    with activate_tile_metrics(metrics):
+        window = load_2d_window(
+            connector=FakeConnector(),  # type: ignore[arg-type]
+            store_path="cubes/example.zarr",
+            array_name="NDVI",
+            metadata=metadata,
+            y_start=0,
+            y_stop=4,
+            x_start=0,
+            x_stop=4,
+            max_parallel_chunk_reads=4,
+        )
+
+    assert window.tolist() == [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+    ]
+    assert metrics.snapshot()["chunk_reads"] == 4
 
 
 def test_load_2d_chunk_accepts_full_edge_chunk_payload(monkeypatch) -> None:
@@ -345,6 +396,105 @@ def test_load_4d_chunk_reads_inner_sharded_chunk() -> None:
     )
 
     assert chunk.tolist() == [[[[11, 12], [15, 16]]]]
+
+
+def test_load_4d_window_reuses_decoded_shard_index_cache() -> None:
+    clear_zarr_shard_index_cache()
+    metadata = ZarrV3ArrayMetadata(
+        shape=(1, 1, 4, 4),
+        chunk_shape=(1, 1, 4, 4),
+        data_type="uint16",
+        fill_value=0,
+        codecs=[
+            {
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [1, 1, 2, 2],
+                    "codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                    ],
+                    "index_codecs": [
+                        {"name": "bytes", "configuration": {"endian": "little"}},
+                    ],
+                    "index_location": "end",
+                },
+            }
+        ],
+        separator="/",
+        attributes={},
+        dimension_names=("time", "band", "y", "x"),
+    )
+
+    chunks = [
+        np.array([[[[1, 2], [5, 6]]]], dtype=np.uint16).tobytes(),
+        np.array([[[[3, 4], [7, 8]]]], dtype=np.uint16).tobytes(),
+        np.array([[[[9, 10], [13, 14]]]], dtype=np.uint16).tobytes(),
+        np.array([[[[11, 12], [15, 16]]]], dtype=np.uint16).tobytes(),
+    ]
+    payload = b"".join(chunks)
+    index = np.asarray(
+        [
+            [0, len(chunks[0])],
+            [len(chunks[0]), len(chunks[1])],
+            [len(chunks[0]) + len(chunks[1]), len(chunks[2])],
+            [len(chunks[0]) + len(chunks[1]) + len(chunks[2]), len(chunks[3])],
+        ],
+        dtype="<u8",
+    ).reshape((1, 1, 2, 2, 2))
+    index_bytes = index.tobytes()
+
+    class FakeConnector:
+        def __init__(self) -> None:
+            self.tail_reads = 0
+
+        def build_oci_uri(self, object_path: str) -> str:
+            return f"oci://bucket@ns/{object_path}"
+
+        def read_byte_tail(self, object_path: str, *, length: int, use_cache: bool = False) -> bytes:
+            assert object_path == "bucket@ns/cubes/example.zarr/bands/c/0/0/0/0"
+            assert length == len(index_bytes)
+            self.tail_reads += 1
+            return index_bytes
+
+        def read_byte_range(
+            self,
+            object_path: str,
+            *,
+            start: int | None = None,
+            end: int | None = None,
+            use_cache: bool = False,
+        ) -> bytes:
+            assert object_path == "bucket@ns/cubes/example.zarr/bands/c/0/0/0/0"
+            assert start is not None
+            assert end is not None
+            return payload[start:end]
+
+    connector = FakeConnector()
+    metrics = TileRequestMetrics()
+    with activate_tile_metrics(metrics):
+        window = load_4d_window(
+            connector=connector,  # type: ignore[arg-type]
+            store_path="cubes/example.zarr",
+            array_name="bands",
+            metadata=metadata,
+            time_index=0,
+            band_index=0,
+            y_start=0,
+            y_stop=4,
+            x_start=0,
+            x_stop=4,
+            max_parallel_chunk_reads=1,
+        )
+
+    assert window.tolist() == [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+    ]
+    assert connector.tail_reads == 1
+    assert metrics.snapshot()["shard_index_reads"] == 1
+    clear_zarr_shard_index_cache()
 
 
 def test_estimate_4d_nonempty_pixel_bounds_reads_shard_indices() -> None:

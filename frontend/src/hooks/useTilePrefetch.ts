@@ -1,6 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
-import { useMapStore, type MapViewState } from "../store/mapStore";
+import { buildPrefetchPlan } from "../lib/tilePrefetchPlanner";
+import type { TilePrefetchBudget, TilePrefetchPlan, TilePrefetchPlanInput } from "../lib/tilePrefetchPlanner";
+import type { MapViewState } from "../store/mapStore";
 
 interface UseTilePrefetchOptions {
   tileTemplate: string | null;
@@ -8,8 +10,33 @@ interface UseTilePrefetchOptions {
   minZoom: number | null;
   maxZoom: number | null;
   enabled: boolean;
+  vmin: number | null;
+  vmax: number | null;
+  setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
   radius?: number;
 }
+
+interface NavigatorWithPrefetchSignals extends Navigator {
+  connection?: {
+    effectiveType?: string;
+    saveData?: boolean;
+  };
+  deviceMemory?: number;
+}
+
+interface IdleTask {
+  cancel: () => void;
+}
+
+const DEFAULT_PREFETCH_BUDGET: TilePrefetchBudget = {
+  maxInflightRequests: 3,
+  maxQueuedTiles: 32
+};
+
+const REDUCED_PREFETCH_BUDGET: TilePrefetchBudget = {
+  maxInflightRequests: 1,
+  maxQueuedTiles: 8
+};
 
 export function useTilePrefetch({
   tileTemplate,
@@ -17,35 +44,80 @@ export function useTilePrefetch({
   minZoom,
   maxZoom,
   enabled,
+  vmin,
+  vmax,
+  setRangeFromTileHeaders,
   radius = 2
 }: UseTilePrefetchOptions): void {
-  const { vmin, vmax, setRangeFromTileHeaders } = useMapStore((state) => ({
-    vmin: state.vmin,
-    vmax: state.vmax,
-    setRangeFromTileHeaders: state.setRangeFromTileHeaders
-  }));
+  const previousViewStateRef = useRef<MapViewState | null>(null);
 
   useEffect(() => {
     if (!enabled || !tileTemplate) {
-      return;
-    }
-    const zoom = Math.floor(viewState.zoom);
-    if ((minZoom !== null && zoom < minZoom) || (maxZoom !== null && zoom > maxZoom)) {
+      previousViewStateRef.current = viewState;
       return;
     }
 
     const abortController = new AbortController();
-    const { x, y } = lonLatToTile(viewState.longitude, viewState.latitude, zoom);
-    const urls = buildPrefetchUrls(tileTemplate, zoom, x, y, radius);
+    const budget = getPrefetchBudget();
+    const input: TilePrefetchPlanInput = {
+      tileTemplate,
+      viewState,
+      previousViewState: previousViewStateRef.current,
+      minZoom,
+      maxZoom,
+      radius,
+      budget
+    };
+    previousViewStateRef.current = viewState;
 
-    void prefetchUrls({
-      urls,
-      signal: abortController.signal,
-      shouldSeedRange: vmin === null && vmax === null,
-      setRangeFromTileHeaders
+    let worker: Worker | null = null;
+    let completed = false;
+    const idleTask = scheduleIdleTask(() => {
+      if (abortController.signal.aborted) {
+        return;
+      }
+
+      const runPlan = (plan: TilePrefetchPlan) => {
+        if (abortController.signal.aborted || completed || plan.urls.length === 0) {
+          return;
+        }
+        completed = true;
+        void prefetchUrls({
+          urls: plan.urls,
+          signal: abortController.signal,
+          shouldSeedRange: vmin === null && vmax === null,
+          setRangeFromTileHeaders,
+          maxInflightRequests: budget.maxInflightRequests
+        }).catch((error) => {
+          if (!abortController.signal.aborted) {
+            console.debug("Tile prefetch queue failed", error);
+          }
+        });
+      };
+
+      try {
+        worker = new Worker(new URL("../workers/tilePrefetchPlanner.worker.ts", import.meta.url), { type: "module" });
+        worker.onmessage = (event: MessageEvent<TilePrefetchPlan>) => {
+          worker?.terminate();
+          worker = null;
+          runPlan(event.data);
+        };
+        worker.onerror = () => {
+          worker?.terminate();
+          worker = null;
+          runPlan(buildPrefetchPlan(input));
+        };
+        worker.postMessage({ type: "plan", input });
+      } catch {
+        runPlan(buildPrefetchPlan(input));
+      }
     });
 
-    return () => abortController.abort();
+    return () => {
+      abortController.abort();
+      idleTask.cancel();
+      worker?.terminate();
+    };
   }, [
     enabled,
     maxZoom,
@@ -55,72 +127,87 @@ export function useTilePrefetch({
     tileTemplate,
     viewState.latitude,
     viewState.longitude,
+    viewState.pitch,
+    viewState.bearing,
     viewState.zoom,
     vmin,
     vmax
   ]);
 }
 
-function buildPrefetchUrls(tileTemplate: string, z: number, centerX: number, centerY: number, radius: number): string[] {
-  const limit = 2 ** z;
-  const urls: string[] = [];
-  urls.push(formatTileUrl(tileTemplate, z, centerX, centerY));
-
-  for (let dy = -radius; dy <= radius; dy += 1) {
-    for (let dx = -radius; dx <= radius; dx += 1) {
-      if (dx === 0 && dy === 0) {
-        continue;
-      }
-      const x = centerX + dx;
-      const y = centerY + dy;
-      if (x < 0 || x >= limit || y < 0 || y >= limit) {
-        continue;
-      }
-      urls.push(formatTileUrl(tileTemplate, z, x, y));
-    }
-  }
-
-  return urls;
-}
-
 async function prefetchUrls({
   urls,
   signal,
   shouldSeedRange,
-  setRangeFromTileHeaders
+  setRangeFromTileHeaders,
+  maxInflightRequests
 }: {
   urls: string[];
   signal: AbortSignal;
   shouldSeedRange: boolean;
   setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
+  maxInflightRequests: number;
 }): Promise<void> {
   const cache = "caches" in window ? await window.caches.open("vizarr-prefetch-tiles") : null;
+  let nextIndex = 0;
 
-  for (const [index, url] of urls.entries()) {
-    if (signal.aborted) {
-      return;
-    }
-
-    const request = new Request(url, { signal });
-    if (cache && (await cache.match(request))) {
-      continue;
-    }
-
-    try {
-      const response = await fetch(request);
-      if (!response.ok) {
+  const workers = Array.from({ length: Math.max(1, Math.min(maxInflightRequests, urls.length)) }, async () => {
+    while (!signal.aborted && nextIndex < urls.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const url = urls[index];
+      if (!url) {
         continue;
       }
-      if (shouldSeedRange && index === 0) {
-        seedRangeFromHeaders(response, setRangeFromTileHeaders);
-      }
-      if (cache) {
-        await cache.put(request, response.clone());
-      }
-    } catch (error) {
-      if (!signal.aborted) {
-        console.debug("Tile prefetch failed", error);
-      }
+      await prefetchUrl({
+        url,
+        signal,
+        cache,
+        shouldSeedRange: shouldSeedRange && index === 0,
+        setRangeFromTileHeaders
+      });
+    }
+  });
+
+  await Promise.all(workers);
+}
+
+async function prefetchUrl({
+  url,
+  signal,
+  cache,
+  shouldSeedRange,
+  setRangeFromTileHeaders
+}: {
+  url: string;
+  signal: AbortSignal;
+  cache: Cache | null;
+  shouldSeedRange: boolean;
+  setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
+}): Promise<void> {
+  if (signal.aborted) {
+    return;
+  }
+
+  const request = new Request(url, { signal });
+  if (cache && (await cache.match(request))) {
+    return;
+  }
+
+  try {
+    const response = await fetch(request);
+    if (!response.ok) {
+      return;
+    }
+    if (shouldSeedRange) {
+      seedRangeFromHeaders(response, setRangeFromTileHeaders);
+    }
+    if (cache) {
+      await cache.put(request, response.clone());
+    }
+  } catch (error) {
+    if (!signal.aborted) {
+      console.debug("Tile prefetch failed", error);
     }
   }
 }
@@ -138,21 +225,27 @@ function seedRangeFromHeaders(response: Response, setRangeFromTileHeaders: (vmin
   }
 }
 
-function formatTileUrl(template: string, z: number, x: number, y: number): string {
-  return template
-    .replace("{z}", String(z))
-    .replace("{x}", String(x))
-    .replace("{y}", String(y));
+function getPrefetchBudget(): TilePrefetchBudget {
+  const navigatorSignals = navigator as NavigatorWithPrefetchSignals;
+  const connection = navigatorSignals.connection;
+  const slowConnection =
+    connection?.saveData === true ||
+    connection?.effectiveType === "slow-2g" ||
+    connection?.effectiveType === "2g";
+  const lowMemory = typeof navigatorSignals.deviceMemory === "number" && navigatorSignals.deviceMemory <= 4;
+  return slowConnection || lowMemory ? REDUCED_PREFETCH_BUDGET : DEFAULT_PREFETCH_BUDGET;
 }
 
-function lonLatToTile(longitude: number, latitude: number, zoom: number): { x: number; y: number } {
-  const n = 2 ** zoom;
-  const clampedLatitude = Math.max(-85.05112878, Math.min(85.05112878, latitude));
-  const x = Math.floor(((longitude + 180) / 360) * n);
-  const latRad = (clampedLatitude * Math.PI) / 180;
-  const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+function scheduleIdleTask(callback: () => void): IdleTask {
+  if ("requestIdleCallback" in window && "cancelIdleCallback" in window) {
+    const idleId = window.requestIdleCallback(callback, { timeout: 750 });
+    return {
+      cancel: () => window.cancelIdleCallback(idleId)
+    };
+  }
+
+  const timeoutId = globalThis.setTimeout(callback, 120);
   return {
-    x: Math.max(0, Math.min(n - 1, x)),
-    y: Math.max(0, Math.min(n - 1, y))
+    cancel: () => globalThis.clearTimeout(timeoutId)
   };
 }

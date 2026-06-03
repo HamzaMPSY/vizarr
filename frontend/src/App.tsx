@@ -7,7 +7,7 @@ import { useDatasets, useVariables } from "./hooks/useDatasets";
 import { useMapStore } from "./store/mapStore";
 
 function App() {
-  const datasetSocketStatus = useDatasetInvalidation();
+  useDatasetInvalidation();
   const { data: datasets } = useDatasets();
   const {
     datasetId,
@@ -23,13 +23,13 @@ function App() {
   const { data: variables } = useVariables(datasetId);
 
   useEffect(() => {
-    if (!datasetId && datasets && datasets.length > 0) {
+    if (datasets && datasets.length > 0 && (!datasetId || !datasets.some((item) => item.id === datasetId))) {
       setDataset(datasets[0].id);
     }
   }, [datasetId, datasets, setDataset]);
 
   useEffect(() => {
-    if (!variable && variables && variables.length > 0) {
+    if (variables && variables.length > 0 && (!variable || !variables.some((item) => item.id === variable))) {
       setVariable(variables[0].id);
     }
   }, [setVariable, variable, variables]);
@@ -65,10 +65,6 @@ function App() {
     <div className="app-shell">
       <Sidebar />
       <main className="content">
-        <div className="realtime-status" data-status={datasetSocketStatus}>
-          <span aria-hidden="true" />
-          <span>Dataset sync {datasetSocketStatus}</span>
-        </div>
         <MapView />
       </main>
     </div>

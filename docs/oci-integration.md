@@ -4,14 +4,25 @@ This document captures the current OCI Object Storage integration status for Viz
 
 ## Current auth model
 
-Local development:
+Local development can use:
 - mount the host `~/.oci` directory into the backend container
 - use OCI profile `prof`
 - read `OCI_CONFIG_FILE` from the mounted config path
-- use session-token-based OCI auth locally
+- `OCI_AUTH_MODE=security_token` for browser-authenticated OCI CLI sessions
+- `OCI_AUTH_MODE=api_key` for non-interactive local or VM automation
+- `OCI_AUTH_MODE=auto` to choose API-key auth when the profile has no
+  `security_token_file`, or security-token auth when it does
 
 OCI Data Flow / in-cloud execution:
 - use OCI resource principals
+
+OCI Compute execution:
+- use `OCI_AUTH_MODE=instance_principal` with dynamic group policy
+
+Session-token auth is not a fully autonomous backend credential. It can be
+refreshed before expiry, but once OCI requires browser authentication again a
+user must authenticate. For services, benchmarks, and long-running browse or
+multiscale jobs, prefer API keys, instance principals, or resource principals.
 
 This matches the existing `dgov_dataflow_helpers` pattern: local session profile for local runs, resource principals for Data Flow.
 
@@ -176,6 +187,9 @@ Current readiness verdict:
 Current gaps:
 - `missing_multiscale_pyramid`
 
+The full standards-facing compatibility contract and serving-profile gap
+vocabulary live in [compatibility.md](compatibility.md).
+
 Browse generation status:
 - browse overview generation now uses a sparse fast-lat/lon path for affine `EPSG:4326` datasets before falling back to the older projected render paths
 - lower browse levels are derived from the highest built overview instead of re-rendering the full dataset at each zoom
@@ -187,6 +201,9 @@ Browse generation status:
 
 Operational note:
 - when using local security-token auth, refresh the OCI session before long-running browse generation jobs
+- `scripts/oci_session_watchdog.py --profile-name prof --config-file ~/.oci/config --loop`
+  can keep an already-authenticated local session fresh while OCI allows
+  refresh; it cannot bypass browser authentication after the session expires
 - long multiscale builds now preflight the remaining token TTL, but if the OCI CLI session expires after the build starts you still need to re-authenticate and rerun
 
 ## Separate multiscale store
@@ -229,17 +246,66 @@ Live maize target shape:
   - `population_strategy = lazy_on_demand` when no eager fill was requested
 - planner routing now consumes that metadata so the app can distinguish prebuilt/hybrid pyramid zooms from the first direct full-resolution zoom
 
+## Parquet to Zarr source-cube conversion
+
+The source-cube converter can ingest partitioned Parquet from a different OCI
+bucket than the configured Zarr destination bucket. Bucket-relative source
+prefixes are resolved against `--source-bucket`; the destination `--output-store`
+is still resolved against the configured `OCI_BUCKET` unless it is passed as a
+full `oci://bucket@namespace/path.zarr` URI.
+
+Example Sentinel-2 tile ingest:
+
+```bash
+podman exec vizarr_backend_1 python -m app.tools.parquet_to_zarr \
+  --source-bucket bu-lhr-dp-dibe-si007-dev-detcd-AppintegDIdev \
+  --parquet-prefix '20260401/48C676A9D6277B3A21F4EC87F8C70F56B7D057CE3AF4E2CDF79E11221840C639/F5347356860C76BC6E7A6B9505789C79798191668A626078CC704568E5294423/20260325_20260401/1d2053b2-34b7-49b1-8b8f-0935d4bf1b0b/35MQS_1_0_2026-03-25_2026-04-01.parquet' \
+  --output-store cubes/35MQS_1_0_2026-03-25_2026-04-01.zarr \
+  --layout bands \
+  --crs EPSG:4326 \
+  --source-crs EPSG:4326 \
+  --overwrite
+```
+
+If `--value-columns` is omitted, all numeric non-coordinate, non-time columns
+are written as bands. If `--x-column`, `--y-column`, and `--timestamp-regex` are
+omitted, the converter tries common coordinate names such as `LONGITUDE` /
+`LATITUDE` and extracts a `YYYY-MM-DD` or `YYYYMMDD` date from the source path.
+For point/quadkey Parquet whose lon/lat centroids are all distinct, the
+converter detects the axis explosion and infers a regular target grid from row
+count and coordinate extent before snapping the points. For projected 10 m
+Sentinel-2 output, pass the explicit projected `--crs` plus `--x-resolution 10
+--y-resolution 10`.
+
 ## Current implementation limitations
 
 - composite style detection is limited to common Landsat/Sentinel-like red, green, blue, and near-infrared aliases
 - generic support for arbitrary projected Zarr layouts beyond direct `y/x`,
   `time/y/x`, and banded `time/*/y/x` arrays still needs more work
 
+## Representative cube matrix
+
+`docs/oci-cube-matrix.example.json` defines the secret-free compatibility matrix
+used for live OCI benchmark selection. It tracks representative cube families by
+shape class, Zarr format, consolidation state, CRS authority, chunk/shard layout
+class, expected variables/composites, and expected planner representation by
+zoom band.
+
+The matrix intentionally does not contain OCI namespace, bucket, object path, or
+token values. Each benchmarkable entry names environment variables for local
+private dataset and variable selectors. This lets private deployments bind real
+OCI datasets to the public compatibility matrix without committing sensitive
+storage details.
+
 ## Next recommended steps
 
 1. Run `python3 scripts/oci_browser_smoke.py` against a live OCI dev stack, then
    complete the printed browser checklist for the frontend picker, auto-fit, and
    visible tile preview.
-2. Verify true-color and false-color composite tiles against a live Landsat store.
-3. Verify CRS metadata and direct 3D variables against a live non-Landsat store.
-4. Generalize the adapter layer for more Zarr layouts under `cubes`.
+2. Run `python3 scripts/oci_performance_benchmark.py --output
+   .cache/benchmarks/oci-benchmark.json` against the same stack to capture
+   metadata timing, cold/warm tile timing, cache headers, and planner
+   representation headers.
+3. Verify true-color and false-color composite tiles against a live Landsat store.
+4. Verify CRS metadata and direct 3D variables against a live non-Landsat store.
+5. Generalize the adapter layer for more Zarr layouts under `cubes`.

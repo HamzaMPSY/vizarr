@@ -6,10 +6,12 @@ from app.core.browse_artifacts import browse_manifest_path
 from app.core.browse_artifacts import browse_overview_object_path
 from app.core.browse_artifacts import build_browse_manifest
 from app.core.browse_artifacts import clear_browse_manifest_cache
+from app.core.browse_artifacts import compute_browse_coverage
 from app.core.browse_artifacts import read_browse_manifest
 from app.core.browse_artifacts import write_browse_manifest
 from app.core.dataset_catalog import CatalogEntry
 from app.models.dataset import DatasetMeta
+from app.models.dataset import VariableMeta
 
 
 class _FakeConnector:
@@ -123,3 +125,51 @@ def test_browse_manifest_contains_overview_detects_registered_variable() -> None
 
     assert browse_manifest_contains_overview(manifest, variable="B4", time_index=0, zoom=0) is True
     assert browse_manifest_contains_overview(manifest, variable="B5", time_index=0, zoom=0) is False
+
+
+def test_compute_browse_coverage_reports_partial_manifest_gaps() -> None:
+    settings = SimpleNamespace(browse_tile_max_zoom=2)
+    entry = _entry()
+    entry.meta.variables = [
+        VariableMeta(
+            id="B4",
+            name="B4",
+            unit="DN",
+            time_steps=2,
+            stats={"min": 0.0, "max": 1.0, "p02": 0.0, "p98": 1.0},
+        ),
+        VariableMeta(
+            id="B5",
+            name="B5",
+            unit="DN",
+            time_steps=2,
+            stats={"min": 0.0, "max": 1.0, "p02": 0.0, "p98": 1.0},
+        ),
+    ]
+    manifest = {
+        "last_generated_at": "2026-05-07T10:00:00+00:00",
+        "variables": {
+            "B4": {
+                "overviews": {
+                    "0": {
+                        "levels": {
+                            "0": {"path": "browse/B4-0-z0.npz"},
+                            "1": {"path": "browse/B4-0-z1.npz"},
+                            "2": {"path": "browse/B4-0-z2.npz"},
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    coverage = compute_browse_coverage(settings, entry, manifest)
+
+    assert coverage.expected_zoom_levels == [0, 1, 2]
+    assert coverage.available_zoom_levels == [0, 1, 2]
+    assert coverage.expected_artifact_count == 12
+    assert coverage.available_artifact_count == 3
+    assert coverage.generation_status == "partial"
+    assert coverage.missing_variables == ["B5"]
+    assert coverage.missing_time_steps == {"B4": [1], "B5": [0, 1]}
+    assert coverage.last_generated_at is not None

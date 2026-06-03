@@ -45,3 +45,19 @@ ExportOutputFormat = Literal["zarr", "geotiff", "parquet"]
 class ExportRequest(QueryRequestBase):
     bands: list[str] = Field(min_length=1)
     output_format: ExportOutputFormat = "zarr"
+
+
+class BrowseGenerationRequest(BaseModel):
+    variables: list[str] | None = None
+    time_indices: list[int] | None = None
+    zoom_levels: list[int] | None = None
+    overwrite: bool = False
+    retry_job_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_non_negative_indices(self) -> "BrowseGenerationRequest":
+        if self.time_indices is not None and any(value < 0 for value in self.time_indices):
+            raise ValueError("time_indices must be non-negative")
+        if self.zoom_levels is not None and any(value < 0 for value in self.zoom_levels):
+            raise ValueError("zoom_levels must be non-negative")
+        return self

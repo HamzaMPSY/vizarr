@@ -10,6 +10,7 @@ import oci
 
 from app.config import Settings
 from app.core.oci_auth import OCIAuthContext, OCIAuthExpiredError, get_oci_auth_context
+from app.core.tile_observability import record_object_read
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class OCIObjectStorageConnector:
         return get_oci_auth_context(
             profile_name=self._settings.oci_config_profile,
             config_file=self._settings.oci_config_file,
+            auth_mode=self._settings.oci_auth_mode,
         )
 
     def refresh(self) -> None:
@@ -190,12 +192,12 @@ class OCIObjectStorageConnector:
             )
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
+        record_object_read(bytes_read=len(payload.encode("utf-8")))
         if use_cache:
             with self._text_cache_lock:
                 self._text_cache[resolved] = payload
                 self._text_cache.move_to_end(resolved)
-                while len(self._text_cache) > 256:
-                    self._text_cache.popitem(last=False)
+                self._trim_text_cache_locked()
         return payload
 
     def read_bytes(
@@ -218,14 +220,13 @@ class OCIObjectStorageConnector:
             )
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
+        record_object_read(bytes_read=len(payload))
         if use_cache:
             with self._bytes_cache_lock:
                 self._bytes_cache[resolved] = payload
                 self._bytes_cache.move_to_end(resolved)
                 self._bytes_cache_size += len(payload)
-                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                    _, evicted = self._bytes_cache.popitem(last=False)
-                    self._bytes_cache_size -= len(evicted)
+                self._trim_bytes_cache_locked()
         return payload
 
     def write_bytes(
@@ -330,14 +331,13 @@ class OCIObjectStorageConnector:
             )
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
+        record_object_read(bytes_read=len(payload), byte_range=True)
         if use_cache:
             with self._bytes_cache_lock:
                 self._bytes_cache[cache_key] = payload
                 self._bytes_cache.move_to_end(cache_key)
                 self._bytes_cache_size += len(payload)
-                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                    _, evicted = self._bytes_cache.popitem(last=False)
-                    self._bytes_cache_size -= len(evicted)
+                self._trim_bytes_cache_locked()
         return payload
 
     def read_byte_tail(
@@ -370,15 +370,33 @@ class OCIObjectStorageConnector:
             )
         except Exception as error:
             self._raise_not_found_as_file_error(error, resolved)
+        record_object_read(bytes_read=len(payload), byte_range=True)
         if use_cache:
             with self._bytes_cache_lock:
                 self._bytes_cache[cache_key] = payload
                 self._bytes_cache.move_to_end(cache_key)
                 self._bytes_cache_size += len(payload)
-                while len(self._bytes_cache) > 128 or self._bytes_cache_size > 128 * 1024 * 1024:
-                    _, evicted = self._bytes_cache.popitem(last=False)
-                    self._bytes_cache_size -= len(evicted)
+                self._trim_bytes_cache_locked()
         return payload
+
+    def _trim_text_cache_locked(self) -> None:
+        max_entries = max(int(getattr(self._settings, "oci_text_cache_max_entries", 256)), 0)
+        if max_entries == 0:
+            self._text_cache.clear()
+            return
+        while len(self._text_cache) > max_entries:
+            self._text_cache.popitem(last=False)
+
+    def _trim_bytes_cache_locked(self) -> None:
+        max_entries = max(int(getattr(self._settings, "oci_bytes_cache_max_entries", 128)), 0)
+        max_bytes = max(int(getattr(self._settings, "oci_bytes_cache_max_bytes", 128 * 1024 * 1024)), 0)
+        if max_entries == 0 or max_bytes == 0:
+            self._bytes_cache.clear()
+            self._bytes_cache_size = 0
+            return
+        while len(self._bytes_cache) > max_entries or self._bytes_cache_size > max_bytes:
+            _, evicted = self._bytes_cache.popitem(last=False)
+            self._bytes_cache_size -= len(evicted)
 
     def _object_name_from_path(self, object_path: str) -> str:
         resolved = object_path.removeprefix("oci://").lstrip("/")

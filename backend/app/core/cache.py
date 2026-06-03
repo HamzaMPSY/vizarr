@@ -72,7 +72,18 @@ async def connect_cache(redis_url: str, ttl: int) -> CacheClient:
         return CacheClient(client=None, ttl=ttl)
 
 
-def build_tile_cache_key(parts: dict[str, Any]) -> str:
-    payload = json.dumps(parts, sort_keys=True).encode("utf-8")
+def build_tile_cache_key(parts: dict[str, Any], *, display_range_decimals: int = 3) -> str:
+    normalized_parts = normalize_tile_cache_parts(parts, display_range_decimals=display_range_decimals)
+    payload = json.dumps(normalized_parts, sort_keys=True).encode("utf-8")
     digest = hashlib.sha1(payload).hexdigest()[:20]
     return f"tile:{digest}"
+
+
+def normalize_tile_cache_parts(parts: dict[str, Any], *, display_range_decimals: int = 3) -> dict[str, Any]:
+    normalized = dict(parts)
+    for key in ("vmin", "vmax"):
+        value = normalized.get(key)
+        if isinstance(value, float):
+            rounded = round(value, max(display_range_decimals, 0))
+            normalized[key] = 0.0 if rounded == 0 else rounded
+    return normalized

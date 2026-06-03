@@ -11,6 +11,7 @@ from app.core.dataset_catalog import CatalogEntry
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.tile_observability import observe_tile_time
 from app.core.variable_display import resolve_display_range
 from app.core.zarr_v3 import load_2d_window
 from app.core.zarr_v3 import load_2d_window_decimated
@@ -190,6 +191,67 @@ def _bilinear_sample(data: np.ndarray, y_idx: np.ndarray, x_idx: np.ndarray) -> 
     sampled[non_zero] = (weighted_sum[non_zero] / weight_sum[non_zero]).astype(np.float32)
 
     result[valid] = sampled
+    return result
+
+
+def _axis_edges(center_indices: np.ndarray) -> np.ndarray | None:
+    if center_indices.ndim != 1 or center_indices.size == 0:
+        return None
+    finite = np.isfinite(center_indices)
+    if not np.all(finite):
+        return None
+    if center_indices.size == 1:
+        return np.asarray([center_indices[0] - 0.5, center_indices[0] + 0.5], dtype=np.float64)
+
+    deltas = np.diff(center_indices)
+    if not np.all(deltas > 0):
+        return None
+
+    edges = np.empty(center_indices.size + 1, dtype=np.float64)
+    edges[1:-1] = (center_indices[:-1] + center_indices[1:]) / 2.0
+    edges[0] = center_indices[0] - (deltas[0] / 2.0)
+    edges[-1] = center_indices[-1] + (deltas[-1] / 2.0)
+    return edges
+
+
+def _aggregate_window_to_target_grid(
+    window: np.ndarray,
+    *,
+    x_start: int,
+    y_start: int,
+    x_idx_axis: np.ndarray,
+    y_idx_axis: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    result = np.full((height, width), np.nan, dtype=np.float32)
+    finite = np.isfinite(window)
+    if not np.any(finite):
+        return result
+
+    x_edges = _axis_edges(x_idx_axis)
+    y_edges = _axis_edges(y_idx_axis)
+    if x_edges is None or y_edges is None:
+        return result
+
+    rows, cols = np.where(finite)
+    source_cols = cols + x_start
+    source_rows = rows + y_start
+    target_cols = np.searchsorted(x_edges, source_cols, side="right") - 1
+    target_rows = np.searchsorted(y_edges, source_rows, side="right") - 1
+    valid = (target_cols >= 0) & (target_cols < width) & (target_rows >= 0) & (target_rows < height)
+    if not np.any(valid):
+        return result
+
+    target_cols = target_cols[valid]
+    target_rows = target_rows[valid]
+    values = window[rows[valid], cols[valid]].astype(np.float64, copy=False)
+    sums = np.zeros((height, width), dtype=np.float64)
+    counts = np.zeros((height, width), dtype=np.uint32)
+    np.add.at(sums, (target_rows, target_cols), values)
+    np.add.at(counts, (target_rows, target_cols), 1)
+    populated = counts > 0
+    result[populated] = (sums[populated] / counts[populated]).astype(np.float32)
     return result
 
 
@@ -389,9 +451,10 @@ def encode_rgb_tile(rgb_data: np.ndarray) -> bytes:
     rgba = np.zeros((*rgb_data.shape[:2], 4), dtype=np.uint8)
     rgba[..., :3] = np.nan_to_num(rgb_data, nan=0.0, posinf=255.0, neginf=0.0).astype(np.uint8)
     rgba[..., 3] = np.where(finite_mask, 255, 0).astype(np.uint8)
-    image = Image.fromarray(rgba, mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="WEBP", quality=85)
+    with observe_tile_time("image_encoding"):
+        image = Image.fromarray(rgba, mode="RGBA")
+        buffer = io.BytesIO()
+        image.save(buffer, format="WEBP", quality=85)
     return buffer.getvalue()
 
 
@@ -463,6 +526,61 @@ def sample_web_mercator_array(
     return _bilinear_sample(data=data.astype(np.float32, copy=False), y_idx=y_idx, x_idx=x_idx)
 
 
+def _load_projected_source_window(
+    *,
+    connector: OCIObjectStorageConnector,
+    entry: CatalogEntry,
+    array_name: str,
+    data_array_meta,
+    array_rank: int,
+    band_index: int | None,
+    time_index: int,
+    y_start: int,
+    y_stop: int,
+    x_start: int,
+    x_stop: int,
+    max_parallel_chunk_reads: int | None,
+) -> np.ndarray:
+    if array_rank == 2:
+        return load_2d_window(
+            connector=connector,
+            store_path=entry.path,
+            array_name=array_name,
+            metadata=data_array_meta,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        ).astype(np.float32)
+    if band_index is None:
+        return load_3d_window(
+            connector=connector,
+            store_path=entry.path,
+            array_name=array_name,
+            metadata=data_array_meta,
+            time_index=time_index,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        ).astype(np.float32)
+    return load_4d_window(
+        connector=connector,
+        store_path=entry.path,
+        array_name=array_name,
+        metadata=data_array_meta,
+        time_index=time_index,
+        band_index=band_index,
+        y_start=y_start,
+        y_stop=y_stop,
+        x_start=x_start,
+        x_stop=x_stop,
+        max_parallel_chunk_reads=max_parallel_chunk_reads,
+    ).astype(np.float32)
+
+
 def render_projected_band_array(
     connector: OCIObjectStorageConnector,
     entry: CatalogEntry,
@@ -482,6 +600,8 @@ def render_projected_band_array(
 
     array_rank = len(data_array_meta.shape)
     band_index = entry.band_indices[variable] if array_rank == 4 else None
+    aggregation_x_idx_axis: np.ndarray | None = None
+    aggregation_y_idx_axis: np.ndarray | None = None
     if _is_fast_latlon_entry(entry):
         source_width = int(data_array_meta.shape[-1])
         source_height = int(data_array_meta.shape[-2])
@@ -495,6 +615,8 @@ def render_projected_band_array(
         )
         assert affine_axes is not None
         x_idx_axis, y_idx_axis = affine_axes
+        aggregation_x_idx_axis = x_idx_axis
+        aggregation_y_idx_axis = y_idx_axis
         x_idx_full = np.broadcast_to(x_idx_axis[np.newaxis, :], (height, width))
         y_idx_full = np.broadcast_to(y_idx_axis[:, np.newaxis], (height, width))
         window_bounds = _source_window_bounds_from_axis_indices(
@@ -509,8 +631,6 @@ def render_projected_band_array(
         entry = ensure_catalog_entry_ready(entry, connector)
         x_values = entry.x_values
         y_values = entry.y_values
-        assert x_values is not None
-        assert y_values is not None
         mercator_xs, mercator_ys = _pixel_centers(bbox, width=width, height=height)
         target_crs = CRS.from_wkt(entry.crs_wkt) if entry.crs_wkt else CRS.from_epsg(4326)
         transformer = _transformer_from_mercator(target_crs.to_wkt())
@@ -525,13 +645,17 @@ def render_projected_band_array(
         )
         if affine_indices is not None:
             x_idx_full, y_idx_full = affine_indices
+            source_width = int(data_array_meta.shape[-1])
+            source_height = int(data_array_meta.shape[-2])
             window_bounds = _source_window_bounds_from_indices(
                 x_idx=x_idx_full,
                 y_idx=y_idx_full,
-                width=len(x_values),
-                height=len(y_values),
+                width=source_width,
+                height=source_height,
             )
         else:
+            assert x_values is not None
+            assert y_values is not None
             x_idx_full = y_idx_full = None
             window_bounds = _source_window_bounds(
                 x_values=x_values,
@@ -606,45 +730,20 @@ def render_projected_band_array(
         x_idx = _coordinate_to_fractional_index(sampled_x, x_idx_full)
         y_idx = _coordinate_to_fractional_index(sampled_y, y_idx_full)
     else:
-        if array_rank == 2:
-            window = load_2d_window(
-                connector=connector,
-                store_path=entry.path,
-                array_name=array_name,
-                metadata=data_array_meta,
-                y_start=y_start,
-                y_stop=y_stop,
-                x_start=x_start,
-                x_stop=x_stop,
-                max_parallel_chunk_reads=max_parallel_chunk_reads,
-            ).astype(np.float32)
-        elif band_index is None:
-            window = load_3d_window(
-                connector=connector,
-                store_path=entry.path,
-                array_name=array_name,
-                metadata=data_array_meta,
-                time_index=time_index,
-                y_start=y_start,
-                y_stop=y_stop,
-                x_start=x_start,
-                x_stop=x_stop,
-                max_parallel_chunk_reads=max_parallel_chunk_reads,
-            ).astype(np.float32)
-        else:
-            window = load_4d_window(
-                connector=connector,
-                store_path=entry.path,
-                array_name=array_name,
-                metadata=data_array_meta,
-                time_index=time_index,
-                band_index=band_index,
-                y_start=y_start,
-                y_stop=y_stop,
-                x_start=x_start,
-                x_stop=x_stop,
-                max_parallel_chunk_reads=max_parallel_chunk_reads,
-            ).astype(np.float32)
+        window = _load_projected_source_window(
+            connector=connector,
+            entry=entry,
+            array_name=array_name,
+            data_array_meta=data_array_meta,
+            array_rank=array_rank,
+            band_index=band_index,
+            time_index=time_index,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        )
 
     if x_idx_full is not None and y_idx_full is not None and not use_decimated_window:
         x_idx = x_idx_full - x_start
@@ -659,11 +758,43 @@ def render_projected_band_array(
             local_y_values = y_values[y_start:y_stop]
             x_idx = _coordinate_to_fractional_index(local_x_values, source_xs)
             y_idx = _coordinate_to_fractional_index(local_y_values, source_ys)
-    return _bilinear_sample(
+    sampled = _bilinear_sample(
         data=window,
         y_idx=y_idx,
         x_idx=x_idx,
     )
+    if (
+        use_decimated_window
+        and aggregation_x_idx_axis is not None
+        and aggregation_y_idx_axis is not None
+        and not np.any(np.isfinite(sampled))
+    ):
+        full_window = _load_projected_source_window(
+            connector=connector,
+            entry=entry,
+            array_name=array_name,
+            data_array_meta=data_array_meta,
+            array_rank=array_rank,
+            band_index=band_index,
+            time_index=time_index,
+            y_start=y_start,
+            y_stop=y_stop,
+            x_start=x_start,
+            x_stop=x_stop,
+            max_parallel_chunk_reads=max_parallel_chunk_reads,
+        )
+        aggregated = _aggregate_window_to_target_grid(
+            full_window,
+            x_start=x_start,
+            y_start=y_start,
+            x_idx_axis=aggregation_x_idx_axis,
+            y_idx_axis=aggregation_y_idx_axis,
+            width=width,
+            height=height,
+        )
+        if np.any(np.isfinite(aggregated)):
+            return aggregated
+    return sampled
 
 
 def generate_projected_band_tile(
@@ -677,6 +808,7 @@ def generate_projected_band_tile(
     colormap: str,
     vmin: float | None,
     vmax: float | None,
+    max_parallel_chunk_reads: int | None = None,
 ) -> tuple[bytes, tuple[float, float]]:
     reprojected = render_projected_band_array(
         connector=connector,
@@ -687,6 +819,7 @@ def generate_projected_band_tile(
         height=TILE_SIZE,
         time_index=time_index,
         max_source_oversample=1.0,
+        max_parallel_chunk_reads=max_parallel_chunk_reads,
     )
     actual_vmin, actual_vmax = resolve_projected_display_range(entry, variable, reprojected, vmin, vmax)
     return encode_tile(reprojected, colormap, actual_vmin, actual_vmax), (actual_vmin, actual_vmax)
@@ -702,6 +835,7 @@ def generate_projected_composite_tile(
     time_index: int,
     vmin: float | None,
     vmax: float | None,
+    max_parallel_chunk_reads: int | None = None,
 ) -> tuple[bytes, tuple[float, float]]:
     rgb_data = render_projected_composite_array(
         connector=connector,
@@ -714,6 +848,7 @@ def generate_projected_composite_tile(
         vmin=vmin,
         vmax=vmax,
         max_source_oversample=1.0,
+        max_parallel_chunk_reads=max_parallel_chunk_reads,
     )
     finite = rgb_data[np.isfinite(rgb_data)]
     if finite.size == 0:

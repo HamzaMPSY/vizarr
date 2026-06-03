@@ -19,6 +19,7 @@ def in_dataflow() -> bool:
 class OCIAuthContext:
     config: dict
     signer: object
+    auth_mode: str
     region_code: str | None
     token_expires_at_epoch: int | None = None
 
@@ -50,20 +51,71 @@ def _load_local_oci_config(config_file: str, profile_name: str) -> dict:
         return profile
 
 
-def get_oci_auth_context(profile_name: str, config_file: str | None = None) -> OCIAuthContext:
+def get_oci_auth_context(
+    profile_name: str,
+    config_file: str | None = None,
+    auth_mode: str = "auto",
+) -> OCIAuthContext:
     all_regions = {v: k for k, v in regions.REGIONS_SHORT_NAMES.items()}
+    normalized_mode = (auth_mode or "auto").strip().lower().replace("-", "_")
 
-    if in_dataflow():
+    if normalized_mode not in {"auto", "security_token", "api_key", "resource_principal", "instance_principal"}:
+        raise ValueError(
+            "OCI_AUTH_MODE must be one of auto, security_token, api_key, "
+            "resource_principal, or instance_principal"
+        )
+
+    if normalized_mode in {"auto", "resource_principal"} and in_dataflow():
         signer = signers.get_resource_principals_signer()
         region_name = os.environ.get("OCI_RESOURCE_PRINCIPAL_REGION", "")
         return OCIAuthContext(
             config={},
             signer=signer,
+            auth_mode="resource_principal",
+            region_code=all_regions.get(region_name),
+        )
+
+    if normalized_mode == "resource_principal":
+        signer = signers.get_resource_principals_signer()
+        region_name = os.environ.get("OCI_RESOURCE_PRINCIPAL_REGION", "")
+        return OCIAuthContext(
+            config={},
+            signer=signer,
+            auth_mode="resource_principal",
+            region_code=all_regions.get(region_name),
+        )
+
+    if normalized_mode == "instance_principal":
+        signer = signers.InstancePrincipalsSecurityTokenSigner()
+        region_name = getattr(signer, "region", None)
+        return OCIAuthContext(
+            config={"region": region_name} if region_name else {},
+            signer=signer,
+            auth_mode="instance_principal",
             region_code=all_regions.get(region_name),
         )
 
     resolved_config_file = config_file or os.environ.get("OCI_CONFIG_FILE") or oci.config.DEFAULT_LOCATION
     oci_config = _load_local_oci_config(config_file=resolved_config_file, profile_name=profile_name)
+
+    if normalized_mode == "api_key" or (normalized_mode == "auto" and not oci_config.get("security_token_file")):
+        oci.config.validate_config(oci_config)
+        return OCIAuthContext(
+            config=oci_config,
+            signer=oci.signer.Signer(
+                tenancy=oci_config["tenancy"],
+                user=oci_config["user"],
+                fingerprint=oci_config["fingerprint"],
+                private_key_file_location=os.path.expanduser(oci_config["key_file"]),
+                pass_phrase=oci_config.get("pass_phrase"),
+            ),
+            auth_mode="api_key",
+            region_code=all_regions.get(oci_config.get("region")),
+        )
+
+    if normalized_mode == "security_token" and not oci_config.get("security_token_file"):
+        raise oci.exceptions.InvalidConfig("OCI security_token auth requires security_token_file in the profile")
+
     token_path = os.path.expanduser(oci_config["security_token_file"])
     with open(token_path, "r", encoding="utf-8") as handle:
         token = handle.read()
@@ -78,6 +130,7 @@ def get_oci_auth_context(profile_name: str, config_file: str | None = None) -> O
     return OCIAuthContext(
         config=oci_config,
         signer=signer,
+        auth_mode="security_token",
         region_code=all_regions.get(oci_config.get("region")),
         token_expires_at_epoch=token_expires_at_epoch,
     )

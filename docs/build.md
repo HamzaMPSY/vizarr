@@ -37,16 +37,43 @@ Then fill:
 ```bash
 OCI_CONFIG_PROFILE=prof
 OCI_CONFIG_FILE=/home/app/.oci/config
+OCI_AUTH_MODE=auto
 OCI_NAMESPACE=<object-storage-namespace>
 OCI_BUCKET=<bucket-name>
 OCI_PREFIX=<prefix-or-zarr-store>
 ```
 
-Refresh local OCI session auth before starting the backend:
+`OCI_AUTH_MODE=auto` supports:
+
+- `security_token` profiles created by `oci session authenticate`;
+- normal API-key profiles with `user`, `fingerprint`, and `key_file`;
+- `resource_principal` in supported OCI runtimes;
+- explicit `instance_principal` on OCI compute instances.
+
+For autonomous runs, prefer `OCI_AUTH_MODE=api_key`,
+`OCI_AUTH_MODE=instance_principal`, or `OCI_AUTH_MODE=resource_principal`.
+Session-token auth is useful for local development but it is not autonomous.
+
+Refresh local OCI session auth before starting the backend when using
+`OCI_AUTH_MODE=security_token` or a session-token profile in `auto` mode:
 
 ```bash
 oci session authenticate --profile-name prof
 ```
+
+You can keep an already-authenticated local session alive while OCI still allows
+refresh by running:
+
+```bash
+python3 scripts/oci_session_watchdog.py \
+  --profile-name prof \
+  --config-file ~/.oci/config \
+  --loop
+```
+
+This watchdog does not bypass OCI browser authentication. If the token is
+already expired or OCI refuses refresh, it prints the interactive
+`oci session authenticate ...` command that must be run by a user.
 
 The tracked examples intentionally do not include AWS access keys, GCS service
 account paths, or live bucket names.
@@ -239,6 +266,91 @@ Complete the visual browser pass with the checklist printed by the script:
 - confirm the map auto-fits the dataset footprint;
 - confirm the visible map raster layer or sidebar tile preview is populated.
 
+## OCI performance benchmark
+
+Use the benchmark harness when the dev stack is running in OCI mode and you need
+repeatable cold/warm timing for real object-storage-backed cubes:
+
+```bash
+python3 scripts/oci_performance_benchmark.py \
+  --api-url http://localhost:8001/api \
+  --frontend-url http://localhost:5173 \
+  --tile-radius 1 \
+  --output .cache/benchmarks/oci-benchmark.json
+```
+
+The command verifies health, dataset discovery, variables, serving profile,
+TileJSON, a center viewport tile set, a repeated warm tile pass, and the
+frontend HTML shell. It records tile latency plus `X-Cache-Status`,
+`X-Representation`, `X-Execution-Path`, and `X-Browse-Source` for every tile.
+When `TILE_DEBUG_HEADERS_ENABLED=true` is set on the backend, it also records
+tile timing and object I/O diagnostics such as object GET counts, byte-range GET
+counts, approximate bytes read, shard index reads, and Zarr chunk reads.
+
+It exits successfully with `SKIP:` when the running stack has no OCI-backed
+dataset metadata or when OCI auth is unavailable. It does not store OCI
+namespace, bucket, profile, token, or dataset secrets.
+
+Optional budget gates make the command fail when performance or routing drifts:
+
+```bash
+python3 scripts/oci_performance_benchmark.py \
+  --metadata-p95-budget-ms 750 \
+  --cold-tile-p95-budget-ms 2500 \
+  --warm-tile-p95-budget-ms 250 \
+  --expected-representation browse
+```
+
+Use `--forbid-serving` for zoom bands that should be covered by browse or
+pyramid artifacts. Use the browser rendering probe when Playwright is available
+in the environment:
+
+```bash
+PLAYWRIGHT_MODULE=playwright \
+python3 scripts/oci_performance_benchmark.py \
+  --playwright-command 'node scripts/browser_multiscale_probe.cjs {frontend_url}'
+```
+
+The probe reads `.map-shell` data attributes such as `data-render-mode`,
+`data-browser-native-mode`, `data-browser-gpu-status`, selected
+dataset/variable/time/zoom, and the pixel/chunk/byte budget counters, then
+prints JSON containing `renderMode` as `browser-gpu`, `browser-native`, or
+`server-tiles`.
+
+For a local mocked GPU-path check that does not require OCI credentials:
+
+```bash
+VIZARR_BROWSER_PROBE_SCENARIO=browser-gpu \
+VIZARR_EXPECTED_FRONTEND_RENDER_MODE=browser-gpu \
+node scripts/browser_multiscale_probe.cjs http://localhost:5173
+```
+
+Use the pan/zoom smoke option after prefetch changes:
+
+```bash
+VIZARR_BROWSER_PROBE_INTERACTION=pan-zoom \
+node scripts/browser_multiscale_probe.cjs http://localhost:5173
+```
+
+The frontend prefetch planner also has a dependency-free node test that runs in
+the frontend container:
+
+```bash
+podman exec vizarr_frontend_1 node scripts/tile_prefetch_planner_test.mjs
+```
+
+For repeatable coverage across cube families, use the secret-free matrix in
+`docs/oci-cube-matrix.example.json` and provide local private selectors through
+the environment variables named by that matrix:
+
+```bash
+VIZARR_MATRIX_EPSG4326_SHARDED_DATASET_ID=<local-dataset-id> \
+VIZARR_MATRIX_EPSG4326_SHARDED_VARIABLE=NDVI \
+python3 scripts/oci_performance_benchmark.py \
+  --matrix docs/oci-cube-matrix.example.json \
+  --matrix-entry epsg4326-sharded-time-band-yx
+```
+
 ## Data preparation guidance
 
 The current OCI implementation supports projected multiband Zarr v3 stores and
@@ -270,4 +382,6 @@ bytes through Redis and serve object data directly from OCI. Horizontal backend
 scaling is possible if every replica has the same OCI auth and Redis settings.
 
 External Dask scheduling is not wired into the checked-in request path. Treat it
-as future architecture until implemented.
+as future architecture until implemented. Direct source tile renders are
+currently bounded with per-request chunk concurrency and optional object/chunk
+read budgets.

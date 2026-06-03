@@ -61,7 +61,7 @@ export function useDatasetInvalidation() {
       });
     };
 
-    connect();
+    reconnectTimer = window.setTimeout(connect, 0);
 
     return () => {
       closedByEffect = true;

@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from threading import Thread
+from typing import Callable
 
 import numpy as np
 
@@ -376,6 +377,7 @@ def build_and_store_browse_overviews(
     zoom_levels: list[int] | None = None,
     overwrite: bool = False,
     max_zoom_override: int | None = None,
+    progress_callback: Callable[[bool], None] | None = None,
 ) -> dict[str, object]:
     manifest = read_browse_manifest(connector, settings, entry, use_cache=False) or build_browse_manifest(
         settings,
@@ -411,6 +413,8 @@ def build_and_store_browse_overviews(
                         zoom,
                     )
                     reused += 1
+                    if progress_callback is not None:
+                        progress_callback(False)
                     levels_payload.setdefault(str(zoom), {"path": object_path})
                     if base_overview is None:
                         base_overview = _materialize_overview_level(
@@ -481,6 +485,8 @@ def build_and_store_browse_overviews(
                     "zoom": zoom,
                 }
                 generated += 1
+                if progress_callback is not None:
+                    progress_callback(True)
 
             if levels_payload:
                 overview_payload["levels"] = levels_payload

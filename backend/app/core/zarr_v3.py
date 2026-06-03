@@ -1,12 +1,17 @@
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 import json
+from contextvars import copy_context
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import numpy as np
 import numcodecs
 
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.tile_observability import record_zarr_chunk_read
+from app.core.tile_observability import record_zarr_shard_index_read
 from app.core.zarr_reader import read_store_json
 
 
@@ -26,6 +31,16 @@ _DTYPE_MAP = {
 
 _UINT64_MAX = (1 << 64) - 1
 _MAX_PARALLEL_CHUNK_READS = 8
+_DEFAULT_SHARD_INDEX_CACHE_ENTRIES = 4096
+_DEFAULT_SHARD_INDEX_CACHE_BYTES = 64 * 1024 * 1024
+_SHARD_INDEX_CACHE: OrderedDict[tuple[object, ...], tuple[np.ndarray, int]] = OrderedDict()
+_SHARD_INDEX_CACHE_SIZE = 0
+_SHARD_INDEX_CACHE_LOCK = RLock()
+
+
+def _executor_map_with_context(executor: ThreadPoolExecutor, function, items):
+    contexts_and_items = [(copy_context(), item) for item in items]
+    return executor.map(lambda item: item[0].run(function, item[1]), contexts_and_items)
 
 
 @dataclass(frozen=True)
@@ -160,7 +175,7 @@ def load_1d_numeric_array(
         return np.frombuffer(decoded, dtype=metadata.dtype, count=expected_count).copy()
 
     with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, chunk_count)) as executor:
-        values = list(executor.map(read_chunk, range(chunk_count)))
+        values = list(_executor_map_with_context(executor, read_chunk, range(chunk_count)))
 
     return np.concatenate(values, axis=0)
 
@@ -255,7 +270,7 @@ def load_2d_window(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
         chunk_y_start = y_chunk_index * chunk_y
@@ -350,7 +365,7 @@ def load_2d_window_decimated(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
         row_samples = y_samples_by_chunk[y_chunk_index]
@@ -417,7 +432,7 @@ def load_3d_window(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
         chunk_y_start = y_chunk_index * chunk_y
@@ -517,7 +532,7 @@ def load_3d_window_decimated(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
         row_samples = y_samples_by_chunk[y_chunk_index]
@@ -585,7 +600,7 @@ def load_4d_window(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
 
@@ -688,7 +703,7 @@ def load_4d_window_decimated(
             len(chunk_positions),
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            loaded_chunks = list(executor.map(_load_chunk, chunk_positions))
+            loaded_chunks = list(_executor_map_with_context(executor, _load_chunk, chunk_positions))
 
     for y_chunk_index, x_chunk_index, chunk in loaded_chunks:
         row_samples = y_samples_by_chunk[y_chunk_index]
@@ -915,7 +930,7 @@ def estimate_4d_nonempty_pixel_bounds(
         shard_results = [_load_nonempty_chunks(position) for position in shard_positions]
     else:
         with ThreadPoolExecutor(max_workers=min(_MAX_PARALLEL_CHUNK_READS, len(shard_positions))) as executor:
-            shard_results = list(executor.map(_load_nonempty_chunks, shard_positions))
+            shard_results = list(_executor_map_with_context(executor, _load_nonempty_chunks, shard_positions))
 
     nonempty_chunks = [item for group in shard_results for item in group]
     if not nonempty_chunks:
@@ -1038,6 +1053,7 @@ def _read_chunk_bytes(
             return None
         raise
 
+    record_zarr_chunk_read()
     return _decode_bytes(payload, codecs)
 
 
@@ -1125,6 +1141,7 @@ def _read_sharded_chunk_bytes(
                 end=offset + length,
                 use_cache=True,
             )
+            record_zarr_chunk_read()
             return _decode_bytes(payload, sharding.codecs)
         except (FileNotFoundError, ValueError) as exc:
             last_error = exc
@@ -1148,6 +1165,19 @@ def _read_shard_index(
     chunks_per_shard = _chunks_per_shard(shard_shape=shard_shape, inner_chunk_shape=inner_chunk_shape)
     encoded_index_size = _shard_index_encoded_size(chunks_per_shard, index_codecs)
     resolved = connector.build_oci_uri(object_path).removeprefix("oci://")
+    cache_key = _shard_index_cache_key(
+        connector=connector,
+        resolved=resolved,
+        shard_shape=shard_shape,
+        inner_chunk_shape=inner_chunk_shape,
+        index_codecs=index_codecs,
+        index_location=index_location,
+        encoded_index_size=encoded_index_size,
+    )
+    cached = _get_cached_shard_index(connector, cache_key)
+    if cached is not None:
+        return cached
+
     if index_location == "start":
         payload = connector.read_byte_range(resolved, start=0, end=encoded_index_size, use_cache=True)
     elif index_location == "end":
@@ -1155,6 +1185,7 @@ def _read_shard_index(
     else:
         raise ValueError(f"Unsupported Zarr v3 sharding index_location: {index_location}")
 
+    record_zarr_shard_index_read()
     decoded = _decode_bytes(payload, index_codecs)
     expected_entries = int(np.prod(chunks_per_shard))
     index = np.frombuffer(decoded, dtype="<u8")
@@ -1162,7 +1193,79 @@ def _read_shard_index(
         raise ValueError(
             f"Unexpected shard index size: {index.size} uint64 values, expected {expected_entries * 2}"
         )
-    return index.reshape(chunks_per_shard + (2,))
+    reshaped = index.reshape(chunks_per_shard + (2,))
+    _put_cached_shard_index(connector, cache_key, reshaped)
+    return reshaped
+
+
+def clear_zarr_shard_index_cache() -> None:
+    global _SHARD_INDEX_CACHE_SIZE
+    with _SHARD_INDEX_CACHE_LOCK:
+        _SHARD_INDEX_CACHE.clear()
+        _SHARD_INDEX_CACHE_SIZE = 0
+
+
+def _shard_index_cache_key(
+    *,
+    connector: OCIObjectStorageConnector,
+    resolved: str,
+    shard_shape: tuple[int, ...],
+    inner_chunk_shape: tuple[int, ...],
+    index_codecs: list[dict[str, Any]],
+    index_location: str,
+    encoded_index_size: int,
+) -> tuple[object, ...]:
+    return (
+        id(connector),
+        resolved,
+        shard_shape,
+        inner_chunk_shape,
+        json.dumps(index_codecs, sort_keys=True, separators=(",", ":")),
+        index_location,
+        encoded_index_size,
+    )
+
+
+def _get_cached_shard_index(
+    connector: OCIObjectStorageConnector,
+    cache_key: tuple[object, ...],
+) -> np.ndarray | None:
+    max_entries, max_bytes = _shard_index_cache_limits(connector)
+    if max_entries <= 0 or max_bytes <= 0:
+        return None
+    with _SHARD_INDEX_CACHE_LOCK:
+        cached = _SHARD_INDEX_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        _SHARD_INDEX_CACHE.move_to_end(cache_key)
+        return cached[0]
+
+
+def _put_cached_shard_index(
+    connector: OCIObjectStorageConnector,
+    cache_key: tuple[object, ...],
+    index: np.ndarray,
+) -> None:
+    global _SHARD_INDEX_CACHE_SIZE
+    max_entries, max_bytes = _shard_index_cache_limits(connector)
+    if max_entries <= 0 or max_bytes <= 0 or index.nbytes > max_bytes:
+        return
+    with _SHARD_INDEX_CACHE_LOCK:
+        existing = _SHARD_INDEX_CACHE.pop(cache_key, None)
+        if existing is not None:
+            _SHARD_INDEX_CACHE_SIZE -= existing[1]
+        _SHARD_INDEX_CACHE[cache_key] = (index, index.nbytes)
+        _SHARD_INDEX_CACHE_SIZE += index.nbytes
+        while len(_SHARD_INDEX_CACHE) > max_entries or _SHARD_INDEX_CACHE_SIZE > max_bytes:
+            _, (_, evicted_size) = _SHARD_INDEX_CACHE.popitem(last=False)
+            _SHARD_INDEX_CACHE_SIZE -= evicted_size
+
+
+def _shard_index_cache_limits(connector: OCIObjectStorageConnector) -> tuple[int, int]:
+    settings = getattr(connector, "_settings", None)
+    entries = getattr(settings, "zarr_shard_index_cache_entries", _DEFAULT_SHARD_INDEX_CACHE_ENTRIES)
+    bytes_limit = getattr(settings, "zarr_shard_index_cache_bytes", _DEFAULT_SHARD_INDEX_CACHE_BYTES)
+    return max(int(entries), 0), max(int(bytes_limit), 0)
 
 
 def _resolve_shard_chunk_position(

@@ -732,14 +732,17 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             )
             time_node = metadata.get("time")
             if isinstance(time_node, dict):
-                time_meta = parse_array_metadata(time_node)
-                time_values = load_1d_numeric_array(
-                    connector=connector,
-                    store_path=entry.path,
-                    array_name="time",
-                    metadata=time_meta,
-                )
-                entry.meta.time_values = _time_labels_from_values(time_values, time_node.get("attributes", {}))
+                try:
+                    time_meta = parse_array_metadata(time_node)
+                    time_values = load_1d_numeric_array(
+                        connector=connector,
+                        store_path=entry.path,
+                        array_name="time",
+                        metadata=time_meta,
+                    )
+                    entry.meta.time_values = _time_labels_from_values(time_values, time_node.get("attributes", {}))
+                except Exception as exc:
+                    logger.warning("Skipping time coordinate preload for %s: %s", store_path, exc)
 
     return catalog
 

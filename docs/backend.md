@@ -108,10 +108,27 @@ Important settings:
 
 | Setting | Role |
 |---|---|
+| `APP_ENVIRONMENT` | `development` by default; `production` enables API-key auth even when `AUTH_ENABLED=false` |
+| `AUTH_ENABLED` | Explicitly require API-key auth for protected routes |
+| `AUTH_API_KEYS` | Comma-separated API keys; use `key=dataset_id_a\|dataset_id_b` for dataset-scoped access |
 | `STORAGE_BACKEND` | `synthetic` or `oci_zarr` |
 | `REDIS_URL` | Redis connection string |
 | `TILE_CACHE_TTL` | Redis tile byte TTL in seconds |
-| `OCI_CONFIG_PROFILE` | OCI CLI profile for local session auth |
+| `TILE_CACHE_DISPLAY_RANGE_DECIMALS` | Decimal places used when normalizing `vmin`/`vmax` in tile cache keys |
+| `TILE_CACHE_CUSTOM_RANGE_ENABLED` | When `false`, skip backend cache writes for explicit `vmin`/`vmax` tile requests |
+| `DIRECT_TILE_MAX_PARALLEL_CHUNK_READS` | Maximum parallel source Zarr chunk reads per direct tile render; `0` uses the lower-level default |
+| `DIRECT_TILE_MAX_OBJECT_GETS` | Direct tile object-read budget; `0` disables this limit |
+| `DIRECT_TILE_MAX_BYTE_RANGE_GETS` | Direct tile byte-range read budget; `0` disables this limit |
+| `DIRECT_TILE_MAX_OBJECT_BYTES` | Direct tile byte budget; `0` disables this limit |
+| `DIRECT_TILE_MAX_ZARR_CHUNKS` | Direct tile Zarr chunk-read budget; `0` disables this limit |
+| `DIRECT_TILE_MAX_SHARD_INDEX_READS` | Direct tile shard-index read budget; `0` disables this limit |
+| `OCI_TEXT_CACHE_MAX_ENTRIES` | In-process LRU entry limit for reusable small text/JSON object reads |
+| `OCI_BYTES_CACHE_MAX_ENTRIES` | In-process LRU entry limit for reusable byte object, range, and tail reads |
+| `OCI_BYTES_CACHE_MAX_BYTES` | In-process byte cache size cap across full-object and range/tail reads |
+| `ZARR_SHARD_INDEX_CACHE_ENTRIES` | Decoded Zarr v3 shard-index LRU entry limit |
+| `ZARR_SHARD_INDEX_CACHE_BYTES` | Decoded Zarr v3 shard-index memory cap |
+| `OCI_AUTH_MODE` | `auto`, `security_token`, `api_key`, `resource_principal`, or `instance_principal` |
+| `OCI_CONFIG_PROFILE` | OCI config profile for local security-token or API-key auth |
 | `OCI_CONFIG_FILE` | Mounted OCI config path |
 | `OCI_NAMESPACE` | Object Storage namespace |
 | `OCI_BUCKET` | Object Storage bucket |
@@ -121,8 +138,50 @@ Important settings:
 | `OCI_MULTISCALE_PREFIX_ROOT` | Multiscale artifact root |
 | `BROWSE_PREWARM_ENABLED` | Startup browse/catalog warming toggle |
 
-The canonical local OCI flow uses OCI session/profile auth from `~/.oci`. The
-tracked examples do not use AWS access keys or generic object-store credentials.
+The canonical local OCI flow can use OCI session/profile auth from `~/.oci`, but
+that profile is intentionally temporary and requires browser authentication when
+it cannot be refreshed. For unattended access, use one of the non-interactive
+OCI modes:
+
+- `OCI_AUTH_MODE=api_key` with a normal OCI API-key profile;
+- `OCI_AUTH_MODE=instance_principal` on an OCI compute instance with dynamic
+  group policy;
+- `OCI_AUTH_MODE=resource_principal` in supported OCI runtimes.
+
+`OCI_AUTH_MODE=auto` uses resource principals in Data Flow/resource-principal
+environments, otherwise reads the configured local profile and chooses API-key
+auth when the profile has no `security_token_file`, or security-token auth when
+it does.
+
+## End-user auth
+
+Vizarr has a minimal API-key gate for deployable environments. Auth is disabled
+for local development unless `AUTH_ENABLED=true`. It is automatically required
+when `APP_ENVIRONMENT=production`.
+
+Protected HTTP routes accept either:
+
+- `Authorization: Bearer <key>`;
+- `X-API-Key: <key>`;
+- `api_key=<key>` query parameter for browser-owned tile requests.
+
+The `/ws/datasets` WebSocket accepts the same header forms or `api_key=<key>`.
+`/api/healthz` remains public for health checks.
+
+`AUTH_API_KEYS` supports two key shapes:
+
+- `global-key` grants access to all datasets plus global/debug routes such as
+  `/api/storage/*`, `/api/query/*`, and `/api/exports/*`;
+- `scoped-key=dataset_a|dataset_b` grants only those dataset routes and filters
+  dataset-list and WebSocket invalidation payloads to the allowed dataset ids.
+
+Dataset-scoped keys also gate read-only Zarr proxy routes. Both source
+`/api/zarr/{dataset_id}/...` and browser multiscale
+`/api/zarr/multiscale/{dataset_id}/...` requests are denied when the key does
+not include the route dataset id.
+
+This is intentionally a first production gate, not a full identity system.
+OIDC/JWT, per-user roles, and persistent tenant policy remain future work.
 
 ## API route surface
 
@@ -186,6 +245,19 @@ Response:
 - `X-Request-Class`, `X-Execution-Path`, and `X-Representation`;
 - optional `X-Browse-Source` when served from browse artifacts.
 
+When `TILE_DEBUG_HEADERS_ENABLED=true`, the response also includes sanitized
+diagnostics such as `X-Tile-Time-Ms`, `X-Tile-Render-Ms`,
+`X-Tile-Encode-Ms`, `X-Object-Get-Count`, `X-Object-Bytes-Read`, and
+`X-Zarr-Chunk-Count`. Direct source renders also include
+`X-Tile-Budget-Status` and, when a limit is exceeded, the budget metric, limit,
+and actual value. These are disabled by default and mirror the structured
+`tile_request_metrics` backend log payload.
+
+When a direct source render exceeds a configured budget, the endpoint returns
+HTTP `503` with a `direct_tile_compute_budget_exceeded` JSON detail instead of
+caching or returning the tile. Browse and prebuilt pyramid hits do not consume
+the direct tile budget.
+
 ## Dataset metadata
 
 `DatasetMeta` includes `variables` for scalar/band rendering and
@@ -234,6 +306,22 @@ store URI. Empty paths return `400`; missing root `zarr.json` documents return
 
 Those names line up with the documented public app API above.
 
+Serving-profile `seamless_rendering_gaps` use the compatibility vocabulary in
+[compatibility.md](compatibility.md), so clients can explain whether a cube is
+blocked by missing CRS metadata, unsupported dimension order, missing browse
+overviews, or missing browser-readable multiscale data.
+
+For generated multiscale stores, the serving profile also exposes normalized
+level descriptors in `multiscale_levels`. Each descriptor includes the level
+path, optional browse zoom, level bounds, shape, chunk shape, dtype,
+compressor/filter/order fields, dimension separator, browser-readable status,
+browser-GPU compatibility status, and per-level gaps. `browser_gpu_ready` is a
+separate readiness flag for the planned deck.gl path; it is stricter than
+`browser_multiscale_ready` because it requires consolidated Zarr v2 metadata,
+per-level bounds, browse zoom mapping, and GPU-compatible chunk layout. When it
+is false, `browser_gpu_reason` and `browser_gpu_gaps` provide the exact fallback
+cause for UI debug state and browser probes.
+
 ## Dependencies
 
 The backend uses FastAPI, Pydantic settings, Xarray, NumPy, Pillow, Redis,
@@ -241,4 +329,5 @@ OCI/ocifs/fsspec libraries, and test utilities from `requirements.txt`.
 
 Dask is present as a dependency and remains part of the broader data-processing
 toolbox, but the checked-in request path does not start a Dask scheduler or
-worker cluster.
+worker cluster. Current tile work is in-process, with bounded per-request source
+chunk concurrency and optional direct tile read budgets.

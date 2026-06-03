@@ -19,6 +19,7 @@ interface MapState {
   colormap: string;
   vmin: number | null;
   vmax: number | null;
+  countryBordersEnabled: boolean;
   viewState: MapViewState;
   setDataset: (datasetId: string) => void;
   setVariable: (variable: string) => void;
@@ -28,6 +29,7 @@ interface MapState {
   setColormap: (colormap: string) => void;
   setRange: (vmin: number | null, vmax: number | null) => void;
   setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
+  setCountryBordersEnabled: (enabled: boolean) => void;
   setViewState: (viewState: MapViewState) => void;
 }
 
@@ -40,6 +42,7 @@ export const useMapStore = create<MapState>((set) => ({
   colormap: "viridis",
   vmin: null,
   vmax: null,
+  countryBordersEnabled: false,
   viewState: {
     longitude: 0,
     latitude: 20,
@@ -71,5 +74,6 @@ export const useMapStore = create<MapState>((set) => ({
       }
       return { vmin, vmax };
     }),
+  setCountryBordersEnabled: (countryBordersEnabled) => set({ countryBordersEnabled }),
   setViewState: (viewState) => set({ viewState })
 }));

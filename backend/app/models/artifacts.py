@@ -30,3 +30,34 @@ class ExportStatusResponse(BaseModel):
     request_fingerprint: str
     output_path: str | None = None
     error_message: str | None = None
+
+
+class BrowseGenerationAcceptedResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    result_type: Literal["browse_generation"] = "browse_generation"
+    dataset_id: str
+    progress: float
+    total_artifacts: int
+    completed_artifacts: int
+    can_retry: bool = False
+
+
+class BrowseGenerationStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    job_type: str
+    dataset_id: str
+    progress: float
+    total_artifacts: int
+    completed_artifacts: int
+    generated_artifacts: int
+    reused_artifacts: int
+    variables: list[str]
+    time_indices: list[int]
+    zoom_levels: list[int]
+    manifest_path: str | None = None
+    error_message: str | None = None
+    attempt: int
+    retry_of_job_id: str | None = None
+    can_retry: bool

@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "description": "Secret-free representative OCI Zarr cube compatibility matrix. Keep real namespace, bucket, object paths, and tokens in local env/private config only.",
+  "entries": [
+    {
+      "id": "projected-multiband-time-band-yx",
+      "description": "Projected multiband imagery with time, band, y, and x dimensions.",
+      "shape_class": "time/band/y/x",
+      "zarr_format": 3,
+      "consolidated": true,
+      "crs_authority": "EPSG:32629",
+      "chunk_layout": {
+        "sharded": false,
+        "shard_shape_class": "[1, 1, 512, 512]",
+        "inner_chunk_shape_class": null
+      },
+      "expected_variables": ["red", "green", "blue", "nir"],
+      "expected_composites": ["true-color", "false-color"],
+      "expected_representations_by_zoom": {
+        "low": "browse",
+        "mid": "pyramid",
+        "high": "serving"
+      },
+      "benchmark": {
+        "dataset_id_env": "VIZARR_MATRIX_PROJECTED_MULTIBAND_DATASET_ID",
+        "variable_env": "VIZARR_MATRIX_PROJECTED_MULTIBAND_VARIABLE",
+        "expected_representation": "browse",
+        "forbid_serving": true
+      }
+    },
+    {
+      "id": "projected-direct-time-yx",
+      "description": "Projected single-variable cube with time, y, and x dimensions.",
+      "shape_class": "time/y/x",
+      "zarr_format": 3,
+      "consolidated": true,
+      "crs_authority": "EPSG:32629",
+      "chunk_layout": {
+        "sharded": false,
+        "shard_shape_class": "[1, 512, 512]",
+        "inner_chunk_shape_class": null
+      },
+      "expected_variables": ["ndvi"],
+      "expected_composites": [],
+      "expected_representations_by_zoom": {
+        "low": "browse",
+        "mid": "pyramid",
+        "high": "serving"
+      },
+      "benchmark": {
+        "dataset_id_env": "VIZARR_MATRIX_PROJECTED_DIRECT_3D_DATASET_ID",
+        "variable_env": "VIZARR_MATRIX_PROJECTED_DIRECT_3D_VARIABLE",
+        "expected_representation": "browse",
+        "forbid_serving": true
+      }
+    },
+    {
+      "id": "projected-static-yx",
+      "description": "Projected static single-time raster with y and x dimensions.",
+      "shape_class": "y/x",
+      "zarr_format": 3,
+      "consolidated": true,
+      "crs_authority": "EPSG:32629",
+      "chunk_layout": {
+        "sharded": false,
+        "shard_shape_class": "[512, 512]",
+        "inner_chunk_shape_class": null
+      },
+      "expected_variables": ["elevation"],
+      "expected_composites": [],
+      "expected_representations_by_zoom": {
+        "low": "browse",
+        "mid": "serving",
+        "high": "serving"
+      },
+      "benchmark": {
+        "dataset_id_env": "VIZARR_MATRIX_PROJECTED_STATIC_2D_DATASET_ID",
+        "variable_env": "VIZARR_MATRIX_PROJECTED_STATIC_2D_VARIABLE",
+        "expected_representation": "browse",
+        "forbid_serving": true
+      }
+    },
+    {
+      "id": "epsg4326-sharded-time-band-yx",
+      "description": "EPSG:4326 sharded time/band/y/x cube intended for browse and multiscale artifact validation.",
+      "shape_class": "time/band/y/x",
+      "zarr_format": 3,
+      "consolidated": true,
+      "crs_authority": "EPSG:4326",
+      "chunk_layout": {
+        "sharded": true,
+        "shard_shape_class": "[1, 1, 4096, 4096]",
+        "inner_chunk_shape_class": "[1, 1, 256, 256]"
+      },
+      "expected_variables": ["ndvi"],
+      "expected_composites": [],
+      "expected_representations_by_zoom": {
+        "low": "browse",
+        "mid": "pyramid",
+        "high": "serving"
+      },
+      "benchmark": {
+        "dataset_id_env": "VIZARR_MATRIX_EPSG4326_SHARDED_DATASET_ID",
+        "variable_env": "VIZARR_MATRIX_EPSG4326_SHARDED_VARIABLE",
+        "expected_representation": "browse",
+        "forbid_serving": true
+      }
+    },
+    {
+      "id": "unsupported-row-column-layout",
+      "description": "Negative fixture class: spatial axes use unsupported row/column dimension names.",
+      "shape_class": "time/band/row/column",
+      "zarr_format": 3,
+      "consolidated": true,
+      "crs_authority": "EPSG:32629",
+      "chunk_layout": {
+        "sharded": false,
+        "shard_shape_class": "[1, 1, 512, 512]",
+        "inner_chunk_shape_class": null
+      },
+      "expected_variables": [],
+      "expected_composites": [],
+      "expected_representations_by_zoom": {},
+      "expected_diagnostic": "unsupported-layout"
+    }
+  ]
+}

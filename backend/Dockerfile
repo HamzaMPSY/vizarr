@@ -19,6 +19,9 @@ ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
+    gdal-bin \
+    libgdal-dev \
+    libopenjp2-7 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

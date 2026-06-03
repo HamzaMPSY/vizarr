@@ -8,6 +8,7 @@ import xarray as xr
 from app.tools.parquet_to_zarr import ConversionConfig
 from app.tools.parquet_to_zarr import ExistingStoreContext
 from app.tools.parquet_to_zarr import _build_ingest_summary
+from app.tools.parquet_to_zarr import _derive_output_store
 from app.tools.parquet_to_zarr import _build_input_time_slices
 from app.tools.parquet_to_zarr import _build_regular_axis
 from app.tools.parquet_to_zarr import _build_to_zarr_kwargs
@@ -18,12 +19,16 @@ from app.tools.parquet_to_zarr import _detect_value_columns
 from app.tools.parquet_to_zarr import _encode_value_column
 from app.tools.parquet_to_zarr import _extract_existing_value_columns
 from app.tools.parquet_to_zarr import _extract_timestamps
+from app.tools.parquet_to_zarr import _infer_regular_grid_from_distribution
 from app.tools.parquet_to_zarr import _initial_read_columns
 from app.tools.parquet_to_zarr import _is_transient_read_error
+from app.tools.parquet_to_zarr import _load_parquet_inputs
+from app.tools.parquet_to_zarr import _normalize_source_oci_uri
 from app.tools.parquet_to_zarr import _read_table_with_retries
 from app.tools.parquet_to_zarr import _grid_dataset
 from app.tools.parquet_to_zarr import _minimum_positive_step
 from app.tools.parquet_to_zarr import _prepare_spatial_frame
+from app.tools.parquet_to_zarr import _resolve_coordinate_columns
 from app.tools.parquet_to_zarr import _resolve_point_preserving_resolutions
 from app.tools.parquet_to_zarr import _resolve_snap_origins
 from app.tools.parquet_to_zarr import _resolve_target_grid
@@ -34,6 +39,98 @@ from app.tools.parquet_to_zarr import _slice_frame_for_timestamp
 from app.tools.parquet_to_zarr import _validate_storage_layout
 from app.tools.parquet_to_zarr import _validate_append_frames_fit_existing_grid
 from app.tools.parquet_to_zarr import _validate_expected_columns_against_existing
+
+
+class DummyConnector:
+    namespace = "destns"
+
+    def build_oci_uri(self, object_path: str) -> str:
+        return f"oci://destbucket@destns/{object_path.lstrip('/')}"
+
+
+def test_normalize_source_oci_uri_uses_source_bucket_for_relative_prefix() -> None:
+    uri = _normalize_source_oci_uri(
+        "partition/date/tile.parquet",
+        DummyConnector(),
+        source_bucket="sourcebucket",
+        source_namespace=None,
+    )
+
+    assert uri == "oci://sourcebucket@destns/partition/date/tile.parquet"
+
+
+def test_normalize_source_oci_uri_preserves_explicit_oci_uri() -> None:
+    uri = _normalize_source_oci_uri(
+        "oci://other@namespace/path/tile.parquet",
+        DummyConnector(),
+        source_bucket="sourcebucket",
+        source_namespace="destns",
+    )
+
+    assert uri == "oci://other@namespace/path/tile.parquet"
+
+
+def test_normalize_source_oci_uri_keeps_legacy_destination_bucket_default() -> None:
+    uri = _normalize_source_oci_uri(
+        "/legacy/path/tile.parquet",
+        DummyConnector(),
+        source_bucket=None,
+        source_namespace=None,
+    )
+
+    assert uri == "oci://destbucket@destns/legacy/path/tile.parquet"
+
+
+def test_load_parquet_inputs_combines_links_file_and_direct_prefixes(tmp_path) -> None:
+    links = tmp_path / "links.txt"
+    links.write_text("# ignored\nfrom-file.parquet\n\n", encoding="utf-8")
+
+    inputs = _load_parquet_inputs(
+        links_file=str(links),
+        parquet_prefixes=["from-arg.parquet"],
+    )
+
+    assert inputs == ["from-file.parquet", "from-arg.parquet"]
+
+
+def test_derive_output_store_uses_single_parquet_name() -> None:
+    output = _derive_output_store(
+        [
+            "20260401/hash/35MQS_1_0_2026-03-25_2026-04-01.parquet",
+        ]
+    )
+
+    assert output == "cubes/35MQS_1_0_2026-03-25_2026-04-01.zarr"
+
+
+def test_resolve_coordinate_columns_infers_common_lon_lat_names() -> None:
+    frame = pd.DataFrame(
+        {
+            "LONGITUDE": [10.0],
+            "LATITUDE": [20.0],
+            "B04": [0.1],
+        }
+    )
+    config = ConversionConfig(
+        x_column=None,
+        y_column=None,
+        value_columns=None,
+        layout="bands",
+        timestamp_column=None,
+        timestamp_regex=None,
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs=None,
+        max_grid_cells=1_000,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+    )
+
+    assert _resolve_coordinate_columns(frame, config) == ("LONGITUDE", "LATITUDE")
 
 
 def test_regular_step_detects_even_spacing() -> None:
@@ -61,8 +158,11 @@ def test_detect_value_columns_skips_coordinate_and_partition_fields() -> None:
         {
             "x": [0.0],
             "y": [1.0],
-            "year": [2025],
+            "YEAR": [2025],
             "month": [12],
+            "QUADKEY": ["123"],
+            "START_DATE": pd.to_datetime(["2026-03-25"]),
+            "END_DATE": pd.to_datetime(["2026-04-01"]),
             "signal": [4.0],
         }
     )
@@ -85,6 +185,81 @@ def test_detect_value_columns_skips_coordinate_and_partition_fields() -> None:
         string_cell_aggregation="first",
     )
     assert _detect_value_columns(frame, config) == ("signal",)
+
+
+def test_infer_regular_grid_from_point_distribution_handles_unique_centroids() -> None:
+    rows = []
+    for row in range(4):
+        for col in range(4):
+            rows.append(
+                {
+                    "LONGITUDE": col + row * 0.001,
+                    "LATITUDE": row + col * 0.001,
+                }
+            )
+    parquet_uri = "oci://bucket@namespace/points.parquet"
+    config = ConversionConfig(
+        x_column="LONGITUDE",
+        y_column="LATITUDE",
+        value_columns=("B04",),
+        layout="bands",
+        timestamp_column=None,
+        timestamp_regex=None,
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs="EPSG:4326",
+        max_grid_cells=8,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+        source_crs="EPSG:4326",
+    )
+
+    inferred = _infer_regular_grid_from_distribution(
+        coordinate_frames={parquet_uri: pd.DataFrame(rows)},
+        parquet_uris=[parquet_uri],
+        config=config,
+    )
+
+    assert inferred is not None
+    assert inferred.width == 4
+    assert inferred.height == 4
+    assert inferred.x_resolution == pytest.approx(1.001)
+    assert inferred.y_resolution == pytest.approx(1.001)
+
+
+def test_detect_value_columns_includes_decimal_object_bands() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0],
+            "y": [1.0],
+            "B04": pd.Series([Decimal("0.25")], dtype=object),
+            "LABEL": ["cloud"],
+        }
+    )
+    config = ConversionConfig(
+        x_column="x",
+        y_column="y",
+        value_columns=None,
+        layout="bands",
+        timestamp_column=None,
+        timestamp_regex=r"ts=(\d{4}-\d{2}-\d{2})",
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs=None,
+        max_grid_cells=1_000,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+    )
+
+    assert _detect_value_columns(frame, config) == ("B04",)
 
 
 def test_coerce_numeric_series_accepts_decimal_objects() -> None:
@@ -217,6 +392,35 @@ def test_extract_timestamps_returns_multiple_sorted_values_from_column() -> None
         np.datetime64("2025-01-15T00:00:00.000000000"),
         np.datetime64("2025-01-22T00:00:00.000000000"),
     ]
+
+
+def test_extract_timestamps_infers_sentinel_date_from_path_without_regex() -> None:
+    config = ConversionConfig(
+        x_column="x",
+        y_column="y",
+        value_columns=("B04",),
+        layout="bands",
+        timestamp_column=None,
+        timestamp_regex=None,
+        x_dim="x",
+        y_dim="y",
+        y_descending=True,
+        dtype="float32",
+        crs=None,
+        max_grid_cells=1_000,
+        x_resolution=None,
+        y_resolution=None,
+        cell_aggregation="mean",
+        string_cell_aggregation="first",
+    )
+
+    timestamps = _extract_timestamps(
+        pd.DataFrame({"x": [0], "y": [0], "B04": [1]}),
+        "oci://bucket@namespace/20260401/hash/35MQS_1_0_2026-03-25_2026-04-01.parquet",
+        config,
+    )
+
+    assert timestamps == [np.datetime64("2026-03-25T00:00:00.000000000")]
 
 
 def test_slice_frame_for_timestamp_filters_single_time_slice() -> None:

@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 import xarray as xr
 from fastapi import FastAPI
+from fastapi import HTTPException
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -12,6 +13,7 @@ from app.api.websockets import router as websocket_router
 from app.core.browse_tiles import prewarm_browse_overviews
 from app.core.browse_tiles import start_background_browse_prewarm
 from app.config import get_settings
+from app.core.auth import authenticate_http_request
 from app.core.cache import CacheClient
 from app.core.cache import connect_cache
 from app.core.dataset_catalog import has_direct_store_target
@@ -23,6 +25,7 @@ from app.core.oci_auth import OCIAuthExpiredError
 from app.core.zarr_reader import open_oci_zarr_dataset
 from app.index.catalog_store import build_index_records
 from app.index.planner_index import PlannerIndex
+from app.services.browse_jobs import BrowseGenerationJobStore
 from app.services.export_jobs import ExportJobStore
 from app.services.planner import PlannerService
 
@@ -34,6 +37,7 @@ async def lifespan(app: FastAPI):
     app.state.planner_index = PlannerIndex()
     app.state.planner = PlannerService(settings, app.state.planner_index)
     app.state.export_job_store = ExportJobStore()
+    app.state.browse_generation_job_store = BrowseGenerationJobStore()
     app.state.storage_connector = None
     app.state.dataset_catalog = None
     app.state.dataset_manifest = None
@@ -111,12 +115,23 @@ async def handle_oci_auth_expired(_request: Request, exc: OCIAuthExpiredError) -
     )
 
 
+@app.middleware("http")
+async def require_api_auth(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        try:
+            authenticate_http_request(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+    return await call_next(request)
+
+
 app.include_router(api_router, prefix="/api")
 app.include_router(websocket_router)
 app.state.settings = settings
 app.state.planner_index = PlannerIndex()
 app.state.planner = PlannerService(settings, app.state.planner_index)
 app.state.export_job_store = ExportJobStore()
+app.state.browse_generation_job_store = BrowseGenerationJobStore()
 app.state.storage_connector = None
 app.state.dataset_catalog = None
 app.state.dataset_manifest = None

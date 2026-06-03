@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 
 import { buildTileUrl } from "../api/endpoints";
-import { useColormaps, useDatasets, useVariables } from "../hooks/useDatasets";
+import { useColormaps, useDatasets, useServingProfile, useVariables } from "../hooks/useDatasets";
 import { useMapStore } from "../store/mapStore";
 
 export function Sidebar() {
@@ -15,15 +15,18 @@ export function Sidebar() {
     colormap,
     vmin,
     vmax,
+    countryBordersEnabled,
     setDataset,
     setVariable,
     setRenderMode,
     setCompositeStyle,
     setTimeIndex,
-    setColormap
+    setColormap,
+    setCountryBordersEnabled
   } = useMapStore();
   const { data: variables, isLoading: variablesLoading } = useVariables(datasetId);
   const { data: colormaps } = useColormaps();
+  const { data: servingProfile } = useServingProfile(datasetId);
 
   const selectedDataset = useMemo(
     () => datasets?.find((item) => item.id === datasetId) ?? null,
@@ -57,6 +60,13 @@ export function Sidebar() {
     selectedDataset?.time_values && timeIndex >= 0 && timeIndex < selectedDataset.time_values.length
       ? selectedDataset.time_values[timeIndex]
       : null;
+  const browseCoverage = servingProfile?.browse_coverage ?? null;
+  const browseStatus = browseCoverage?.generation_status ?? "missing";
+  const browseNeedsAttention =
+    browseCoverage !== null && (browseStatus === "missing" || browseStatus === "partial" || browseStatus === "failed");
+  const browseCoverageLabel = browseCoverage
+    ? `${browseCoverage.available_artifact_count}/${browseCoverage.expected_artifact_count} artifacts`
+    : "not reported";
 
   return (
     <aside className="sidebar">
@@ -186,6 +196,19 @@ export function Sidebar() {
         ) : null}
       </section>
 
+      <section className="panel">
+        <label className="checkbox-row" htmlFor="country-borders">
+          <input
+            id="country-borders"
+            type="checkbox"
+            checked={countryBordersEnabled}
+            onChange={(event) => setCountryBordersEnabled(event.target.checked)}
+          />
+          <span>Country borders</span>
+        </label>
+        <p className="muted">Natural Earth Admin-0 boundary lines rendered above the raster layer.</p>
+      </section>
+
       <section className="panel panel--status">
         <p className="eyebrow">POC Status</p>
         <ul>
@@ -194,7 +217,13 @@ export function Sidebar() {
           <li>Redis cache: optional</li>
           <li>Cloud Zarr access: live</li>
           <li>RGB composites: {compositeStyles.length > 0 ? "available" : "not advertised"}</li>
+          <li>Browse artifacts: {browseCoverage ? `${browseStatus} (${browseCoverageLabel})` : "not reported"}</li>
         </ul>
+        {browseNeedsAttention ? (
+          <p className="status-note">
+            Browse coverage is {browseStatus}; first-view tiles may fall back to direct serving.
+          </p>
+        ) : null}
       </section>
 
       {debugTileUrl ? (

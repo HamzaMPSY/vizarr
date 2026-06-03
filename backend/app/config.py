@@ -5,10 +5,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Vizarr POC API"
+    app_environment: str = "development"
     app_port: int = 8000
+    auth_enabled: bool = False
+    auth_api_keys: str = ""
     use_synthetic_data: bool = True
     redis_url: str = "redis://localhost:6379/0"
     tile_cache_ttl: int = 3600
+    tile_cache_display_range_decimals: int = 3
+    tile_cache_custom_range_enabled: bool = True
+    direct_tile_max_parallel_chunk_reads: int = 8
+    direct_tile_max_object_gets: int = 0
+    direct_tile_max_byte_range_gets: int = 0
+    direct_tile_max_object_bytes: int = 0
+    direct_tile_max_zarr_chunks: int = 0
+    direct_tile_max_shard_index_reads: int = 0
+    oci_text_cache_max_entries: int = 256
+    oci_bytes_cache_max_entries: int = 128
+    oci_bytes_cache_max_bytes: int = 134217728
+    zarr_shard_index_cache_entries: int = 4096
+    zarr_shard_index_cache_bytes: int = 67108864
     colormap_default: str = "viridis"
     planner_version: str = "v1"
     browse_enabled_styles: str = "ndvi-default,rgb-default"
@@ -26,6 +42,7 @@ class Settings(BaseSettings):
     default_dataset_id: str = "demo-global"
     default_time_index: int = 0
     storage_backend: str = "synthetic"
+    oci_auth_mode: str = "auto"
     oci_config_profile: str = "prof"
     oci_config_file: str = "/home/app/.oci/config"
     oci_namespace: str = ""
@@ -38,6 +55,7 @@ class Settings(BaseSettings):
     oci_dataset_description: str = ""
     oci_zarr_path: str = ""
     oci_zarr_consolidated: bool = True
+    tile_debug_headers_enabled: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

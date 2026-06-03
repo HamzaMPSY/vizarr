@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import oci
 
 from app.core.oci_object_storage import OCIObjectStorageConnector
+from app.core.tile_observability import TileRequestMetrics
+from app.core.tile_observability import activate_tile_metrics
 
 
 class _FakeFilesystem:
@@ -77,6 +79,16 @@ class _FakeClient:
             )
         )
 
+    def get_object(
+        self,
+        *,
+        namespace_name: str,
+        bucket_name: str,
+        object_name: str,
+        range: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(data=SimpleNamespace(content=f"tail:{object_name}:{range}".encode("utf-8")))
+
 
 def _service_error(status: int, code: str = "NotAuthenticated") -> oci.exceptions.ServiceError:
     return oci.exceptions.ServiceError(
@@ -126,6 +138,26 @@ def test_read_bytes_uses_connector_cache() -> None:
     assert first == b"payload:bucket@namespace/chunk"
     assert second == first
     assert filesystem.calls == ["bucket@namespace/chunk"]
+
+
+def test_connector_counts_only_successful_uncached_reads_in_active_tile_context() -> None:
+    connector = _connector()
+    metrics = TileRequestMetrics()
+
+    with activate_tile_metrics(metrics):
+        connector.read_text("bucket/path.json", use_cache=True)
+        connector.read_text("bucket/path.json", use_cache=True)
+        connector.read_bytes("bucket/chunk", use_cache=True)
+        connector.read_bytes("bucket/chunk", use_cache=True)
+        connector.read_byte_range("bucket/chunk", start=1, end=4, use_cache=True)
+        connector.read_byte_range("bucket/chunk", start=1, end=4, use_cache=True)
+        connector.read_byte_tail("bucket/tail", length=5, use_cache=True)
+        connector.read_byte_tail("bucket/tail", length=5, use_cache=True)
+
+    snapshot = metrics.snapshot()
+    assert snapshot["object_get_count"] == 4
+    assert snapshot["byte_range_get_count"] == 2
+    assert snapshot["object_bytes_read"] > 0
 
 
 def test_write_bytes_evicts_cached_reads_and_writes_to_object_storage() -> None:
