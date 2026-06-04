@@ -37,6 +37,28 @@ class CompositeStyle(BaseModel):
     bands: list[str]
 
 
+class LayoutValidationIssue(BaseModel):
+    code: str
+    message: str
+    remediation: str
+
+
+class LayoutValidation(BaseModel):
+    adapter_name: str | None = None
+    adapter_priority: int | None = None
+    accepted: bool = False
+    data_array_name: str | None = None
+    band_array_name: str | None = None
+    variable_array_names: dict[str, str] = Field(default_factory=dict)
+    matched_dimensions: list[str] = Field(default_factory=list)
+    accepted_dimensions: list[str] = Field(default_factory=list)
+    required_metadata: list[str] = Field(default_factory=list)
+    crs_transform_conventions: list[str] = Field(default_factory=list)
+    tile_capabilities: list[str] = Field(default_factory=list)
+    readback_capabilities: list[str] = Field(default_factory=list)
+    issues: list[LayoutValidationIssue] = Field(default_factory=list)
+
+
 class DatasetMeta(BaseModel):
     id: str
     name: str
@@ -58,6 +80,7 @@ class DatasetMeta(BaseModel):
     multiscale_population_strategy: str | None = None
     multiscale_prepopulated_zoom_max: int | None = None
     multiscale_max_zoom: int | None = None
+    layout_validation: LayoutValidation | None = None
 
 
 class ChunkLayout(BaseModel):
@@ -118,6 +141,7 @@ class DatasetServingProfile(BaseModel):
     browse_overview_max_zoom: int | None = None
     browse_coverage: BrowseCoverage
     chunk_layout: ChunkLayout | None = None
+    layout_validation: LayoutValidation | None = None
     supported_rendering_modes: list[str]
     browser_multiscale_ready: bool
     browser_gpu_ready: bool = False

@@ -4,8 +4,29 @@ import { buildPrefetchPlan } from "../lib/tilePrefetchPlanner";
 import type { TilePrefetchBudget, TilePrefetchPlan, TilePrefetchPlanInput } from "../lib/tilePrefetchPlanner";
 import type { MapViewState } from "../store/mapStore";
 
+export type TilePrefetchDiagnosticSource =
+  | "viewport-prefetch"
+  | "adjacent-time-prefetch"
+  | "maplibre"
+  | "browser-gpu";
+
+export interface TilePrefetchDiagnostic {
+  source: TilePrefetchDiagnosticSource;
+  path: string;
+  z: string | null;
+  x: string | null;
+  y: string | null;
+  status: number | null;
+  ok: boolean;
+  errorMessage: string | null;
+  headers: Record<string, string>;
+  recordedAt: number;
+}
+
 interface UseTilePrefetchOptions {
   tileTemplate: string | null;
+  adjacentTimeTileTemplate?: string | null;
+  adjacentTimePrefetchEnabled?: boolean;
   viewState: MapViewState;
   minZoom: number | null;
   maxZoom: number | null;
@@ -13,7 +34,9 @@ interface UseTilePrefetchOptions {
   vmin: number | null;
   vmax: number | null;
   setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
+  onTileDiagnostic?: (diagnostic: TilePrefetchDiagnostic) => void;
   radius?: number;
+  adjacentTimeRadius?: number;
 }
 
 interface NavigatorWithPrefetchSignals extends Navigator {
@@ -40,6 +63,8 @@ const REDUCED_PREFETCH_BUDGET: TilePrefetchBudget = {
 
 export function useTilePrefetch({
   tileTemplate,
+  adjacentTimeTileTemplate = null,
+  adjacentTimePrefetchEnabled = false,
   viewState,
   minZoom,
   maxZoom,
@@ -47,7 +72,9 @@ export function useTilePrefetch({
   vmin,
   vmax,
   setRangeFromTileHeaders,
-  radius = 2
+  onTileDiagnostic,
+  radius = 2,
+  adjacentTimeRadius = 1
 }: UseTilePrefetchOptions): void {
   const previousViewStateRef = useRef<MapViewState | null>(null);
 
@@ -87,6 +114,8 @@ export function useTilePrefetch({
           signal: abortController.signal,
           shouldSeedRange: vmin === null && vmax === null,
           setRangeFromTileHeaders,
+          source: "viewport-prefetch",
+          onTileDiagnostic,
           maxInflightRequests: budget.maxInflightRequests
         }).catch((error) => {
           if (!abortController.signal.aborted) {
@@ -124,6 +153,7 @@ export function useTilePrefetch({
     minZoom,
     radius,
     setRangeFromTileHeaders,
+    onTileDiagnostic,
     tileTemplate,
     viewState.latitude,
     viewState.longitude,
@@ -133,6 +163,70 @@ export function useTilePrefetch({
     vmin,
     vmax
   ]);
+
+  useEffect(() => {
+    if (!enabled || !adjacentTimePrefetchEnabled || !adjacentTimeTileTemplate) {
+      return;
+    }
+
+    const abortController = new AbortController();
+    const baseBudget = getPrefetchBudget();
+    const budget: TilePrefetchBudget = {
+      maxInflightRequests: 1,
+      maxQueuedTiles: Math.min(baseBudget.maxQueuedTiles, 8)
+    };
+    const input: TilePrefetchPlanInput = {
+      tileTemplate: adjacentTimeTileTemplate,
+      viewState,
+      previousViewState: null,
+      minZoom,
+      maxZoom,
+      radius: adjacentTimeRadius,
+      budget
+    };
+
+    const idleTask = scheduleIdleTask(() => {
+      if (abortController.signal.aborted) {
+        return;
+      }
+      const plan = buildPrefetchPlan(input);
+      if (plan.urls.length === 0) {
+        return;
+      }
+      void prefetchUrls({
+        urls: plan.urls,
+        signal: abortController.signal,
+        shouldSeedRange: false,
+        setRangeFromTileHeaders,
+        source: "adjacent-time-prefetch",
+        onTileDiagnostic,
+        maxInflightRequests: budget.maxInflightRequests
+      }).catch((error) => {
+        if (!abortController.signal.aborted) {
+          console.debug("Adjacent time prefetch failed", error);
+        }
+      });
+    });
+
+    return () => {
+      abortController.abort();
+      idleTask.cancel();
+    };
+  }, [
+    adjacentTimePrefetchEnabled,
+    adjacentTimeRadius,
+    adjacentTimeTileTemplate,
+    enabled,
+    maxZoom,
+    minZoom,
+    onTileDiagnostic,
+    setRangeFromTileHeaders,
+    viewState.latitude,
+    viewState.longitude,
+    viewState.pitch,
+    viewState.bearing,
+    viewState.zoom
+  ]);
 }
 
 async function prefetchUrls({
@@ -140,12 +234,16 @@ async function prefetchUrls({
   signal,
   shouldSeedRange,
   setRangeFromTileHeaders,
+  source,
+  onTileDiagnostic,
   maxInflightRequests
 }: {
   urls: string[];
   signal: AbortSignal;
   shouldSeedRange: boolean;
   setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
+  source: TilePrefetchDiagnosticSource;
+  onTileDiagnostic?: (diagnostic: TilePrefetchDiagnostic) => void;
   maxInflightRequests: number;
 }): Promise<void> {
   const cache = "caches" in window ? await window.caches.open("vizarr-prefetch-tiles") : null;
@@ -164,6 +262,8 @@ async function prefetchUrls({
         signal,
         cache,
         shouldSeedRange: shouldSeedRange && index === 0,
+        source,
+        onTileDiagnostic,
         setRangeFromTileHeaders
       });
     }
@@ -177,12 +277,16 @@ async function prefetchUrl({
   signal,
   cache,
   shouldSeedRange,
+  source,
+  onTileDiagnostic,
   setRangeFromTileHeaders
 }: {
   url: string;
   signal: AbortSignal;
   cache: Cache | null;
   shouldSeedRange: boolean;
+  source: TilePrefetchDiagnosticSource;
+  onTileDiagnostic?: (diagnostic: TilePrefetchDiagnostic) => void;
   setRangeFromTileHeaders: (vmin: number, vmax: number) => void;
 }): Promise<void> {
   if (signal.aborted) {
@@ -196,6 +300,7 @@ async function prefetchUrl({
 
   try {
     const response = await fetch(request);
+    onTileDiagnostic?.(await buildTileDiagnostic(url, response, source));
     if (!response.ok) {
       return;
     }
@@ -207,9 +312,129 @@ async function prefetchUrl({
     }
   } catch (error) {
     if (!signal.aborted) {
+      onTileDiagnostic?.(buildNetworkTileDiagnostic(url, error, source));
       console.debug("Tile prefetch failed", error);
     }
   }
+}
+
+async function buildTileDiagnostic(
+  url: string,
+  response: Response,
+  source: TilePrefetchDiagnosticSource
+): Promise<TilePrefetchDiagnostic> {
+  const parsed = parseTileUrl(url);
+  return {
+    source,
+    ...parsed,
+    status: response.status,
+    ok: response.ok,
+    errorMessage: response.ok ? null : await readErrorMessage(response),
+    headers: pickDiagnosticHeaders(response.headers),
+    recordedAt: Date.now()
+  };
+}
+
+function buildNetworkTileDiagnostic(
+  url: string,
+  error: unknown,
+  source: TilePrefetchDiagnosticSource
+): TilePrefetchDiagnostic {
+  const parsed = parseTileUrl(url);
+  return {
+    source,
+    ...parsed,
+    status: null,
+    ok: false,
+    errorMessage: error instanceof Error ? error.message : "Tile request failed",
+    headers: {},
+    recordedAt: Date.now()
+  };
+}
+
+function parseTileUrl(url: string): Pick<TilePrefetchDiagnostic, "path" | "z" | "x" | "y"> {
+  const parsed = new URL(url, window.location.origin);
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  const y = parts.length >= 1 ? parts[parts.length - 1] : null;
+  const x = parts.length >= 2 ? parts[parts.length - 2] : null;
+  const z = parts.length >= 3 ? parts[parts.length - 3] : null;
+  return {
+    path: parsed.pathname,
+    z,
+    x,
+    y
+  };
+}
+
+function pickDiagnosticHeaders(headers: Headers): Record<string, string> {
+  const names = [
+    "X-Cache-Status",
+    "X-Request-Class",
+    "X-Execution-Path",
+    "X-Representation",
+    "X-Planned-Representation",
+    "X-Request-Coalescing",
+    "X-Tile-Empty",
+    "X-Tile-Time-Ms",
+    "X-Tile-Planner-Ms",
+    "X-Tile-Cache-Lookup-Ms",
+    "X-Tile-Coalescing-Ms",
+    "X-Tile-Catalog-Ms",
+    "X-Tile-Render-Ms",
+    "X-Tile-Encode-Ms",
+    "X-Object-Get-Count",
+    "X-Object-Byte-Range-Get-Count",
+    "X-Object-Bytes-Read",
+    "X-Zarr-Shard-Index-Reads",
+    "X-Zarr-Chunk-Count",
+    "X-Tile-Budget-Status",
+    "X-Tile-Budget-Reason",
+    "X-Tile-Budget-Metric",
+    "X-Tile-Budget-Limit",
+    "X-Tile-Budget-Actual",
+    "X-Data-Vmin",
+    "X-Data-Vmax"
+  ];
+  const picked: Record<string, string> = {};
+  for (const name of names) {
+    const value = headers.get(name);
+    if (value !== null && value !== "") {
+      picked[name] = value;
+    }
+  }
+  return picked;
+}
+
+async function readErrorMessage(response: Response): Promise<string | null> {
+  const contentType = response.headers.get("content-type") ?? "";
+  try {
+    if (contentType.includes("application/json")) {
+      const payload = await response.clone().json() as unknown;
+      return errorPayloadToMessage(payload);
+    }
+    const text = await response.clone().text();
+    return text.trim().slice(0, 240) || null;
+  } catch {
+    return null;
+  }
+}
+
+function errorPayloadToMessage(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const detail = (payload as { detail?: unknown }).detail;
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (detail && typeof detail === "object") {
+    const fields = detail as Record<string, unknown>;
+    return [fields.error, fields.reason, fields.metric, fields.actual, fields.limit]
+      .filter((item) => item !== undefined && item !== null && item !== "")
+      .join(" ")
+      .slice(0, 240);
+  }
+  return JSON.stringify(payload).slice(0, 240);
 }
 
 function seedRangeFromHeaders(response: Response, setRangeFromTileHeaders: (vmin: number, vmax: number) => void): void {

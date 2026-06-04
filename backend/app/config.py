@@ -7,11 +7,28 @@ class Settings(BaseSettings):
     app_name: str = "Vizarr POC API"
     app_environment: str = "development"
     app_port: int = 8000
+    cors_allowed_origins: str = ""
+    cors_allowed_methods: str = "GET,POST,HEAD,OPTIONS"
+    cors_allowed_headers: str = "Authorization,X-API-Key,Content-Type,Range,If-None-Match,If-Modified-Since"
+    cors_exposed_headers: str = (
+        "Accept-Ranges,Content-Range,ETag,X-Cache-Status,X-Request-Class,"
+        "X-Execution-Path,X-Representation,X-Planned-Representation,"
+        "X-Request-Coalescing,X-Tile-Empty,X-Tile-Time-Ms,X-Tile-Planner-Ms,"
+        "X-Tile-Cache-Lookup-Ms,X-Tile-Coalescing-Ms,X-Tile-Catalog-Ms,"
+        "X-Tile-Render-Ms,X-Tile-Encode-Ms,X-Object-Get-Count,"
+        "X-Object-Byte-Range-Get-Count,X-Object-Bytes-Read,"
+        "X-Zarr-Shard-Index-Reads,X-Zarr-Chunk-Count,X-Tile-Budget-Status,"
+        "X-Tile-Budget-Reason,X-Tile-Budget-Metric,X-Tile-Budget-Limit,"
+        "X-Tile-Budget-Actual,X-Data-Vmin,X-Data-Vmax"
+    )
     auth_enabled: bool = False
     auth_api_keys: str = ""
+    api_key_rate_limit_per_minute: int = 0
+    api_key_rate_limit_window_seconds: int = 60
     use_synthetic_data: bool = True
     redis_url: str = "redis://localhost:6379/0"
     tile_cache_ttl: int = 3600
+    job_store_ttl: int = 86_400
     tile_cache_display_range_decimals: int = 3
     tile_cache_custom_range_enabled: bool = True
     direct_tile_max_parallel_chunk_reads: int = 8

@@ -1,8 +1,12 @@
 import json
 import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from io import BytesIO
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from PIL import Image
 from starlette.concurrency import run_in_threadpool
 
 from app.core.browse_tiles import BrowseTileResult
@@ -23,11 +27,21 @@ from app.core.tile_observability import activate_tile_metrics
 from app.core.tile_observability import build_tile_debug_headers
 from app.core.tile_observability import enforce_tile_compute_budget
 from app.core.tile_generator import generate_tile
+from app.index.spatial_index import tile_intersects_bounds
 from app.core.variable_display import resolve_display_range
 
 
 router = APIRouter(prefix="/tiles", tags=["tiles"])
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RenderedTile:
+    body: bytes
+    vmin: float
+    vmax: float
+    representation: str
+    browse_source: str | None = None
 
 
 @router.get("/{dataset_id}/{variable}/{z}/{x}/{y}")
@@ -42,6 +56,7 @@ async def get_tile(
     colormap: str = Query(default="viridis"),
     vmin: float | None = None,
     vmax: float | None = None,
+    cache_version: str | None = None,
 ) -> Response:
     metrics = TileRequestMetrics()
     with activate_tile_metrics(metrics):
@@ -56,6 +71,7 @@ async def get_tile(
             colormap=colormap,
             vmin=vmin,
             vmax=vmax,
+            cache_version=cache_version,
             metrics=metrics,
         )
 
@@ -71,12 +87,14 @@ async def _get_tile_impl(
     colormap: str = Query(default="viridis"),
     vmin: float | None = None,
     vmax: float | None = None,
+    cache_version: str | None = None,
     metrics: TileRequestMetrics | None = None,
 ) -> Response:
     if metrics is None:
         metrics = TileRequestMetrics()
     settings = request.app.state.settings
     planner = request.app.state.planner
+    effective_cache_version = cache_version or await request.app.state.cache.get_dataset_version(dataset_id)
     direct_tile_max_parallel_chunk_reads = _direct_tile_max_parallel_chunk_reads(settings)
     with metrics.time_block("planner"):
         tile_plan = planner.plan_tile_request(
@@ -109,13 +127,26 @@ async def _get_tile_impl(
         is_composite = composite_band_ids is not None
         if variable not in entry.band_indices and not is_composite:
             raise HTTPException(status_code=404, detail="Variable not found")
+        planned_representation = "serving" if is_composite else tile_plan.chosen_representation
+        if not tile_intersects_bounds(entry.meta.bounds, z, x, y):
+            return _empty_tile_response(
+                settings=settings,
+                metrics=metrics,
+                dataset_id=dataset_id,
+                variable=variable,
+                z=z,
+                x=x,
+                y=y,
+                request_class=tile_plan.request_class,
+                execution_path=tile_plan.execution_path,
+                planned_representation=planned_representation,
+            )
         if tile_plan.chosen_representation == "browse" and not is_composite:
             try:
                 with metrics.time_block("catalog_metadata"):
                     await run_in_threadpool(ensure_catalog_entry_ready, entry, request.app.state.storage_connector)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-        planned_representation = "serving" if is_composite else tile_plan.chosen_representation
 
         cache_key = _build_tile_cache_key(
             settings,
@@ -133,6 +164,7 @@ async def _get_tile_impl(
                 "render_mode": "composite" if is_composite else "band",
                 "composite_bands": composite_band_ids,
                 "planner_version": settings.planner_version,
+                "cache_version": effective_cache_version,
             },
             vmin=vmin,
             vmax=vmax,
@@ -171,140 +203,161 @@ async def _get_tile_impl(
                 },
             )
 
-        if is_composite:
-            tile_generator = generate_projected_composite_tile
-            tile_args = (
-                request.app.state.storage_connector,
-                entry,
-                variable,
-                z,
-                x,
-                y,
-                time_index,
-                vmin,
-                vmax,
-                direct_tile_max_parallel_chunk_reads,
-            )
-        else:
-            tile_generator = generate_projected_band_tile
-            tile_args = (
-                request.app.state.storage_connector,
-                entry,
-                variable,
-                z,
-                x,
-                y,
-                time_index,
-                colormap,
-                vmin,
-                vmax,
-                direct_tile_max_parallel_chunk_reads,
-            )
-        actual_representation = tile_plan.chosen_representation
-        browse_source: str | None = None
-        if is_composite:
-            actual_representation = "serving"
-            with metrics.time_block("representation_generation"):
-                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
-        elif tile_plan.chosen_representation == "browse":
-            try:
-                with metrics.time_block("representation_generation"):
-                    browse_result = await run_in_threadpool(
-                        generate_browse_tile,
-                        settings,
-                        request.app.state.storage_connector,
-                        entry,
-                        variable,
-                        z,
-                        x,
-                        y,
-                        time_index,
-                        colormap,
-                        vmin,
-                        vmax,
-                    )
-                if not isinstance(browse_result, BrowseTileResult):
-                    raise TypeError("Browse tile generation returned an unexpected result")
-                tile_bytes = browse_result.tile_bytes
-                actual_vmin, actual_vmax = browse_result.display_range
-                browse_source = browse_result.source
-            except FileNotFoundError:
+        async def _render_uncached_oci_tile() -> _RenderedTile:
+            if is_composite:
+                tile_generator = generate_projected_composite_tile
+                tile_args = (
+                    request.app.state.storage_connector,
+                    entry,
+                    variable,
+                    z,
+                    x,
+                    y,
+                    time_index,
+                    vmin,
+                    vmax,
+                    direct_tile_max_parallel_chunk_reads,
+                )
+            else:
+                tile_generator = generate_projected_band_tile
+                tile_args = (
+                    request.app.state.storage_connector,
+                    entry,
+                    variable,
+                    z,
+                    x,
+                    y,
+                    time_index,
+                    colormap,
+                    vmin,
+                    vmax,
+                    direct_tile_max_parallel_chunk_reads,
+                )
+            actual_representation = tile_plan.chosen_representation
+            browse_source: str | None = None
+            if is_composite:
                 actual_representation = "serving"
                 with metrics.time_block("representation_generation"):
                     tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
-        elif tile_plan.chosen_representation == "pyramid":
-            try:
-                with metrics.time_block("representation_generation"):
-                    tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
-                        generate_pyramid_tile,
-                        request.app.state.storage_connector,
-                        entry,
-                        variable,
-                        z,
-                        x,
-                        y,
-                        time_index,
-                        colormap,
-                        vmin,
-                        vmax,
-                    )
-            except FileNotFoundError:
-                actual_representation = "serving"
-                with metrics.time_block("representation_generation"):
-                    tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
-                        generate_and_cache_pyramid_tile,
-                        request.app.state.storage_connector,
-                        entry,
-                        variable,
-                        z,
-                        x,
-                        y,
-                        time_index,
-                        colormap,
-                        vmin,
-                        vmax,
-                        direct_tile_max_parallel_chunk_reads,
-                    )
-            except ValueError:
-                actual_representation = "serving"
+            elif tile_plan.chosen_representation == "browse":
+                try:
+                    with metrics.time_block("representation_generation"):
+                        browse_result = await run_in_threadpool(
+                            generate_browse_tile,
+                            settings,
+                            request.app.state.storage_connector,
+                            entry,
+                            variable,
+                            z,
+                            x,
+                            y,
+                            time_index,
+                            colormap,
+                            vmin,
+                            vmax,
+                        )
+                    if not isinstance(browse_result, BrowseTileResult):
+                        raise TypeError("Browse tile generation returned an unexpected result")
+                    tile_bytes = browse_result.tile_bytes
+                    actual_vmin, actual_vmax = browse_result.display_range
+                    browse_source = browse_result.source
+                except FileNotFoundError:
+                    actual_representation = "serving"
+                    with metrics.time_block("representation_generation"):
+                        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
+            elif tile_plan.chosen_representation == "pyramid":
+                try:
+                    with metrics.time_block("representation_generation"):
+                        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+                            generate_pyramid_tile,
+                            request.app.state.storage_connector,
+                            entry,
+                            variable,
+                            z,
+                            x,
+                            y,
+                            time_index,
+                            colormap,
+                            vmin,
+                            vmax,
+                        )
+                except FileNotFoundError:
+                    actual_representation = "serving"
+                    with metrics.time_block("representation_generation"):
+                        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+                            generate_and_cache_pyramid_tile,
+                            request.app.state.storage_connector,
+                            entry,
+                            variable,
+                            z,
+                            x,
+                            y,
+                            time_index,
+                            colormap,
+                            vmin,
+                            vmax,
+                            direct_tile_max_parallel_chunk_reads,
+                        )
+                except ValueError:
+                    actual_representation = "serving"
+                    with metrics.time_block("representation_generation"):
+                        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
+            else:
                 with metrics.time_block("representation_generation"):
                     tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
-        else:
-            with metrics.time_block("representation_generation"):
-                tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(tile_generator, *tile_args)
 
-        if actual_representation == "serving":
-            _enforce_direct_tile_budget_or_raise(
-                settings=settings,
-                metrics=metrics,
-                dataset_id=dataset_id,
-                variable=variable,
-                z=z,
-                x=x,
-                y=y,
-                execution_path=tile_plan.execution_path,
-            )
-        else:
-            metrics.record_budget_decision(
-                status="not_applicable",
-                reason=f"{actual_representation} representation did not use direct source serving",
+            if actual_representation == "serving":
+                _enforce_direct_tile_budget_or_raise(
+                    settings=settings,
+                    metrics=metrics,
+                    dataset_id=dataset_id,
+                    variable=variable,
+                    z=z,
+                    x=x,
+                    y=y,
+                    execution_path=tile_plan.execution_path,
+                )
+            else:
+                metrics.record_budget_decision(
+                    status="not_applicable",
+                    reason=f"{actual_representation} representation did not use direct source serving",
+                )
+
+            if cache_key is not None and (is_composite or actual_representation == tile_plan.chosen_representation):
+                await request.app.state.cache.set(cache_key, tile_bytes, dataset_id=dataset_id)
+            return _RenderedTile(
+                body=tile_bytes,
+                vmin=actual_vmin,
+                vmax=actual_vmax,
+                representation=actual_representation,
+                browse_source=browse_source,
             )
 
-        if cache_key is not None and (is_composite or actual_representation == tile_plan.chosen_representation):
-            await request.app.state.cache.set(cache_key, tile_bytes)
+        coalescing_status = "bypass"
+        if cache_key is not None:
+            with metrics.time_block("request_coalescing"):
+                rendered, coalescing_status = await request.app.state.tile_request_coalescer.run(
+                    cache_key,
+                    _render_uncached_oci_tile,
+                )
+        else:
+            rendered = await _render_uncached_oci_tile()
+
+        cache_status = "COALESCED" if coalescing_status == "follower" else "MISS"
         headers = {
             "Cache-Control": "public, max-age=3600",
-            "X-Cache-Status": "MISS",
-            "X-Data-Vmin": str(actual_vmin),
-            "X-Data-Vmax": str(actual_vmax),
+            "X-Cache-Status": cache_status,
+            "X-Data-Vmin": str(rendered.vmin),
+            "X-Data-Vmax": str(rendered.vmax),
             "X-Request-Class": tile_plan.request_class,
             "X-Execution-Path": tile_plan.execution_path,
-            "X-Representation": actual_representation,
+            "X-Representation": rendered.representation,
+            "X-Request-Coalescing": coalescing_status,
         }
-        if browse_source is not None:
-            headers["X-Browse-Source"] = browse_source
+        if rendered.browse_source is not None:
+            headers["X-Browse-Source"] = rendered.browse_source
         return _tile_response(
-            body=tile_bytes,
+            body=rendered.body,
             headers=headers,
             settings=settings,
             metrics=metrics,
@@ -313,9 +366,10 @@ async def _get_tile_impl(
             z=z,
             x=x,
             y=y,
-            cache_status="MISS",
-            representation=actual_representation,
+            cache_status=cache_status,
+            representation=rendered.representation,
             execution_path=tile_plan.execution_path,
+            coalescing_status=coalescing_status,
         )
 
     registry = request.app.state.registry
@@ -324,6 +378,19 @@ async def _get_tile_impl(
     variable_ids = {item.id for item in registry.meta.variables}
     if variable not in variable_ids:
         raise HTTPException(status_code=404, detail="Variable not found")
+    if not tile_intersects_bounds(registry.meta.bounds, z, x, y):
+        return _empty_tile_response(
+            settings=settings,
+            metrics=metrics,
+            dataset_id=dataset_id,
+            variable=variable,
+            z=z,
+            x=x,
+            y=y,
+            request_class=tile_plan.request_class,
+            execution_path=tile_plan.execution_path,
+            planned_representation=tile_plan.chosen_representation,
+        )
 
     cache_key = _build_tile_cache_key(
         settings,
@@ -339,6 +406,7 @@ async def _get_tile_impl(
             "vmax": vmax,
             "representation": tile_plan.chosen_representation,
             "planner_version": settings.planner_version,
+            "cache_version": effective_cache_version,
         },
         vmin=vmin,
         vmax=vmax,
@@ -375,24 +443,43 @@ async def _get_tile_impl(
             },
         )
 
-    with metrics.time_block("representation_generation"):
-        tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
-            generate_tile,
-            registry.dataset,
-            registry.meta,
-            variable,
-            z,
-            x,
-            y,
-            time_index,
-            colormap,
-            vmin,
-            vmax,
+    async def _render_uncached_synthetic_tile() -> _RenderedTile:
+        with metrics.time_block("representation_generation"):
+            tile_bytes, (actual_vmin, actual_vmax) = await run_in_threadpool(
+                generate_tile,
+                registry.dataset,
+                registry.meta,
+                variable,
+                z,
+                x,
+                y,
+                time_index,
+                colormap,
+                vmin,
+                vmax,
+            )
+        if cache_key is not None:
+            await request.app.state.cache.set(cache_key, tile_bytes, dataset_id=dataset_id)
+        return _RenderedTile(
+            body=tile_bytes,
+            vmin=actual_vmin,
+            vmax=actual_vmax,
+            representation=tile_plan.chosen_representation,
         )
+
+    coalescing_status = "bypass"
     if cache_key is not None:
-        await request.app.state.cache.set(cache_key, tile_bytes)
+        with metrics.time_block("request_coalescing"):
+            rendered, coalescing_status = await request.app.state.tile_request_coalescer.run(
+                cache_key,
+                _render_uncached_synthetic_tile,
+            )
+    else:
+        rendered = await _render_uncached_synthetic_tile()
+
+    cache_status = "COALESCED" if coalescing_status == "follower" else "MISS"
     return _tile_response(
-        body=tile_bytes,
+        body=rendered.body,
         settings=settings,
         metrics=metrics,
         dataset_id=dataset_id,
@@ -400,19 +487,69 @@ async def _get_tile_impl(
         z=z,
         x=x,
         y=y,
-        cache_status="MISS",
-        representation=tile_plan.chosen_representation,
+        cache_status=cache_status,
+        representation=rendered.representation,
         execution_path=tile_plan.execution_path,
         headers={
             "Cache-Control": "public, max-age=3600",
-            "X-Cache-Status": "MISS",
-            "X-Data-Vmin": str(actual_vmin),
-            "X-Data-Vmax": str(actual_vmax),
+            "X-Cache-Status": cache_status,
+            "X-Data-Vmin": str(rendered.vmin),
+            "X-Data-Vmax": str(rendered.vmax),
             "X-Request-Class": tile_plan.request_class,
             "X-Execution-Path": tile_plan.execution_path,
-            "X-Representation": tile_plan.chosen_representation,
+            "X-Representation": rendered.representation,
+            "X-Request-Coalescing": coalescing_status,
         },
+        coalescing_status=coalescing_status,
     )
+
+
+def _empty_tile_response(
+    *,
+    settings,
+    metrics: TileRequestMetrics,
+    dataset_id: str,
+    variable: str,
+    z: int,
+    x: int,
+    y: int,
+    request_class: str,
+    execution_path: str,
+    planned_representation: str,
+) -> Response:
+    return _tile_response(
+        body=_transparent_webp_tile(),
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-Cache-Status": "BYPASS",
+            "X-Data-Vmin": "0.0",
+            "X-Data-Vmax": "0.0",
+            "X-Request-Class": request_class,
+            "X-Execution-Path": execution_path,
+            "X-Representation": "empty",
+            "X-Planned-Representation": planned_representation,
+            "X-Tile-Empty": "bounds",
+            "X-Request-Coalescing": "none",
+        },
+        settings=settings,
+        metrics=metrics,
+        dataset_id=dataset_id,
+        variable=variable,
+        z=z,
+        x=x,
+        y=y,
+        cache_status="BYPASS",
+        representation="empty",
+        execution_path=execution_path,
+        coalescing_status="none",
+    )
+
+
+@lru_cache(maxsize=1)
+def _transparent_webp_tile() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(buffer, format="WEBP", lossless=True)
+    return buffer.getvalue()
 
 
 def _tile_response(
@@ -429,9 +566,11 @@ def _tile_response(
     cache_status: str,
     representation: str,
     execution_path: str,
+    coalescing_status: str = "none",
 ) -> Response:
     metrics.finish()
     response_headers = dict(headers)
+    response_headers.setdefault("X-Request-Coalescing", coalescing_status)
     if settings.tile_debug_headers_enabled:
         response_headers.update(build_tile_debug_headers(metrics))
     _log_tile_metrics(
@@ -444,6 +583,7 @@ def _tile_response(
         cache_status=cache_status,
         representation=representation,
         execution_path=execution_path,
+        coalescing_status=coalescing_status,
     )
     return Response(body, media_type="image/webp", headers=response_headers)
 
@@ -524,6 +664,7 @@ def _log_tile_metrics(
     cache_status: str,
     representation: str,
     execution_path: str,
+    coalescing_status: str = "none",
 ) -> None:
     payload = {
         "event": "tile_request_metrics",
@@ -533,6 +674,7 @@ def _log_tile_metrics(
         "x": x,
         "y": y,
         "cache_status": cache_status,
+        "coalescing_status": coalescing_status,
         "representation": representation,
         "execution_path": execution_path,
         **metrics.snapshot(),

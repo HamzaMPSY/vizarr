@@ -1,8 +1,8 @@
 # Backend
 
 The backend is a FastAPI service that catalogs datasets, plans requests, renders
-WebP map tiles, and exposes OCI-backed Zarr stores through safe read-only proxy
-routes.
+WebP map tiles, exposes lossless source readback endpoints, and exposes
+OCI-backed Zarr stores through safe read-only proxy routes.
 
 ## Runtime modes
 
@@ -31,7 +31,7 @@ backend/
 │   │   ├── storage.py           # OCI discovery/debug endpoints
 │   │   ├── zarr.py              # Dataset-scoped Zarr proxy
 │   │   ├── websockets.py        # Dataset invalidation WebSocket
-│   │   ├── query.py             # Planner preview/stats/clip endpoints
+│   │   ├── query.py             # Source readback and planner preview/stats/clip endpoints
 │   │   └── exports.py           # Export job creation/status
 │   ├── core/
 │   │   ├── cache.py
@@ -42,6 +42,7 @@ backend/
 │   │   ├── oci_object_storage.py
 │   │   ├── zarr_reader.py
 │   │   ├── zarr_v3.py
+│   │   ├── readback.py
 │   │   ├── tile_generator.py
 │   │   ├── projected_tile_generator.py
 │   │   ├── browse_tiles.py
@@ -109,11 +110,17 @@ Important settings:
 | Setting | Role |
 |---|---|
 | `APP_ENVIRONMENT` | `development` by default; `production` enables API-key auth even when `AUTH_ENABLED=false` |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated browser origins allowed by CORS. Empty means wildcard only outside production; production with an empty value sends no wildcard CORS headers |
+| `CORS_ALLOWED_METHODS` | Comma-separated CORS methods, defaulting to `GET,POST,HEAD,OPTIONS` |
+| `CORS_ALLOWED_HEADERS` | Comma-separated request headers allowed by CORS, including `Authorization`, `X-API-Key`, `Content-Type`, and range/cache validators |
 | `AUTH_ENABLED` | Explicitly require API-key auth for protected routes |
 | `AUTH_API_KEYS` | Comma-separated API keys; use `key=dataset_id_a\|dataset_id_b` for dataset-scoped access |
+| `API_KEY_RATE_LIMIT_PER_MINUTE` | Per-API-key request limit. `0` disables rate limiting |
+| `API_KEY_RATE_LIMIT_WINDOW_SECONDS` | Rate-limit window size in seconds |
 | `STORAGE_BACKEND` | `synthetic` or `oci_zarr` |
 | `REDIS_URL` | Redis connection string |
 | `TILE_CACHE_TTL` | Redis tile byte TTL in seconds |
+| `JOB_STORE_TTL` | Redis job status TTL in seconds for export, clip handoff, and browse generation job records |
 | `TILE_CACHE_DISPLAY_RANGE_DECIMALS` | Decimal places used when normalizing `vmin`/`vmax` in tile cache keys |
 | `TILE_CACHE_CUSTOM_RANGE_ENABLED` | When `false`, skip backend cache writes for explicit `vmin`/`vmax` tile requests |
 | `DIRECT_TILE_MAX_PARALLEL_CHUNK_READS` | Maximum parallel source Zarr chunk reads per direct tile render; `0` uses the lower-level default |
@@ -166,7 +173,10 @@ Protected HTTP routes accept either:
 - `api_key=<key>` query parameter for browser-owned tile requests.
 
 The `/ws/datasets` WebSocket accepts the same header forms or `api_key=<key>`.
-`/api/healthz` remains public for health checks.
+`/api/healthz` remains public for health checks. In OCI mode it includes a
+safe `oci_auth` block with the configured auth mode, status, and remaining
+security-token lifetime when available. It does not expose config paths,
+profile contents, credentials, bucket names, or object paths.
 
 `AUTH_API_KEYS` supports two key shapes:
 
@@ -180,8 +190,33 @@ Dataset-scoped keys also gate read-only Zarr proxy routes. Both source
 `/api/zarr/multiscale/{dataset_id}/...` requests are denied when the key does
 not include the route dataset id.
 
+When `API_KEY_RATE_LIMIT_PER_MINUTE` is greater than zero, authenticated HTTP
+requests are rate-limited per accepted key. Redis is used when reachable, with
+a bounded in-process fallback for local development. Exceeded requests return
+HTTP `429` with `Retry-After`, `X-RateLimit-Limit`, and
+`X-RateLimit-Remaining` headers. WebSocket messages are not rate-limited by
+this first guard.
+
+Safe manual key rotation uses an overlap window:
+
+1. Add the new key to `AUTH_API_KEYS` beside the old key, preserving any
+   dataset scope, then reload or redeploy the backend.
+2. Update frontend/deployment secrets that hold `VITE_API_KEY` or external
+   callers to use the new key.
+3. Confirm `/api/datasets` and a representative tile request succeed with the
+   new key.
+4. Remove the old key from `AUTH_API_KEYS` and reload or redeploy again.
+
 This is intentionally a first production gate, not a full identity system.
 OIDC/JWT, per-user roles, and persistent tenant policy remain future work.
+
+## CORS behavior
+
+Local development keeps CORS permissive when `CORS_ALLOWED_ORIGINS` is empty so
+Vite, direct backend, and compose workflows remain simple. Production does not
+default to `*`: set `CORS_ALLOWED_ORIGINS` to the exact viewer origin or
+origins, for example `https://viewer.example.com`. A literal `*` is ignored in
+production settings.
 
 ## API route surface
 
@@ -194,15 +229,20 @@ All routes below are mounted under `/api`.
 | GET | `/datasets/{dataset_id}` | synthetic + OCI | public app API | Return one dataset and hydrate OCI metadata as needed |
 | GET | `/datasets/{dataset_id}/variables` | synthetic + OCI | public app API | Return variables/bands for a dataset |
 | GET | `/datasets/{dataset_id}/serving-profile` | synthetic + OCI | public app API | Report browser/proxy/multiscale readiness and gaps |
+| POST | `/datasets/{dataset_id}/browse-generation` | OCI-only | internal/operator API | Queue browse overview generation for a dataset; duplicate active requests return the existing job |
+| GET | `/datasets/{dataset_id}/browse-generation/{job_id}` | OCI-only | internal/operator API | Return durable browse generation job status |
 | GET | `/colormaps` | synthetic + OCI | public app API | List supported colormap names |
 | GET | `/colormaps/{name}/palette` | synthetic + OCI | public app API | Return sampled RGBA palette values |
 | GET | `/tilejson/{dataset_id}/{variable}` | synthetic + OCI | public app API | Return TileJSON with backend tile URL template |
 | GET | `/tiles/{dataset_id}/{variable}/{z}/{x}/{y}` | synthetic + OCI | public app API | Return a rendered WebP map tile |
+| GET | `/query/point` | synthetic + OCI | internal/experimental | Return one numeric source value at a WGS84 point before colormap or tile encoding |
+| GET | `/query/bbox` | synthetic + OCI | internal/experimental | Return a bounded source-value window for a small WGS84 bbox before colormap or tile encoding |
+| GET | `/query/range` | synthetic + OCI | internal/experimental | Return metadata or bounded active-view range stats, percentiles, and histogram bins before colormap or tile encoding |
 | POST | `/query/preview` | synthetic + OCI | internal/experimental | Return a planner preview artifact descriptor |
 | POST | `/query/stats` | synthetic + OCI | internal/experimental | Return a planner stats artifact descriptor |
 | POST | `/query/clip` | synthetic + OCI | internal/experimental | Return small clip artifact descriptor or accepted batch export |
 | POST | `/exports` | synthetic + OCI | internal/experimental | Create an export job from a planned request |
-| GET | `/exports/{job_id}` | synthetic + OCI | internal/experimental | Return in-memory export job status |
+| GET | `/exports/{job_id}` | synthetic + OCI | internal/experimental | Return durable export job status |
 | GET | `/storage/objects` | OCI-only | development/debug | List raw OCI objects under a prefix |
 | GET | `/storage/prefixes` | OCI-only | development/debug | List folder-like OCI prefixes |
 | GET | `/storage/zarr-stores` | OCI-only | development/debug | Detect candidate Zarr store roots |
@@ -213,9 +253,34 @@ All routes below are mounted under `/api`.
 | GET | `/zarr/multiscale/{dataset_id}` | OCI-only | public app API | Return multiscale Zarr proxy metadata |
 | GET/HEAD | `/zarr/multiscale/{dataset_id}/{object_path}` | OCI-only | public app API | Proxy a multiscale Zarr object with byte-range support |
 
+`GET /api/datasets` accepts an optional `bbox=west,south,east,north` WGS84
+query parameter. The backend filters the authenticated dataset list to records
+whose `DatasetMeta.bounds` intersects the bbox. Antimeridian viewports are
+represented with `west > east`; malformed, non-finite, or out-of-range bbox
+values return HTTP `422`.
+
 The backend also registers top-level `WS /ws/datasets` outside the `/api`
 prefix. It sends JSON dataset invalidation events and supports `{"type":"ping"}`
 messages with `{"type":"pong"}` responses.
+
+## Durable job status
+
+Export jobs, clip handoff jobs, and browse generation jobs use the shared
+backend job record store. When Redis is reachable through `REDIS_URL`, job
+records are stored as versioned JSON payloads with the configured
+`JOB_STORE_TTL` and can be read by another backend worker. If Redis is not
+reachable at startup, the service falls back to in-memory job status for local
+development and logs that the store is not durable.
+
+Accepted job writes must complete against the active store. If Redis was
+selected but a create/read/update operation fails, the API returns HTTP `503`
+instead of silently acknowledging a job whose durable status was not recorded.
+Malformed stored job payloads are ignored and removed so callers receive the
+normal not-found response rather than invalid data.
+
+Durable status does not make the background computation itself durable. Browse
+generation still runs in the accepting backend process, and export output
+durability remains limited to the existing artifact/export output path.
 
 ## Tile endpoint
 
@@ -235,6 +300,7 @@ Query parameters:
 | `colormap` | string | `viridis` | Style name and planner style input |
 | `vmin` | float | dataset/display default | Optional display minimum |
 | `vmax` | float | dataset/display default | Optional display maximum |
+| `cache_version` | string | dataset cache version | Internal cache-busting token emitted in TileJSON templates |
 
 Response:
 
@@ -243,12 +309,19 @@ Response:
 - `X-Cache-Status: HIT` or `MISS`;
 - `X-Data-Vmin` and `X-Data-Vmax`;
 - `X-Request-Class`, `X-Execution-Path`, and `X-Representation`;
+- `X-Request-Coalescing` for uncached in-flight request sharing;
 - optional `X-Browse-Source` when served from browse artifacts.
+
+Tiles outside `DatasetMeta.bounds` short-circuit before source rendering and
+return a transparent 256x256 WebP with `X-Representation: empty`,
+`X-Tile-Empty: bounds`, `X-Planned-Representation`, and cache headers. This
+keeps MapLibre on the normal image-tile path while avoiding OCI object reads for
+tiles that cannot intersect the dataset.
 
 When `TILE_DEBUG_HEADERS_ENABLED=true`, the response also includes sanitized
 diagnostics such as `X-Tile-Time-Ms`, `X-Tile-Render-Ms`,
-`X-Tile-Encode-Ms`, `X-Object-Get-Count`, `X-Object-Bytes-Read`, and
-`X-Zarr-Chunk-Count`. Direct source renders also include
+`X-Tile-Encode-Ms`, `X-Tile-Coalescing-Ms`, `X-Object-Get-Count`,
+`X-Object-Bytes-Read`, and `X-Zarr-Chunk-Count`. Direct source renders also include
 `X-Tile-Budget-Status` and, when a limit is exceeded, the budget metric, limit,
 and actual value. These are disabled by default and mirror the structured
 `tile_request_metrics` backend log payload.
@@ -257,6 +330,39 @@ When a direct source render exceeds a configured budget, the endpoint returns
 HTTP `503` with a `direct_tile_compute_budget_exceeded` JSON detail instead of
 caching or returning the tile. Browse and prebuilt pyramid hits do not consume
 the direct tile budget.
+
+## Scientific readback endpoints
+
+WebP tile responses are visual products for map navigation. They may be
+colormapped, resampled, composited, and lossy-encoded, so clients must not use
+tile pixels as scientific source values.
+
+Use the readback endpoints when the caller needs numeric source data before
+colormap or WebP encoding:
+
+- `GET /api/query/point?dataset_id=...&variable=...&lon=...&lat=...`
+  returns one source value plus source pixel coordinates when the point
+  intersects the dataset;
+- `GET /api/query/bbox?dataset_id=...&variable=...&bbox=west,south,east,north`
+  returns a small two-dimensional value grid clipped to the source pixels whose
+  centers intersect the WGS84 bbox;
+- `GET /api/query/range?dataset_id=...&variable=...&bbox=west,south,east,north`
+  samples a bounded source window and returns min/max, p02/p98, histogram bin
+  edges, histogram counts, valid-value count, and unit. Without `bbox`, it
+  returns the variable metadata stats with `stats_source: "metadata"`.
+
+The point and bbox endpoints accept `time_index` and optional `diagnostics=true`.
+Bbox readback and range sampling are intentionally bounded with `max_width` and
+`max_height` query parameters. Bbox defaults to `64`; range sampling defaults to
+`128`; both are capped at `512`, and oversized requests return HTTP `413`.
+Diagnostics may include the source store path, array name, dtype, source CRS,
+source window, chunk shape, and object/chunk read counters.
+
+These endpoints preserve the source array dtype until JSON serialization and
+convert nodata, fill values, and non-finite numeric values to JSON `null`. They
+are read-only and do not add a PNG or lossless image tile mode; exports and
+future product workflows should build on explicit source-data APIs instead of
+changing the default WebP tile route.
 
 ## Dataset metadata
 

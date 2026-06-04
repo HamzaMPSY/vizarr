@@ -21,7 +21,7 @@ interface UseDeckZarrRasterOptions {
   lastFailureReason?: string | null;
 }
 
-interface DeckZarrRasterDebug {
+export interface DeckZarrRasterDebug {
   status: "native" | "native-loading" | "fallback";
   reason: string;
   levelPath: string | null;
@@ -33,7 +33,7 @@ interface DeckZarrRasterDebug {
   lastFailureReason: string | null;
 }
 
-interface DeckZarrRasterResult {
+export interface DeckZarrRasterResult {
   layers: DeckLayer[];
   active: boolean;
   debug: DeckZarrRasterDebug;

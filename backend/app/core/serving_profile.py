@@ -50,6 +50,7 @@ def build_dataset_serving_profile(
     browse_coverage = compute_browse_coverage(settings, entry, browse_manifest)
 
     chunk_layout = _build_chunk_layout(entry)
+    layout_validation = entry.layout_validation or entry.meta.layout_validation
     supported_rendering_modes = ["dynamic_tiles"]
     if entry.meta.zarr_proxy_root:
         supported_rendering_modes.append("proxy_zarr")
@@ -129,6 +130,7 @@ def build_dataset_serving_profile(
         browse_overview_max_zoom=browse_overview_max_zoom,
         browse_coverage=browse_coverage,
         chunk_layout=chunk_layout,
+        layout_validation=layout_validation,
         supported_rendering_modes=supported_rendering_modes,
         browser_multiscale_ready=browser_multiscale_ready,
         browser_gpu_ready=browser_gpu_ready,
@@ -174,6 +176,11 @@ def _collect_browse_overview_zoom_levels(manifest: dict[str, Any] | None) -> lis
 
 def _standards_compatibility_gaps(entry: CatalogEntry) -> list[str]:
     gaps: list[str] = []
+    layout_validation = entry.layout_validation or entry.meta.layout_validation
+    if layout_validation is not None and not layout_validation.accepted:
+        for issue in layout_validation.issues:
+            if issue.code not in gaps:
+                gaps.append(issue.code)
     metadata = entry.data_array_meta
     if metadata is None:
         gaps.append("missing_data_array_metadata")

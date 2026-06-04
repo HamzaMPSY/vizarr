@@ -4,6 +4,7 @@ from app.core.dataset_catalog import CatalogEntry
 from app.core.serving_profile import build_dataset_serving_profile
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.models.dataset import DatasetMeta
+from app.models.dataset import LayoutValidation
 
 
 class _Connector:
@@ -85,6 +86,19 @@ def _entry() -> CatalogEntry:
 
 def test_build_dataset_serving_profile_flags_missing_multiscale_and_partial_browse(monkeypatch) -> None:
     entry = _entry()
+    entry.layout_validation = LayoutValidation(
+        adapter_name="projected-4d-banded",
+        adapter_priority=100,
+        accepted=True,
+        data_array_name="bands",
+        band_array_name="band",
+        matched_dimensions=["time", "band", "y", "x"],
+        accepted_dimensions=["time/*/y/x"],
+        required_metadata=["data array dimension names"],
+        crs_transform_conventions=["CF spatial_ref.attributes.crs_wkt"],
+        tile_capabilities=["dynamic_tiles"],
+        readback_capabilities=["point"],
+    )
     connector = _Connector({})
     settings = SimpleNamespace(browse_tile_max_zoom=8)
 
@@ -103,6 +117,9 @@ def test_build_dataset_serving_profile_flags_missing_multiscale_and_partial_brow
     assert profile.browse_coverage.available_zoom_levels == [0]
     assert profile.browse_coverage.missing_time_steps == {"NDVI": [0]}
     assert profile.chunk_layout is not None
+    assert profile.layout_validation is not None
+    assert profile.layout_validation.adapter_name == "projected-4d-banded"
+    assert profile.layout_validation.tile_capabilities == ["dynamic_tiles"]
     assert profile.chunk_layout.sharded is True
     assert profile.chunk_layout.shard_shape == [1, 1, 4096, 4096]
     assert profile.chunk_layout.inner_chunk_shape == [1, 1, 256, 256]

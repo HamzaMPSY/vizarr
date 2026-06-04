@@ -1,6 +1,7 @@
+import logging
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from starlette.concurrency import run_in_threadpool
 
 from app.core.auth import filter_dataset_ids
@@ -9,6 +10,9 @@ from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
 from app.core.dataset_catalog import get_or_build_catalog
 from app.core.serving_profile import build_dataset_serving_profile
+from app.index.spatial_index import BBox
+from app.index.spatial_index import bounds_intersect_bbox
+from app.index.spatial_index import parse_bbox_query
 from app.models.artifacts import BrowseGenerationAcceptedResponse
 from app.models.artifacts import BrowseGenerationStatusResponse
 from app.models.dataset import BrowseCoverage, DatasetMeta, DatasetServingProfile, VariableMeta
@@ -17,17 +21,36 @@ from app.models.requests import BrowseGenerationRequest
 
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("", response_model=list[DatasetMeta])
-async def list_datasets(request: Request) -> list[DatasetMeta]:
+async def list_datasets(
+    request: Request,
+    response: Response,
+    bbox: str | None = Query(default=None, description="Optional west,south,east,north WGS84 viewport filter"),
+) -> list[DatasetMeta]:
     auth_context = getattr(request.state, "auth_context", None)
     settings = request.app.state.settings
     if settings.storage_backend == "oci_zarr":
         manifest = getattr(request.app.state, "dataset_manifest", None)
-        catalog = get_or_build_catalog(request.app)
         connector = request.app.state.storage_connector
+        diagnostics = getattr(request.app.state, "dataset_manifest_diagnostics", {}) or {}
+        _set_manifest_headers(response, diagnostics)
         needs_metadata_hydration = manifest is None or any(not item.variables for item in manifest)
+
+        if manifest is not None and not needs_metadata_hydration:
+            datasets = manifest
+            return _filter_datasets_for_request(request, auth_context, datasets, bbox)
+
+        catalog = getattr(request.app.state, "dataset_catalog", None)
+        if catalog is None and manifest is not None:
+            datasets = manifest
+            return _filter_datasets_for_request(request, auth_context, datasets, bbox)
+
+        catalog = get_or_build_catalog(request.app)
+        diagnostics = getattr(request.app.state, "dataset_manifest_diagnostics", {}) or {}
+        _set_manifest_headers(response, diagnostics)
 
         if needs_metadata_hydration and connector is not None:
             for entry in catalog.values():
@@ -48,11 +71,55 @@ async def list_datasets(request: Request) -> list[DatasetMeta]:
             datasets = manifest
         else:
             datasets = [entry.meta for entry in catalog.values()]
-        allowed_ids = filter_dataset_ids(auth_context, [item.id for item in datasets])
-        return datasets if allowed_ids is None else [item for item in datasets if item.id in allowed_ids]
+        return _filter_datasets_for_request(request, auth_context, datasets, bbox)
     meta = request.app.state.registry.meta
-    allowed_ids = filter_dataset_ids(auth_context, [meta.id])
-    return [meta] if allowed_ids is None or meta.id in allowed_ids else []
+    return _filter_datasets_for_request(request, auth_context, [meta], bbox)
+
+
+def _filter_datasets_for_request(
+    request: Request,
+    auth_context,
+    datasets: list[DatasetMeta],
+    raw_bbox: str | None,
+) -> list[DatasetMeta]:
+    allowed_ids = filter_dataset_ids(auth_context, [item.id for item in datasets])
+    filtered = datasets if allowed_ids is None else [item for item in datasets if item.id in allowed_ids]
+    if raw_bbox is None:
+        return filtered
+    try:
+        bbox = parse_bbox_query(raw_bbox)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if bbox is None:
+        return filtered
+    return _filter_datasets_by_bbox(request, filtered, bbox)
+
+
+def _filter_datasets_by_bbox(request: Request, datasets: list[DatasetMeta], bbox: BBox) -> list[DatasetMeta]:
+    spatial_index = getattr(request.app.state, "dataset_spatial_index", None)
+    indexed_ids: set[str] = set()
+    matching_ids: set[str] = set()
+    if spatial_index is not None:
+        indexed_records = spatial_index.all()
+        indexed_ids = {record.dataset_id for record in indexed_records}
+        dataset_ids = {item.id for item in datasets if item.bounds is not None}
+        if dataset_ids.issubset(indexed_ids):
+            matching_ids = spatial_index.query_ids(bbox)
+            return [item for item in datasets if item.id in matching_ids]
+
+    return [item for item in datasets if bounds_intersect_bbox(item.bounds, bbox)]
+
+
+def _set_manifest_headers(response: Response, diagnostics: dict[str, Any]) -> None:
+    source = diagnostics.get("source")
+    status = diagnostics.get("status")
+    generated_at = diagnostics.get("generated_at")
+    if source is not None:
+        response.headers["X-Dataset-Manifest-Source"] = str(source)
+    if status is not None:
+        response.headers["X-Dataset-Manifest-Status"] = str(status)
+    if generated_at is not None:
+        response.headers["X-Dataset-Manifest-Generated-At"] = str(generated_at)
 
 
 @router.get("/{dataset_id}", response_model=DatasetMeta)
@@ -180,7 +247,13 @@ async def create_browse_generation(
     variables = _browse_generation_variables(entry, payload.variables)
     time_indices = _browse_generation_time_indices(entry, variables, payload.time_indices)
     zoom_levels = _browse_generation_zoom_levels(settings, payload.zoom_levels)
-    job = request.app.state.browse_generation_job_store.create_job(
+    if payload.retry_job_id is not None:
+        retry_job = request.app.state.browse_generation_job_store.get_job(payload.retry_job_id)
+        if retry_job is None or retry_job.dataset_id != entry.id:
+            raise HTTPException(status_code=404, detail="Browse generation retry job not found")
+        if not retry_job.can_retry:
+            raise HTTPException(status_code=409, detail="Browse generation job is not retryable")
+    job, created = request.app.state.browse_generation_job_store.create_or_get_active_job(
         dataset_id=entry.id,
         variables=variables,
         time_indices=time_indices,
@@ -188,18 +261,20 @@ async def create_browse_generation(
         overwrite=payload.overwrite,
         retry_of_job_id=payload.retry_job_id,
     )
-    background_tasks.add_task(
-        _run_browse_generation_job,
-        request.app.state.browse_generation_job_store,
-        job.job_id,
-        settings,
-        request.app.state.storage_connector,
-        entry,
-        variables,
-        time_indices,
-        zoom_levels,
-        payload.overwrite,
-    )
+    if created:
+        background_tasks.add_task(
+            _run_browse_generation_job,
+            request.app.state.browse_generation_job_store,
+            job.job_id,
+            settings,
+            request.app.state.cache,
+            request.app.state.storage_connector,
+            entry,
+            variables,
+            time_indices,
+            zoom_levels,
+            payload.overwrite,
+        )
     return BrowseGenerationAcceptedResponse(
         job_id=job.job_id,
         status=job.status,
@@ -219,10 +294,11 @@ async def get_browse_generation(dataset_id: str, job_id: str, request: Request) 
     return _browse_generation_status_response(job)
 
 
-def _run_browse_generation_job(
+async def _run_browse_generation_job(
     job_store,
     job_id: str,
     settings,
+    cache,
     connector,
     entry,
     variables: list[str],
@@ -232,7 +308,8 @@ def _run_browse_generation_job(
 ) -> None:
     try:
         job_store.mark_running(job_id)
-        summary = build_and_store_browse_overviews(
+        summary = await run_in_threadpool(
+            build_and_store_browse_overviews,
             settings=settings,
             connector=connector,
             entry=entry,
@@ -242,6 +319,7 @@ def _run_browse_generation_job(
             overwrite=overwrite,
             progress_callback=lambda generated: job_store.record_artifact(job_id, generated=generated),
         )
+        await cache.invalidate_dataset_tiles(entry.id)
         job_store.mark_succeeded(
             job_id,
             manifest_path=_string_or_none(summary.get("manifest_path")),
@@ -249,7 +327,10 @@ def _run_browse_generation_job(
             reused=int(summary.get("reused", 0)),
         )
     except Exception as exc:
-        job_store.mark_failed(job_id, str(exc))
+        try:
+            job_store.mark_failed(job_id, str(exc))
+        except Exception:
+            logger.warning("Failed to persist browse generation failure for job_id=%s", job_id, exc_info=True)
 
 
 def _browse_generation_status_response(job: BrowseGenerationJobRecord) -> BrowseGenerationStatusResponse:
@@ -276,7 +357,7 @@ def _browse_generation_status_response(job: BrowseGenerationJobRecord) -> Browse
 
 def _browse_generation_variables(entry, requested_variables: list[str] | None) -> list[str]:
     available = [item.id for item in entry.meta.variables] or list(entry.band_names)
-    selected = requested_variables or available
+    selected = _unique_preserving_order(requested_variables or available)
     unknown = sorted(set(selected).difference(available))
     if unknown:
         raise HTTPException(status_code=422, detail=f"Unknown browse variable(s): {', '.join(unknown)}")
@@ -293,7 +374,7 @@ def _browse_generation_time_indices(
     invalid = [value for value in selected if value >= max_time_steps]
     if invalid:
         raise HTTPException(status_code=422, detail=f"Unknown browse time index: {invalid[0]}")
-    return selected
+    return sorted(set(selected))
 
 
 def _browse_generation_zoom_levels(settings, requested_zoom_levels: list[int] | None) -> list[int]:
@@ -316,3 +397,7 @@ def _variable_time_steps(entry, variable: str) -> int:
 
 def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _unique_preserving_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))

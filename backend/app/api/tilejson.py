@@ -22,6 +22,8 @@ async def get_tilejson(
     vmin: float | None = None,
     vmax: float | None = None,
 ) -> TileJSON:
+    settings = request.app.state.settings
+    cache_version = await request.app.state.cache.get_dataset_version(dataset_id)
     tile_template = _tile_template(
         request=request,
         dataset_id=dataset_id,
@@ -30,8 +32,8 @@ async def get_tilejson(
         colormap=colormap,
         vmin=vmin,
         vmax=vmax,
+        cache_version=cache_version,
     )
-    settings = request.app.state.settings
     if settings.storage_backend == "oci_zarr":
         catalog = get_or_build_catalog(request.app)
         entry = catalog.get(dataset_id)
@@ -69,10 +71,12 @@ def _tile_template(
     colormap: str,
     vmin: float | None,
     vmax: float | None,
+    cache_version: str,
 ) -> str:
     query = {
         "time_index": str(time_index),
         "colormap": colormap,
+        "cache_version": cache_version,
     }
     if vmin is not None:
         query["vmin"] = str(vmin)

@@ -48,7 +48,9 @@ it contains store metadata.
 
 The current adapter is tuned toward projected multiband Zarr v3 stores with a
 main `bands` array and dimensions like `time`, `band`, `y`, and `x`. Generic
-projected layouts are not complete yet.
+projected layouts are not complete yet. Zarr v2 source-store metadata can be
+parsed for interoperability planning, including Xarray `_ARRAY_DIMENSIONS`, but
+v2 direct source rendering is not a supported tile path yet.
 
 ### Browse artifacts
 
@@ -260,6 +262,7 @@ responses still use `X-Cache-Status` for the backend Redis cache.
 | Synthetic demo dataset | Implemented |
 | OCI session-profile auth and object listing | Implemented |
 | Zarr v3 metadata/chunk/shard handling | Implemented for current target layouts |
+| Zarr v2 source metadata normalization | Implemented as an adapter-planning proof; source rendering remains planned |
 | Server-rendered WebP tiles | Implemented |
 | Direct tile compute/read budgets | Implemented |
 | Browse overview serving | Implemented |
@@ -273,5 +276,7 @@ responses still use `X-Cache-Status` for the backend Redis cache.
 | Generic projected Zarr layout adapter | Partly implemented for direct `time/y/x` and banded `time/*/y/x` layouts |
 | Debounced frontend tile prefetch | Implemented without a worker |
 | WebSocket dataset invalidation | Implemented |
+| STAC item/collection discovery | Planned |
+| Native COG serving | Not implemented; pending TiTiler/hybrid decision |
 | External Dask scheduler | Not implemented |
 | Nginx disk tile cache | Implemented |

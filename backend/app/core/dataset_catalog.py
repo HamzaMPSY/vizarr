@@ -1,19 +1,29 @@
 import base64
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import UTC
+from datetime import datetime
+from typing import Any
 
 import numpy as np
 from pyproj import CRS, Geod, Transformer
 
 from app.config import Settings
+from app.core.layout_adapters import ProjectedLayout
+from app.core.layout_adapters import dimension_names_from_node
+from app.core.layout_adapters import select_projected_array_names
+from app.core.layout_adapters import select_projected_layout
+from app.core.layout_adapters import validate_projected_layout
 from app.core.multiscale_store import multiscale_proxy_root
 from app.core.multiscale_store import multiscale_store_path
 from app.core.multiscale_store import probe_multiscale_store
 from app.core.datasets import _stats
 from app.core.oci_object_storage import OCIObjectStorageConnector
 from app.core.variable_display import apply_variable_display_defaults
+from app.core.zarr_reader import read_zarr_v2_store_metadata
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import estimate_4d_nonempty_pixel_bounds
 from app.core.zarr_v3 import load_1d_numeric_array
@@ -22,7 +32,7 @@ from app.core.zarr_v3 import load_fixed_length_utf32_labels
 from app.core.zarr_v3 import parse_array_metadata
 from app.core.zarr_v3 import read_consolidated_metadata
 from app.core.zarr_v3 import read_store_metadata
-from app.models.dataset import CompositeStyle, DatasetBounds, DatasetMeta, VariableMeta
+from app.models.dataset import CompositeStyle, DatasetBounds, DatasetMeta, LayoutValidation, VariableMeta
 
 
 LANDSAT_BAND_NAMES = {
@@ -60,13 +70,7 @@ _BAND_ALIASES = {
 
 logger = logging.getLogger(__name__)
 _MAX_PARALLEL_BAND_SAMPLES = 4
-
-
-@dataclass
-class ProjectedLayout:
-    data_array_name: str
-    band_array_name: str | None
-    variable_array_names: dict[str, str]
+DATASET_MANIFEST_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -90,6 +94,7 @@ class CatalogEntry:
     x_values: np.ndarray | None = None
     y_values: np.ndarray | None = None
     data_bounds_ready: bool = False
+    layout_validation: LayoutValidation | None = None
 
 
 def _encode_dataset_id(path: str) -> str:
@@ -148,59 +153,16 @@ def _default_band_names(count: int) -> list[str]:
     return [f"B{index}" for index in range(1, count + 1)]
 
 
+def _dimension_names_from_node(node: dict) -> tuple[str, ...]:
+    return dimension_names_from_node(node)
+
+
 def _select_projected_array_names(metadata: dict[str, dict]) -> tuple[str, str]:
-    candidates: list[tuple[str, str]] = []
-    for array_name, node in metadata.items():
-        shape = node.get("shape")
-        dimension_names = tuple(node.get("dimension_names", []))
-        if not isinstance(shape, list) or len(shape) != 4:
-            continue
-        if "x" not in dimension_names or "y" not in dimension_names or "time" not in dimension_names:
-            continue
-
-        non_spatial_dims = [name for name in dimension_names if name not in {"time", "x", "y"}]
-        if len(non_spatial_dims) != 1:
-            continue
-        candidates.append((array_name, non_spatial_dims[0]))
-
-    if not candidates:
-        raise ValueError("Dataset does not expose a supported projected 4D array with dims time/*/y/x")
-
-    candidates.sort(key=lambda item: item[0])
-    return candidates[0]
+    return select_projected_array_names(metadata)
 
 
 def _select_projected_layout(metadata: dict[str, dict]) -> ProjectedLayout:
-    try:
-        data_array_name, band_array_name = _select_projected_array_names(metadata)
-        return ProjectedLayout(
-            data_array_name=data_array_name,
-            band_array_name=band_array_name,
-            variable_array_names={},
-        )
-    except ValueError:
-        pass
-
-    variable_arrays: dict[str, str] = {}
-    for array_name, node in sorted(metadata.items()):
-        shape = node.get("shape")
-        dimension_names = tuple(node.get("dimension_names", []))
-        if not isinstance(shape, list):
-            continue
-        if len(shape) == 3 and dimension_names == ("time", "y", "x"):
-            variable_arrays[array_name] = array_name
-        elif len(shape) == 2 and dimension_names == ("y", "x"):
-            variable_arrays[array_name] = array_name
-
-    if variable_arrays:
-        first_array_name = next(iter(variable_arrays.values()))
-        return ProjectedLayout(
-            data_array_name=first_array_name,
-            band_array_name=None,
-            variable_array_names=variable_arrays,
-        )
-
-    raise ValueError("Dataset does not expose a supported projected layout with dims time/*/y/x, time/y/x, or y/x")
+    return select_projected_layout(metadata)
 
 
 def _build_variable_meta(
@@ -626,19 +588,59 @@ def _read_dataset_metadata(
     connector: OCIObjectStorageConnector,
     store_path: str,
 ) -> tuple[dict, dict]:
-    store_metadata, metadata = read_consolidated_metadata(
-        connector=connector,
-        store_path=store_path,
-    )
-    if metadata:
-        return store_metadata, metadata
-    return read_store_metadata(
-        connector=connector,
-        store_path=store_path,
-    )
+    try:
+        store_metadata, metadata = read_consolidated_metadata(
+            connector=connector,
+            store_path=store_path,
+        )
+        if metadata:
+            return store_metadata, metadata
+        return read_store_metadata(
+            connector=connector,
+            store_path=store_path,
+        )
+    except FileNotFoundError:
+        return read_zarr_v2_store_metadata(
+            connector=connector,
+            store_path=store_path,
+        )
 
 
-def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector) -> dict[str, CatalogEntry]:
+def _append_layout_diagnostic(
+    diagnostics: list[dict[str, Any]] | None,
+    *,
+    store_path: str,
+    status: str,
+    layout_validation: LayoutValidation | None = None,
+    code: str | None = None,
+    message: str | None = None,
+    remediation: str | None = None,
+) -> None:
+    if diagnostics is None:
+        return
+    entry: dict[str, Any] = {
+        "store_path": store_path,
+        "status": status,
+    }
+    if layout_validation is not None:
+        entry["layout_validation"] = layout_validation.model_dump(mode="json")
+        entry["adapter_name"] = layout_validation.adapter_name
+        entry["accepted"] = layout_validation.accepted
+        entry["issues"] = [issue.model_dump(mode="json") for issue in layout_validation.issues]
+    if code is not None:
+        entry["code"] = code
+    if message is not None:
+        entry["message"] = message
+    if remediation is not None:
+        entry["remediation"] = remediation
+    diagnostics.append(entry)
+
+
+def build_catalog_index(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, CatalogEntry]:
     direct_store_path = _resolve_direct_store_path(settings)
     stores = [] if direct_store_path is not None else connector.list_zarr_stores(prefix=settings.oci_prefix, limit=10000)
     catalog: dict[str, CatalogEntry] = {}
@@ -660,10 +662,37 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             )
             zarr_format = int(store_metadata.get("zarr_format", store_zarr_format or 0))
             if zarr_format != 3:
+                _append_layout_diagnostic(
+                    diagnostics,
+                    store_path=store_path,
+                    status="unsupported",
+                    code="unsupported_zarr_format",
+                    message=f"Source Zarr format {zarr_format} is not a renderable source path.",
+                    remediation="Use a Zarr v3 source store or add a source adapter with chunk-read support.",
+                )
                 continue
-            layout = _select_projected_layout(metadata)
+            layout_result = validate_projected_layout(metadata)
+            layout_validation = layout_result.to_validation()
+            if not layout_result.accepted:
+                _append_layout_diagnostic(
+                    diagnostics,
+                    store_path=store_path,
+                    status="unsupported",
+                    layout_validation=layout_validation,
+                )
+                raise ValueError(layout_result.error_message())
+            layout = layout_result.to_projected_layout()
         except Exception as exc:
             logger.warning("Skipping unsupported dataset store %s: %s", store_path, exc)
+            if diagnostics is not None and not any(item.get("store_path") == store_path for item in diagnostics):
+                _append_layout_diagnostic(
+                    diagnostics,
+                    store_path=store_path,
+                    status="unsupported",
+                    code="catalog_read_failed",
+                    message=str(exc),
+                    remediation="Inspect the store metadata and ensure it matches a registered layout adapter.",
+                )
             continue
 
         dataset_id = _encode_dataset_id(store_path)
@@ -702,8 +731,16 @@ def build_catalog_index(settings: Settings, connector: OCIObjectStorageConnector
             y_meta=parse_array_metadata(metadata["y"]) if "y" in metadata else None,
             crs_wkt=metadata.get("spatial_ref", {}).get("attributes", {}).get("crs_wkt"),
             geo_transform=_parse_geo_transform(metadata.get("spatial_ref", {}).get("attributes", {}).get("GeoTransform")),
+            layout_validation=layout.validation,
         )
         entry = catalog[dataset_id]
+        entry.meta.layout_validation = layout.validation
+        _append_layout_diagnostic(
+            diagnostics,
+            store_path=store_path,
+            status="accepted",
+            layout_validation=layout.validation,
+        )
         _apply_crs_metadata(entry)
         multiscale_summary = probe_multiscale_store(
             connector=connector,
@@ -751,23 +788,168 @@ def build_dataset_manifest(catalog: dict[str, CatalogEntry]) -> list[DatasetMeta
     return [entry.meta.model_copy(deep=True) for entry in catalog.values()]
 
 
-def warm_catalog_index(app, eager_entry_state: bool = False) -> dict[str, CatalogEntry]:
+def dataset_manifest_path(settings: Settings) -> str:
+    prefix = str(getattr(settings, "oci_prefix", "") or "").strip("/")
+    if prefix:
+        return f"{prefix}/_manifest/datasets.json"
+    return "_manifest/datasets.json"
+
+
+def build_dataset_manifest_payload(
+    settings: Settings,
+    manifest: list[DatasetMeta],
+    *,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
+        "generated_at": (generated_at or datetime.now(tz=UTC)).isoformat(),
+        "oci_prefix": str(getattr(settings, "oci_prefix", "") or ""),
+        "datasets": [item.model_dump(mode="json") for item in manifest],
+    }
+
+
+def parse_dataset_manifest_payload(payload: dict[str, Any]) -> tuple[list[DatasetMeta], dict[str, Any]]:
+    schema_version = payload.get("schema_version")
+    if schema_version != DATASET_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported dataset manifest schema version: {schema_version!r}")
+    raw_datasets = payload.get("datasets")
+    if not isinstance(raw_datasets, list):
+        raise ValueError("Dataset manifest is missing a datasets list")
+    manifest = [DatasetMeta.model_validate(item) for item in raw_datasets]
+    return manifest, {
+        "schema_version": schema_version,
+        "generated_at": payload.get("generated_at"),
+        "dataset_count": len(manifest),
+    }
+
+
+def read_dataset_manifest_from_object(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+) -> tuple[list[DatasetMeta] | None, dict[str, Any]]:
+    path = dataset_manifest_path(settings)
+    loaded_at = datetime.now(tz=UTC).isoformat()
+    try:
+        raw_payload = connector.read_text(path, use_cache=False)
+        payload = json.loads(raw_payload)
+        if not isinstance(payload, dict):
+            raise ValueError("Dataset manifest root must be an object")
+        manifest, summary = parse_dataset_manifest_payload(payload)
+    except FileNotFoundError:
+        return None, {
+            "source": "object_manifest",
+            "path": path,
+            "status": "missing",
+            "loaded_at": loaded_at,
+        }
+    except Exception as exc:
+        logger.warning("Ignoring unreadable dataset manifest %s: %s", path, exc)
+        return None, {
+            "source": "object_manifest",
+            "path": path,
+            "status": "invalid",
+            "loaded_at": loaded_at,
+            "error": str(exc),
+        }
+
+    diagnostics = {
+        "source": "object_manifest",
+        "path": path,
+        "status": "loaded",
+        "loaded_at": loaded_at,
+        **summary,
+    }
+    return manifest, diagnostics
+
+
+def write_dataset_manifest_to_object(
+    settings: Settings,
+    connector: OCIObjectStorageConnector,
+    manifest: list[DatasetMeta],
+) -> dict[str, Any]:
+    path = dataset_manifest_path(settings)
+    generated_at = datetime.now(tz=UTC)
+    payload = build_dataset_manifest_payload(settings, manifest, generated_at=generated_at)
+    connector.write_text(path, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return {
+        "source": "live_scan",
+        "path": path,
+        "status": "written",
+        "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
+        "generated_at": generated_at.isoformat(),
+        "dataset_count": len(manifest),
+    }
+
+
+def load_dataset_manifest_from_object(app) -> bool:
+    connector = app.state.storage_connector
+    if connector is None:
+        app.state.dataset_manifest_diagnostics = {
+            "source": "object_manifest",
+            "status": "unavailable",
+            "error": "storage connector is not configured",
+        }
+        return False
+    manifest, diagnostics = read_dataset_manifest_from_object(app.state.settings, connector)
+    app.state.dataset_manifest_diagnostics = diagnostics
+    if manifest is None:
+        return False
+    app.state.dataset_manifest = manifest
+    return True
+
+
+def warm_catalog_index(
+    app,
+    eager_entry_state: bool = False,
+    persist_manifest: bool = False,
+    eager_manifest_metadata: bool = False,
+) -> dict[str, CatalogEntry]:
     settings = app.state.settings
     connector = app.state.storage_connector
     if connector is None:
         app.state.dataset_catalog = {}
         app.state.dataset_manifest = []
+        app.state.dataset_manifest_diagnostics = {
+            "source": "live_scan",
+            "status": "empty",
+            "dataset_count": 0,
+        }
         return {}
 
-    catalog = build_catalog_index(settings=settings, connector=connector)
-    if eager_entry_state:
+    layout_diagnostics: list[dict[str, Any]] = []
+    catalog = build_catalog_index(settings=settings, connector=connector, diagnostics=layout_diagnostics)
+    if eager_entry_state or eager_manifest_metadata:
         for entry in catalog.values():
             try:
-                ensure_catalog_entry_ready(entry, connector)
+                if eager_entry_state:
+                    ensure_catalog_entry_ready(entry, connector)
+                else:
+                    ensure_catalog_entry_metadata_ready(entry, connector)
             except Exception as exc:
-                logger.warning("Skipping eager catalog warm-up for %s: %s", entry.path, exc)
+                logger.warning("Skipping eager catalog metadata warm-up for %s: %s", entry.path, exc)
     app.state.dataset_catalog = catalog
     app.state.dataset_manifest = build_dataset_manifest(catalog)
+    diagnostics: dict[str, Any] = {
+        "source": "live_scan",
+        "status": "built",
+        "dataset_count": len(app.state.dataset_manifest),
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "layout_diagnostics": layout_diagnostics,
+    }
+    if persist_manifest:
+        try:
+            diagnostics = write_dataset_manifest_to_object(settings, connector, app.state.dataset_manifest)
+            diagnostics["layout_diagnostics"] = layout_diagnostics
+        except Exception as exc:
+            logger.warning("Failed to persist OCI dataset manifest: %s", exc)
+            diagnostics = {
+                **diagnostics,
+                "status": "write_failed",
+                "path": dataset_manifest_path(settings),
+                "error": str(exc),
+            }
+    app.state.dataset_manifest_diagnostics = diagnostics
     logger.info("Built OCI dataset manifest with %d dataset(s)", len(app.state.dataset_manifest))
     return catalog
 
@@ -794,6 +976,8 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
         entry.data_array_name = layout.data_array_name
         entry.band_array_name = layout.band_array_name or ""
         entry.variable_array_names = layout.variable_array_names
+        entry.layout_validation = layout.validation
+        entry.meta.layout_validation = layout.validation
         entry.data_array_metas = {
             array_name: parse_array_metadata(metadata[array_name])
             for array_name in {layout.data_array_name, *layout.variable_array_names.values()}
@@ -835,7 +1019,7 @@ def ensure_catalog_entry_metadata_ready(entry: CatalogEntry, connector: OCIObjec
                 entry.band_names = _default_band_names(int(metadata[layout.band_array_name]["shape"][0]))
 
         data_shape = metadata[layout.data_array_name]["shape"]
-        data_dimension_names = tuple(metadata[layout.data_array_name].get("dimension_names", []))
+        data_dimension_names = _dimension_names_from_node(metadata[layout.data_array_name])
         time_steps = int(data_shape[0]) if data_shape and data_dimension_names[0:1] == ("time",) else 1
         entry.band_indices = {name: index for index, name in enumerate(entry.band_names)}
         if "time" in metadata:

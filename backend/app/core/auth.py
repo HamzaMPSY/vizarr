@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from secrets import compare_digest
 from urllib.parse import unquote
@@ -15,6 +16,7 @@ _GLOBAL_ACCESS_PREFIXES = ("/api/storage", "/api/query", "/api/exports")
 @dataclass(frozen=True)
 class AuthContext:
     token_hint: str
+    token_digest: str
     allowed_dataset_ids: frozenset[str] | None
 
     @property
@@ -75,6 +77,7 @@ def authenticate_token(settings, token: str | None) -> AuthContext:
         if compare_digest(token, key.token):
             return AuthContext(
                 token_hint=_token_hint(key.token),
+                token_digest=_token_digest(key.token),
                 allowed_dataset_ids=key.allowed_dataset_ids,
             )
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
@@ -169,3 +172,7 @@ def _parse_auth_keys(raw_value: str) -> list[_AuthKey]:
 
 def _token_hint(token: str) -> str:
     return f"...{token[-6:]}" if len(token) > 6 else "configured-key"
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]

@@ -30,6 +30,26 @@ export interface DatasetBounds {
   north: number;
 }
 
+export type BBox = [number, number, number, number];
+
+export interface RangeStatsResponse {
+  result_type: "range_stats";
+  dataset_id: string;
+  variable: string;
+  time_index: number;
+  bbox?: BBox | null;
+  stats_source: "metadata" | "sampled_bbox";
+  min: number | null;
+  max: number | null;
+  p02: number | null;
+  p98: number | null;
+  histogram_bins: number[];
+  histogram_counts: number[];
+  valid_count: number;
+  unit?: string | null;
+  notes: string[];
+}
+
 export interface DatasetMeta {
   id: string;
   name: string;
@@ -48,12 +68,38 @@ export interface DatasetMeta {
   multiscale_zarr_format?: number | null;
   multiscale_zarr_consolidated?: boolean | null;
   multiscale_proxy_root?: string | null;
+  multiscale_population_strategy?: string | null;
+  multiscale_prepopulated_zoom_max?: number | null;
+  multiscale_max_zoom?: number | null;
+  layout_validation?: LayoutValidation | null;
 }
 
 export interface ChunkLayout {
   sharded: boolean;
   shard_shape?: number[] | null;
   inner_chunk_shape?: number[] | null;
+}
+
+export interface LayoutValidationIssue {
+  code: string;
+  message: string;
+  remediation: string;
+}
+
+export interface LayoutValidation {
+  adapter_name?: string | null;
+  adapter_priority?: number | null;
+  accepted: boolean;
+  data_array_name?: string | null;
+  band_array_name?: string | null;
+  variable_array_names: Record<string, string>;
+  matched_dimensions: string[];
+  accepted_dimensions: string[];
+  required_metadata: string[];
+  crs_transform_conventions: string[];
+  tile_capabilities: string[];
+  readback_capabilities: string[];
+  issues: LayoutValidationIssue[];
 }
 
 export type BrowseCoverageStatus = 'missing' | 'partial' | 'complete' | 'queued' | 'running' | 'failed';
@@ -90,6 +136,9 @@ export interface DatasetServingProfile {
   multiscale_zarr_format?: number | null;
   multiscale_zarr_consolidated?: boolean | null;
   multiscale_proxy_root?: string | null;
+  multiscale_population_strategy?: string | null;
+  multiscale_prepopulated_zoom_max?: number | null;
+  multiscale_max_zoom?: number | null;
   data_array_name?: string | null;
   variable_ids: string[];
   has_multiscale: boolean;
@@ -99,6 +148,7 @@ export interface DatasetServingProfile {
   browse_overview_max_zoom?: number | null;
   browse_coverage: BrowseCoverage;
   chunk_layout?: ChunkLayout | null;
+  layout_validation?: LayoutValidation | null;
   supported_rendering_modes: string[];
   browser_multiscale_ready: boolean;
   browser_gpu_ready?: boolean;
@@ -111,8 +161,8 @@ export interface DatasetServingProfile {
 export interface MultiscaleLevelProfile {
   path: string;
   browse_zoom?: number | null;
-  bbox_wgs84?: [number, number, number, number] | null;
-  bbox_epsg3857?: [number, number, number, number] | null;
+  bbox_wgs84?: BBox | null;
+  bbox_epsg3857?: BBox | null;
   shape: number[];
   chunks: number[];
   dtype?: string | null;
@@ -129,11 +179,22 @@ export interface TileJson {
   tilejson: string;
   name: string;
   tiles: string[];
-  bounds: [number, number, number, number];
+  bounds: BBox;
   center?: [number, number, number] | null;
   minzoom: number;
   maxzoom: number;
   detail_minzoom?: number | null;
   has_coarse_fallback: boolean;
   coarse_representation?: string | null;
+}
+
+export interface BrowseGenerationAcceptedResponse {
+  job_id: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  result_type: "browse_generation";
+  dataset_id: string;
+  progress: number;
+  total_artifacts: number;
+  completed_artifacts: number;
+  can_retry: boolean;
 }

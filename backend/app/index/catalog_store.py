@@ -7,7 +7,7 @@ from app.index.planner_index import CubeIndexRecord
 from app.models.dataset import DatasetMeta
 
 
-def build_index_records(app) -> list[CubeIndexRecord]:
+def build_index_records(app, *, allow_catalog_build: bool = True) -> list[CubeIndexRecord]:
     settings = app.state.settings
     browse_styles = [
         item.strip()
@@ -16,19 +16,36 @@ def build_index_records(app) -> list[CubeIndexRecord]:
     ]
 
     if settings.storage_backend == "oci_zarr" and getattr(app.state, "storage_connector", None) is not None:
-        catalog = get_or_build_catalog(app)
+        catalog = getattr(app.state, "dataset_catalog", None)
+        if catalog is None and allow_catalog_build:
+            catalog = get_or_build_catalog(app)
         records: list[CubeIndexRecord] = []
-        for entry in catalog.values():
-            records.extend(
-                _records_from_catalog_entry(
-                    settings=settings,
-                    entry=entry,
-                    browse_styles=browse_styles,
-                    version=settings.planner_version,
+        if catalog is not None:
+            for entry in catalog.values():
+                records.extend(
+                    _records_from_catalog_entry(
+                        settings=settings,
+                        entry=entry,
+                        browse_styles=browse_styles,
+                        version=settings.planner_version,
+                    )
                 )
-            )
-        if records:
-            return records
+            if records:
+                return records
+
+        manifest = getattr(app.state, "dataset_manifest", None)
+        if manifest:
+            for item in manifest:
+                meta = item if isinstance(item, DatasetMeta) else DatasetMeta.model_validate(item)
+                records.extend(
+                    _records_from_manifest_meta(
+                        meta=meta,
+                        browse_styles=browse_styles,
+                        version=settings.planner_version,
+                    )
+                )
+            if records:
+                return records
 
     registry = app.state.registry
     return _records_from_registry(
@@ -72,6 +89,25 @@ def _records_from_catalog_entry(
         browse_styles=browse_styles,
         version=version,
         crs=entry.crs_wkt,
+    )
+
+
+def _records_from_manifest_meta(
+    *,
+    meta: DatasetMeta,
+    browse_styles: list[str],
+    version: str,
+) -> list[CubeIndexRecord]:
+    serving_path = meta.zarr_proxy_root or f"/api/zarr/{meta.id}"
+    return _records_from_meta(
+        collection_id=meta.id,
+        meta=meta,
+        source_path=serving_path,
+        serving_path=serving_path,
+        browse_path_root=serving_path,
+        browse_styles=browse_styles,
+        version=version,
+        crs=meta.crs_wkt or meta.crs_authority,
     )
 
 

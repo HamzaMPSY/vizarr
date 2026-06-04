@@ -1,4 +1,12 @@
-import type { DatasetMeta, DatasetServingProfile, TileJson, VariableMeta } from "../types";
+import type {
+  BrowseGenerationAcceptedResponse,
+  BBox,
+  DatasetMeta,
+  DatasetServingProfile,
+  RangeStatsResponse,
+  TileJson,
+  VariableMeta
+} from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
 const WS_BASE = import.meta.env.VITE_WS_URL ?? "";
@@ -13,14 +21,80 @@ interface TileUrlParams {
   vmax: number | null;
 }
 
+interface DatasetListParams {
+  bbox?: BBox | null;
+}
+
+interface RangeStatsParams {
+  datasetId: string;
+  variable: string;
+  timeIndex: number;
+  bbox?: BBox | null;
+  bins?: number;
+  maxWidth?: number;
+  maxHeight?: number;
+}
+
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+
+  constructor(message: string, status: number, detail: unknown = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    const detail = await readErrorDetail(response);
+    throw new ApiError(errorDetailToMessage(detail, response.status), response.status, detail);
   }
   return response.json() as Promise<T>;
 }
 
-function authHeaders(): HeadersInit | undefined {
+export function isOciAuthApiError(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 503) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes("oci") || message.includes("auth") || message.includes("session") || message.includes("token");
+}
+
+async function readErrorDetail(response: Response): Promise<unknown> {
+  try {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const payload = await response.clone().json() as unknown;
+      if (payload && typeof payload === "object" && "detail" in payload) {
+        return (payload as { detail?: unknown }).detail;
+      }
+      return payload;
+    }
+    const text = await response.clone().text();
+    return text.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function errorDetailToMessage(detail: unknown, status: number): string {
+  if (typeof detail === "string" && detail.trim()) {
+    return detail.trim();
+  }
+  if (detail && typeof detail === "object") {
+    const fields = detail as Record<string, unknown>;
+    return [fields.error, fields.reason, fields.message]
+      .filter((item): item is string | number => typeof item === "string" || typeof item === "number")
+      .join(" ")
+      .trim() || `Request failed with ${status}`;
+  }
+  return `Request failed with ${status}`;
+}
+
+function authHeaders(): Record<string, string> | undefined {
   return API_KEY ? { "X-API-Key": API_KEY } : undefined;
 }
 
@@ -92,8 +166,13 @@ export function buildWebSocketUrl(path: string): string {
 interface TileJsonParams extends TileUrlParams {}
 
 export const api = {
-  datasets: async (): Promise<DatasetMeta[]> => {
-    const response = await fetch(`${API_BASE}/api/datasets`, { headers: authHeaders() });
+  datasets: async (params: DatasetListParams = {}): Promise<DatasetMeta[]> => {
+    const query = new URLSearchParams();
+    if (params.bbox) {
+      query.set("bbox", params.bbox.map((value) => String(value)).join(","));
+    }
+    const suffix = query.toString();
+    const response = await fetch(`${API_BASE}/api/datasets${suffix ? `?${suffix}` : ""}`, { headers: authHeaders() });
     return parseJson<DatasetMeta[]>(response);
   },
   dataset: async (datasetId: string): Promise<DatasetMeta> => {
@@ -132,6 +211,30 @@ export const api = {
       headers: authHeaders()
     });
     return parseJson<VariableMeta[]>(response);
+  },
+  createBrowseGeneration: async (datasetId: string): Promise<BrowseGenerationAcceptedResponse> => {
+    const headers = authHeaders();
+    const response = await fetch(`${API_BASE}/api/datasets/${encodeURIComponent(datasetId)}/browse-generation`, {
+      method: "POST",
+      headers: headers ? { "Content-Type": "application/json", ...headers } : { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    return parseJson<BrowseGenerationAcceptedResponse>(response);
+  },
+  rangeStats: async (params: RangeStatsParams): Promise<RangeStatsResponse> => {
+    const query = new URLSearchParams({
+      dataset_id: params.datasetId,
+      variable: params.variable,
+      time_index: String(params.timeIndex),
+      bins: String(params.bins ?? 32),
+      max_width: String(params.maxWidth ?? 128),
+      max_height: String(params.maxHeight ?? 128)
+    });
+    if (params.bbox) {
+      query.set("bbox", params.bbox.map((value) => String(value)).join(","));
+    }
+    const response = await fetch(`${API_BASE}/api/query/range?${query.toString()}`, { headers: authHeaders() });
+    return parseJson<RangeStatsResponse>(response);
   },
   colormaps: async (): Promise<string[]> => {
     const response = await fetch(buildApiUrl("/api/colormaps"), { headers: authHeaders() });

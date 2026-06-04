@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../api/endpoints";
-import type { DatasetMeta, DatasetServingProfile, TileJson, VariableMeta } from "../types";
+import type { BBox, DatasetMeta, DatasetServingProfile, TileJson, VariableMeta } from "../types";
 
-export function useDatasets() {
+export function useDatasets(bbox: BBox | null = null) {
   return useQuery<DatasetMeta[]>({
-    queryKey: ["datasets"],
-    queryFn: api.datasets,
+    queryKey: ["datasets", bbox ? bbox.map((value) => value.toFixed(5)).join(",") : "all"],
+    queryFn: () => api.datasets({ bbox }),
     staleTime: 30_000
   });
 }

@@ -195,6 +195,7 @@ def build_tile_debug_headers(metrics: TileRequestMetrics) -> dict[str, str]:
         "X-Tile-Time-Ms": str(timings.get("total_request", 0.0)),
         "X-Tile-Planner-Ms": str(timings.get("planner", 0.0)),
         "X-Tile-Cache-Lookup-Ms": str(timings.get("cache_lookup", 0.0)),
+        "X-Tile-Coalescing-Ms": str(timings.get("request_coalescing", 0.0)),
         "X-Tile-Catalog-Ms": str(timings.get("catalog_metadata", 0.0)),
         "X-Tile-Render-Ms": str(timings.get("representation_generation", 0.0)),
         "X-Tile-Encode-Ms": str(timings.get("image_encoding", 0.0)),

@@ -9,6 +9,7 @@ This document distinguishes implemented performance behavior from planned work.
 | Map renderer state | Browser/GPU | Implemented | MapLibre has already loaded and retained the raster tile |
 | TanStack Query | Browser memory | Implemented | Dataset, variable, colormap, TileJSON, or serving-profile query key is still cached |
 | Browser HTTP cache | Browser | Implemented | Tile or Zarr proxy response has `Cache-Control: public, max-age=3600` |
+| Spatial bounds shortcut | Backend/API | Implemented | XYZ tile bbox does not intersect `DatasetMeta.bounds`; backend returns transparent WebP before source rendering |
 | Redis tile cache | Backend/Redis | Implemented | Tile cache key exists for the exact dataset, variable/style, coordinate, display range, render mode, composite bands, planner representation, and planner version |
 | Browse artifacts | OCI/local cache path | Implemented | Planner chooses `browse` and the overview artifact exists |
 | Multiscale artifacts | OCI | Partly implemented | Planner chooses `pyramid` and the generated tile exists or can be generated/cache-filled |
@@ -30,10 +31,17 @@ includes every parameter that changes tile output:
 - selected representation;
 - render mode;
 - composite band ids when rendering RGB styles;
-- planner version.
+- planner version;
+- dataset tile cache version.
 
 This prevents stale bytes from one representation or style from being reused for
 another.
+
+Each cached tile is also recorded in a dataset-scoped Redis index. Dataset
+invalidation deletes only keys recorded for that dataset and bumps the dataset
+tile cache version. The bumped version is included in fresh TileJSON tile URLs
+as `cache_version=...`, so browser/Nginx requests move to a new URL even if an
+older disk-cache entry still exists.
 
 Display range values are normalized before key hashing. By default,
 `TILE_CACHE_DISPLAY_RANGE_DECIMALS=3`, so tiny slider jitter does not create a
@@ -61,10 +69,18 @@ Tile responses include:
 - `X-Request-Class`;
 - `X-Execution-Path`;
 - `X-Representation`;
+- `X-Request-Coalescing`;
+- optional `X-Tile-Empty` and `X-Planned-Representation` for bounds-empty
+  transparent tiles;
 - optional `X-Browse-Source`.
 
 These headers let the frontend and operators distinguish browser/Redis cache
 behavior from browse, pyramid, or direct serving paths.
+
+When a requested tile is outside dataset bounds, the backend returns a
+transparent 256x256 WebP with `X-Representation: empty` and `X-Tile-Empty:
+bounds`. The response is cacheable by the browser or Nginx and does not touch
+OCI source objects.
 
 When `TILE_DEBUG_HEADERS_ENABLED=true`, tile responses also include sanitized
 per-request diagnostics:
@@ -72,6 +88,7 @@ per-request diagnostics:
 - `X-Tile-Time-Ms`;
 - `X-Tile-Planner-Ms`;
 - `X-Tile-Cache-Lookup-Ms`;
+- `X-Tile-Coalescing-Ms`;
 - `X-Tile-Catalog-Ms`;
 - `X-Tile-Render-Ms`;
 - `X-Tile-Encode-Ms`;
@@ -91,6 +108,11 @@ XYZ coordinates, representation/cache state, timings, and aggregate counts; it
 does not include OCI signed URLs, tokens, namespace credentials, or object
 contents.
 
+`X-Request-Coalescing` reports `leader`, `follower`, `bypass`, or `none`.
+Identical uncached tile cache keys are coalesced inside each backend worker:
+one leader renders the tile and followers wait for the same result. Followers
+return `X-Cache-Status: COALESCED`; cache hits still return `HIT`.
+
 ## Browse overviews
 
 Browse overviews are the current first-view performance lever. They avoid
@@ -100,11 +122,26 @@ Current behavior:
 
 - startup can prewarm catalog/browse state when enabled;
 - browse artifacts can be generated ahead of time with backend tools;
+- OCI deployments can queue dataset-scoped browse generation with
+  `POST /api/datasets/{dataset_id}/browse-generation` and poll
+  `GET /api/datasets/{dataset_id}/browse-generation/{job_id}`;
+- active browse generation requests are deduplicated by dataset, variables,
+  time indices, zoom levels, and overwrite mode, so repeat operator clicks do
+  not schedule parallel builds for the same configuration;
 - the tile route attempts browse serving when the planner selects `browse`;
 - missing browse files fall back to direct `serving`.
 
 Browse coverage is dataset-specific. A dataset can be valid and still have slow
 first-view performance if its browse artifacts are missing.
+
+Browse manifests and generated overview objects are durable in OCI. Browse
+generation job status is stored through the shared job record store: Redis when
+available, with `JOB_STORE_TTL` controlling status retention, and an in-memory
+fallback for local development. Progress is readable across backend workers when
+Redis is active, failed jobs can be retried, and queued/running duplicates are
+collapsed to the existing job id. The background browse-generation work still
+runs in the accepting backend process, so a process death can stop the work even
+though the last persisted status remains available until TTL expiry.
 
 ## Multiscale artifacts
 
@@ -226,8 +263,16 @@ Tiles are returned as WebP. For continuous visual data, WebP generally keeps til
 payloads smaller than PNG while preserving enough visual quality for map
 navigation.
 
-If exact pixel readback becomes a product requirement, add a separate lossless
-path rather than changing the default map tile response globally.
+Exact source-value readback uses separate `/api/query/point`,
+`/api/query/bbox`, and `/api/query/range` endpoints. Those endpoints read
+source arrays before colormap, resampling for display, compositing, and WebP
+encoding. Keep WebP as the default map tile format unless a concrete product
+case justifies a separate lossless image-tile mode.
+
+`/api/query/range` returns metadata stats when no bbox is supplied. With a bbox,
+it samples a bounded source window and computes min/max, p02/p98, and histogram
+counts for active-view range selection. The frontend calls it only after an
+explicit sidebar action, not while the map is moving.
 
 ## Zarr proxy byte ranges
 
@@ -262,10 +307,22 @@ aborted whenever the viewport, dataset, variable, time index, colormap, display
 range, or TileJSON template changes.
 
 The center tile response is also used to seed `vmin` and `vmax` from
-`X-Data-Vmin` and `X-Data-Vmax` when the user has not already selected an
-explicit range. This keeps MapLibre as the visible tile loader while still
+`X-Data-Vmin` and `X-Data-Vmax` when the user has not already selected a
+manual range. This keeps MapLibre as the visible tile loader while still
 warming likely-next tiles at lower priority and avoiding a separate metadata
 request for the first display range.
+
+Manual display range inputs are draft-only until Apply, Reset auto, or a preset
+button commits state. Invalid `min >= max` drafts never enter TileJSON or tile
+URL construction. This preserves the cache-key normalization policy from ticket
+`023` by preventing one key per keystroke or pointer movement.
+
+Temporal playback uses the same conservative prefetch machinery. When playback
+is active, the frontend can prefetch the next time step with radius `1`, at most
+`8` queued tiles, and `1` in-flight request. This is enabled only for synthetic
+data, browse-covered datasets, or datasets with browser multiscale/GPU-ready
+sidecars. Direct-only OCI datasets show a playback warning and do not start
+adjacent-time speculative requests.
 
 ## Nginx tile cache
 
@@ -276,6 +333,10 @@ and can serve stale tile bytes during backend timeout/error/update states.
 
 Through Nginx, `X-Cache-Status` reports the Nginx disk cache status. Direct
 backend tile requests still use `X-Cache-Status` for the backend Redis cache.
+Dataset invalidation does not purge Nginx files directly. Instead, TileJSON
+templates include the bumped `cache_version` query parameter after invalidation,
+which makes subsequent tile URLs distinct and prevents silent reuse of old
+disk-cache entries.
 
 ## WebSocket invalidation
 

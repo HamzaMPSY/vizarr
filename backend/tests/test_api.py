@@ -1,12 +1,19 @@
+import asyncio
+import time
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.rate_limit import ApiKeyRateLimiter
 from app.core.dataset_catalog import CatalogEntry
 from app.core.oci_auth import OCIAuthExpiredError
 from app.core.oci_object_storage import OCIObjectInfo
 from app.core.tile_observability import record_object_read
 from app.core.tile_observability import record_zarr_chunk_read
 from app.main import app
+from app.main import _cors_allowed_origins
+from app.models.dataset import DatasetBounds
 from app.models.dataset import DatasetMeta
 from app.models.dataset import CompositeStyle
 from app.models.dataset import TileJSON
@@ -49,6 +56,40 @@ def test_auth_is_required_by_production_environment(monkeypatch) -> None:
     assert health.status_code == 200
     assert protected.status_code == 503
     assert "AUTH_API_KEYS" in protected.json()["detail"]
+
+
+def test_production_cors_does_not_default_to_wildcard() -> None:
+    settings = SimpleNamespace(app_environment="production", cors_allowed_origins="")
+
+    assert _cors_allowed_origins(settings) == []
+
+
+def test_configured_production_cors_filters_wildcard() -> None:
+    settings = SimpleNamespace(
+        app_environment="production",
+        cors_allowed_origins="*,https://viewer.example.com",
+    )
+
+    assert _cors_allowed_origins(settings) == ["https://viewer.example.com"]
+
+
+def test_api_key_rate_limit_returns_429(monkeypatch) -> None:
+    monkeypatch.setattr(app.state.settings, "auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "auth_api_keys", "limited-key")
+    monkeypatch.setattr(
+        app.state,
+        "api_key_rate_limiter",
+        ApiKeyRateLimiter(limit=1, window_seconds=60),
+        raising=False,
+    )
+
+    first = client.get("/api/datasets", headers={"X-API-Key": "limited-key"})
+    second = client.get("/api/datasets", headers={"X-API-Key": "limited-key"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.json()["detail"] == "API key rate limit exceeded"
+    assert second.headers["retry-after"]
 
 
 def test_dataset_scoped_api_key_filters_dataset_list(monkeypatch) -> None:
@@ -100,6 +141,23 @@ def test_list_datasets() -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["id"] == "demo-global"
+
+
+def test_list_datasets_filters_by_bbox() -> None:
+    visible = client.get("/api/datasets?bbox=10,0,20,5")
+    hidden = client.get("/api/datasets?bbox=10,86,20,89")
+
+    assert visible.status_code == 200
+    assert [item["id"] for item in visible.json()] == ["demo-global"]
+    assert hidden.status_code == 200
+    assert hidden.json() == []
+
+
+def test_list_datasets_rejects_invalid_bbox() -> None:
+    response = client.get("/api/datasets?bbox=1,2,3")
+
+    assert response.status_code == 422
+    assert "bbox" in response.json()["detail"]
 
 
 def test_list_variables() -> None:
@@ -158,6 +216,36 @@ def test_get_tile_hits_memory_cache_on_second_request() -> None:
     assert second.status_code == 200
     assert second.headers["x-cache-status"] == "HIT"
     assert second.content == first.content
+
+
+def test_dataset_tile_cache_invalidation_bypasses_stale_memory_cache() -> None:
+    asyncio.run(app.state.cache.invalidate_dataset_tiles("demo-global"))
+    first = client.get("/api/tiles/demo-global/temperature/4/7/6?colormap=magma")
+    second = client.get("/api/tiles/demo-global/temperature/4/7/6?colormap=magma")
+    asyncio.run(app.state.cache.invalidate_dataset_tiles("demo-global"))
+    third = client.get("/api/tiles/demo-global/temperature/4/7/6?colormap=magma")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert first.headers["x-cache-status"] == "MISS"
+    assert second.headers["x-cache-status"] == "HIT"
+    assert third.headers["x-cache-status"] == "MISS"
+
+
+def test_tilejson_template_changes_after_dataset_tile_cache_invalidation() -> None:
+    asyncio.run(app.state.cache.invalidate_dataset_tiles("demo-global"))
+    first = client.get("/api/tilejson/demo-global/temperature?colormap=viridis")
+    asyncio.run(app.state.cache.invalidate_dataset_tiles("demo-global"))
+    second = client.get("/api/tilejson/demo-global/temperature?colormap=viridis")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_tile = first.json()["tiles"][0]
+    second_tile = second.json()["tiles"][0]
+    assert "cache_version=" in first_tile
+    assert "cache_version=" in second_tile
+    assert first_tile != second_tile
 
 
 def test_high_zoom_tile_prefers_serving_representation() -> None:
@@ -291,6 +379,100 @@ def test_list_datasets_exposes_zarr_proxy_metadata(monkeypatch) -> None:
     assert payload[0]["multiscale_population_strategy"] == "prepopulated_then_lazy"
     assert payload[0]["multiscale_prepopulated_zoom_max"] == 12
     assert payload[0]["multiscale_max_zoom"] == 15
+
+
+def test_oci_list_datasets_filters_manifest_by_bbox(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    variable = VariableMeta(
+        id="NDVI",
+        name="NDVI",
+        unit="1",
+        time_steps=1,
+        stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+    )
+    entry.meta.variables = [variable]
+    entry.meta.bounds = DatasetBounds(west=30.0, south=-2.0, east=31.0, north=-1.0)
+    remote = entry.meta.model_copy(deep=True)
+    remote.id = "dataset-2"
+    remote.name = "remote.zarr"
+    remote.bounds = DatasetBounds(west=-120.0, south=30.0, east=-110.0, north=40.0)
+    app.state.dataset_manifest = [entry.meta.model_copy(deep=True), remote]
+
+    response = client.get("/api/datasets?bbox=29,-3,32,0")
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == ["dataset-1"]
+
+
+def test_oci_list_datasets_bbox_filter_supports_antimeridian(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+    entry.meta.bounds = DatasetBounds(west=170.0, south=-10.0, east=-170.0, north=10.0)
+    app.state.dataset_manifest = [entry.meta.model_copy(deep=True)]
+
+    response = client.get("/api/datasets?bbox=175,-5,-175,5")
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == ["dataset-1"]
+
+
+def test_list_datasets_can_return_loaded_object_manifest_without_catalog_scan(monkeypatch) -> None:
+    manifest = [
+        DatasetMeta(
+            id="dataset-1",
+            name="example.zarr",
+            description="Example dataset",
+            variables=[
+                VariableMeta(
+                    id="B1",
+                    name="Band 1",
+                    unit="DN",
+                    time_steps=1,
+                    stats=VariableStats(min=0.0, max=1.0, p02=0.02, p98=0.98),
+                )
+            ],
+            zarr_format=3,
+            zarr_consolidated=True,
+            zarr_proxy_root="/api/zarr/dataset-1",
+        )
+    ]
+    monkeypatch.setattr(app.state.settings, "storage_backend", "oci_zarr")
+    monkeypatch.setattr(app.state, "storage_connector", object(), raising=False)
+    monkeypatch.setattr(app.state, "dataset_catalog", None, raising=False)
+    monkeypatch.setattr(app.state, "dataset_manifest", manifest, raising=False)
+    monkeypatch.setattr(
+        app.state,
+        "dataset_manifest_diagnostics",
+        {
+            "source": "object_manifest",
+            "status": "loaded",
+            "generated_at": "2026-06-03T00:00:00+00:00",
+            "dataset_count": 1,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.api.datasets.get_or_build_catalog",
+        lambda _app: (_ for _ in ()).throw(AssertionError("catalog scan should not run")),
+    )
+
+    response = client.get("/api/datasets")
+
+    assert response.status_code == 200
+    assert response.headers["x-dataset-manifest-source"] == "object_manifest"
+    assert response.headers["x-dataset-manifest-status"] == "loaded"
+    assert response.headers["x-dataset-manifest-generated-at"] == "2026-06-03T00:00:00+00:00"
+    payload = response.json()
+    assert [item["id"] for item in payload] == ["dataset-1"]
+    assert payload[0]["variables"][0]["id"] == "B1"
 
 
 def test_list_datasets_hydrates_variables_when_manifest_is_shallow(monkeypatch) -> None:
@@ -617,6 +799,73 @@ def test_oci_tile_falls_back_from_pyramid_to_serving(monkeypatch) -> None:
     assert response.headers["x-data-vmin"] == "0.2"
 
 
+def test_oci_tile_outside_dataset_bounds_returns_empty_without_source_reads(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", True)
+    entry.band_names = ["NDVI"]
+    entry.band_indices = {"NDVI": 0}
+    entry.meta.bounds = DatasetBounds(west=30.39, south=-2.09, east=30.81, north=-1.05)
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+
+    monkeypatch.setattr(
+        app.state.planner,
+        "plan_tile_request",
+        lambda **_kwargs: QueryPlan(
+            planner_version="v1",
+            collection_id=entry.id,
+            request_class="tile",
+            chosen_representation="serving",
+            execution_path="interactive",
+            request_fingerprint="outside-bounds",
+            response_cache_key="artifact:tile:outside-bounds",
+            plan_cache_key="plan:outside-bounds",
+            selected_cube=f"{entry.id}:serving",
+            selected_path=entry.path,
+        ),
+    )
+    monkeypatch.setattr("app.api.tiles.ensure_catalog_entry_metadata_ready", lambda current_entry, _connector: current_entry)
+    monkeypatch.setattr(
+        "app.api.tiles.ensure_catalog_entry_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full catalog readiness should not run")),
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_projected_band_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct renderer should not run")),
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_projected_composite_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("composite renderer should not run")),
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_browse_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("browse renderer should not run")),
+    )
+    monkeypatch.setattr(
+        "app.api.tiles.generate_pyramid_tile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pyramid renderer should not run")),
+    )
+
+    response = client.get("/api/tiles/dataset-1/NDVI/6/0/0?colormap=oob-test")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/webp"
+    assert response.headers["x-representation"] == "empty"
+    assert response.headers["x-planned-representation"] == "serving"
+    assert response.headers["x-tile-empty"] == "bounds"
+    assert response.headers["x-cache-status"] == "BYPASS"
+    assert response.headers["x-object-get-count"] == "0"
+    assert response.headers["x-zarr-chunk-count"] == "0"
+    assert len(response.content) > 0
+
+
 def test_oci_direct_tile_returns_503_when_compute_budget_exceeded(monkeypatch) -> None:
     entry = _configure_oci_app_state(monkeypatch)
     monkeypatch.setattr(app.state.settings, "tile_debug_headers_enabled", True)
@@ -888,6 +1137,43 @@ def test_dataset_serving_profile_returns_503_when_oci_token_has_expired(monkeypa
     }
 
 
+def test_healthcheck_reports_oci_auth_status(monkeypatch) -> None:
+    auth = SimpleNamespace(
+        auth_mode="security_token",
+        token_expires_at_epoch=int(time.time()) + 1_200,
+    )
+    connector = SimpleNamespace(auth=auth)
+    monkeypatch.setattr(app.state.settings, "storage_backend", "oci_zarr")
+    monkeypatch.setattr(app.state, "storage_connector", connector, raising=False)
+
+    response = client.get("/api/healthz")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["oci_auth"]["status"] == "ok"
+    assert payload["oci_auth"]["mode"] == "security_token"
+    assert payload["oci_auth"]["token_seconds_remaining"] > 0
+
+
+def test_healthcheck_reports_expired_oci_auth(monkeypatch) -> None:
+    class ExpiredConnector:
+        @property
+        def auth(self):
+            raise OCIAuthExpiredError("OCI CLI token has expired. Re-authenticate before starting the backend.")
+
+    monkeypatch.setattr(app.state.settings, "storage_backend", "oci_zarr")
+    monkeypatch.setattr(app.state, "storage_connector", ExpiredConnector(), raising=False)
+
+    response = client.get("/api/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["oci_auth"] == {
+        "status": "expired",
+        "mode": app.state.settings.oci_auth_mode,
+        "detail": "OCI CLI token has expired. Re-authenticate before starting the backend.",
+    }
+
+
 def test_create_browse_generation_job_runs_and_reports_status(monkeypatch) -> None:
     entry = _configure_oci_app_state(monkeypatch)
     entry.meta.variables = [
@@ -899,7 +1185,10 @@ def test_create_browse_generation_job_runs_and_reports_status(monkeypatch) -> No
             stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
         )
     ]
+    entry.band_names = ["NDVI"]
+    entry.band_indices = {"NDVI": 0}
     monkeypatch.setattr(app.state, "browse_generation_job_store", BrowseGenerationJobStore(), raising=False)
+    monkeypatch.setattr("app.api.datasets.ensure_catalog_entry_metadata_ready", lambda entry, _connector: entry)
 
     def _build(**kwargs):
         kwargs["progress_callback"](True)
@@ -930,6 +1219,51 @@ def test_create_browse_generation_job_runs_and_reports_status(monkeypatch) -> No
     assert status_payload["can_retry"] is False
 
 
+def test_create_browse_generation_job_reuses_active_duplicate(monkeypatch) -> None:
+    entry = _configure_oci_app_state(monkeypatch)
+    entry.meta.variables = [
+        VariableMeta(
+            id="NDVI",
+            name="NDVI",
+            unit="1",
+            time_steps=1,
+            stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
+        )
+    ]
+    entry.band_names = ["NDVI"]
+    entry.band_indices = {"NDVI": 0}
+    monkeypatch.setattr(app.state, "browse_generation_job_store", BrowseGenerationJobStore(), raising=False)
+    monkeypatch.setattr("app.api.datasets.ensure_catalog_entry_metadata_ready", lambda entry, _connector: entry)
+    scheduled_tasks = []
+
+    def _capture_task(self, func, *args, **kwargs):
+        scheduled_tasks.append((func, args, kwargs))
+
+    monkeypatch.setattr("app.api.datasets.BackgroundTasks.add_task", _capture_task)
+
+    first = client.post(
+        "/api/datasets/dataset-1/browse-generation",
+        json={"variables": ["NDVI", "NDVI"], "time_indices": [0, 0], "zoom_levels": [1, 0, 1]},
+    )
+    duplicate = client.post(
+        "/api/datasets/dataset-1/browse-generation",
+        json={"variables": ["NDVI"], "time_indices": [0], "zoom_levels": [0, 1]},
+    )
+
+    assert first.status_code == 202
+    assert duplicate.status_code == 202
+    assert duplicate.json()["job_id"] == first.json()["job_id"]
+    assert len(scheduled_tasks) == 1
+
+    status = client.get(f"/api/datasets/dataset-1/browse-generation/{first.json()['job_id']}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "queued"
+    assert status.json()["variables"] == ["NDVI"]
+    assert status.json()["time_indices"] == [0]
+    assert status.json()["zoom_levels"] == [0, 1]
+    assert status.json()["total_artifacts"] == 2
+
+
 def test_browse_generation_job_reports_failure_and_retry_state(monkeypatch) -> None:
     entry = _configure_oci_app_state(monkeypatch)
     entry.meta.variables = [
@@ -941,7 +1275,10 @@ def test_browse_generation_job_reports_failure_and_retry_state(monkeypatch) -> N
             stats=VariableStats(min=0.0, max=1.0, p02=0.1, p98=0.9),
         )
     ]
+    entry.band_names = ["NDVI"]
+    entry.band_indices = {"NDVI": 0}
     monkeypatch.setattr(app.state, "browse_generation_job_store", BrowseGenerationJobStore(), raising=False)
+    monkeypatch.setattr("app.api.datasets.ensure_catalog_entry_metadata_ready", lambda entry, _connector: entry)
 
     def _fail(**_kwargs):
         raise RuntimeError("browse build failed")

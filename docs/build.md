@@ -53,6 +53,8 @@ OCI_PREFIX=<prefix-or-zarr-store>
 For autonomous runs, prefer `OCI_AUTH_MODE=api_key`,
 `OCI_AUTH_MODE=instance_principal`, or `OCI_AUTH_MODE=resource_principal`.
 Session-token auth is useful for local development but it is not autonomous.
+On OCI compute, prefer `OCI_AUTH_MODE=instance_principal` so the service does
+not depend on a browser-refreshed local session token.
 
 Refresh local OCI session auth before starting the backend when using
 `OCI_AUTH_MODE=security_token` or a session-token profile in `auto` mode:
@@ -370,9 +372,17 @@ browse or multiscale artifacts for lower zooms.
 - [ ] Confirm Redis is reachable by the backend.
 - [ ] Confirm `OCI_CONFIG_FILE` and profile/resource-principal auth match the
       runtime environment.
+- [ ] Use `OCI_AUTH_MODE=instance_principal` on OCI compute, or another
+      non-interactive mode for autonomous production runs.
+- [ ] Set `CORS_ALLOWED_ORIGINS` to the exact public viewer origin; production
+      does not wildcard CORS when this value is empty.
+- [ ] Set `AUTH_API_KEYS` through deployment secrets and rotate by adding the
+      new key, updating clients, verifying, then removing the old key.
+- [ ] Set `API_KEY_RATE_LIMIT_PER_MINUTE` to a non-zero value for private
+      deployments that need per-key throttling.
 - [ ] Confirm browse or multiscale artifacts exist for datasets that need fast
       first-view performance.
-- [ ] Add HTTPS and domain-specific CORS policy for production.
+- [ ] Add HTTPS for production traffic.
 - [ ] Verify Nginx tile cache and `/ws` behavior against the target runtime.
 
 ## Scaling notes

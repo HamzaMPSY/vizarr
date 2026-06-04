@@ -132,6 +132,8 @@ Default URLs:
 - `GET /api/datasets/{dataset_id}`
 - `GET /api/datasets/{dataset_id}/variables`
 - `GET /api/datasets/{dataset_id}/serving-profile`
+- `POST /api/datasets/{dataset_id}/browse-generation`
+- `GET /api/datasets/{dataset_id}/browse-generation/{job_id}`
 - `GET /api/tilejson/{dataset_id}/{variable}`
 - `GET /api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
 - `GET /api/colormaps`
@@ -149,7 +151,7 @@ roles.
 | Layer | Technology | Current role |
 |---|---|---|
 | Object store | OCI Object Storage | Primary remote Zarr backend |
-| Data format | Zarr v3 source stores, generated browse/multiscale artifacts | Random access and map-tile serving |
+| Data format | Zarr v3 source stores, generated browse/multiscale artifacts | Random access and map-tile serving; Zarr v2 source metadata is a planning proof only |
 | Backend | FastAPI, Xarray, NumPy, Pillow | Catalog, planning, tile rendering, proxy routes |
 | Cache | Redis plus browser HTTP cache | Tile byte cache and repeat navigation speed |
 | Frontend | React, TypeScript, Vite, MapLibre | Dataset picker and raster tile viewer |
@@ -171,6 +173,12 @@ private deployments. Tile and WebSocket URLs include the key as `api_key`
 because MapLibre raster requests and browser WebSockets cannot set custom
 headers.
 
+Production CORS is allowlist-driven through `CORS_ALLOWED_ORIGINS`; an empty
+value no longer defaults to wildcard CORS in production. Per-key throttling can
+be enabled with `API_KEY_RATE_LIMIT_PER_MINUTE`. Rotate keys by adding the new
+key beside the old one, updating clients, verifying access, then removing the
+old key.
+
 ## Known planned work
 
 - browser-native multiscale rendering is attempted for explicitly compatible
@@ -182,6 +190,9 @@ headers.
 - direct projected `y/x`, `time/y/x`, and compatible banded `time/*/y/x`
   stores are supported; arbitrary projected Zarr layouts beyond those shapes
   remain backlog work;
+- STAC discovery, full Zarr v2 source serving, and native COG serving are not
+  implemented product paths yet; see [docs/compatibility.md](docs/compatibility.md)
+  for their scoped interoperability tracks;
 - Nginx proxies `/api`, `/api/tiles/`, `/ws`, and frontend traffic; the tile
   route has a named disk cache in production-style compose;
 - production-style compose keeps the backend internal-only by default, runs

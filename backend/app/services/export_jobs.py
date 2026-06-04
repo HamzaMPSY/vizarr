@@ -4,11 +4,12 @@ from uuid import uuid4
 from app.models.jobs import ExportJobRecord
 from app.models.jobs import JobType
 from app.models.plans import QueryPlan
+from app.services.job_records import JobRecordStore
 
 
 class ExportJobStore:
-    def __init__(self) -> None:
-        self._jobs: dict[str, ExportJobRecord] = {}
+    def __init__(self, record_store: JobRecordStore | None = None) -> None:
+        self._records = record_store or JobRecordStore()
 
     def create_job(
         self,
@@ -28,8 +29,8 @@ class ExportJobStore:
             created_at=datetime.now(tz=UTC),
             plan_snapshot=plan_snapshot,
         )
-        self._jobs[job_id] = job
+        self._records.set_model(job)
         return job
 
     def get_job(self, job_id: str) -> ExportJobRecord | None:
-        return self._jobs.get(job_id)
+        return self._records.get_model(job_id, ExportJobRecord)

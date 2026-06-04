@@ -193,7 +193,11 @@ def test_run_benchmark_reports_cold_and_warm_tile_headers(monkeypatch: pytest.Mo
                     "crs_authority": "EPSG:4326",
                     "composite_styles": [],
                 }
-            ])
+            ], headers={
+                "x-dataset-manifest-source": "object_manifest",
+                "x-dataset-manifest-status": "loaded",
+                "x-dataset-manifest-generated-at": "2026-06-03T00:00:00+00:00",
+            })
         if url.endswith("/datasets/oci-cube/variables"):
             return http_json([{"id": "B04", "name": "Red"}])
         if url.endswith("/datasets/oci-cube/serving-profile"):
@@ -282,6 +286,10 @@ def test_run_benchmark_reports_cold_and_warm_tile_headers(monkeypatch: pytest.Mo
     assert report["tiles"]["cold"]["zarr_shard_index_reads"] == 1
     assert report["tiles"]["warm"]["object_get_count"] == 0
     assert report["frontend"]["content_type"] == "text/html"
+    dataset_request = next(item for item in report["metadata"]["requests"] if item["name"] == "datasets")
+    assert dataset_request["dataset_manifest_source"] == "object_manifest"
+    assert dataset_request["dataset_manifest_status"] == "loaded"
+    assert dataset_request["dataset_manifest_generated_at"] == "2026-06-03T00:00:00+00:00"
 
 
 def test_run_benchmark_fails_when_expected_representation_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:

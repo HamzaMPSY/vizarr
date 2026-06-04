@@ -1,13 +1,20 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from app.core.dataset_catalog import CatalogEntry
+from app.core.dataset_catalog import build_catalog_index
 from app.core.dataset_catalog import _refine_bounds_from_nonempty_data
 from app.core.dataset_catalog import _select_projected_layout
 from app.core.dataset_catalog import _select_projected_array_names
 from app.core.dataset_catalog import _time_labels_from_values
 from app.core.dataset_catalog import ensure_catalog_entry_metadata_ready
 from app.core.dataset_catalog import ensure_catalog_entry_ready
+from app.core.layout_adapters import LayoutAdapterContract
+from app.core.layout_adapters import LayoutAdapterRegistry
+from app.core.layout_adapters import LayoutAdapterResult
+from app.core.layout_adapters import validate_projected_layout
 from app.core.zarr_v3 import ZarrV3ArrayMetadata
 from app.core.zarr_v3 import read_store_metadata
 from app.models.dataset import DatasetMeta
@@ -32,6 +39,36 @@ def test_select_projected_array_names_accepts_non_landsat_band_dim_name() -> Non
         "y": {
             "shape": [128],
             "dimension_names": ["y"],
+        },
+    }
+
+    assert _select_projected_array_names(metadata) == ("spectral_cube", "spectral")
+    layout = _select_projected_layout(metadata)
+    assert layout.validation.adapter_name == "projected-4d-banded"
+    assert layout.validation.adapter_priority == 100
+    assert layout.validation.accepted is True
+    assert layout.validation.accepted_dimensions == ["time/*/y/x"]
+    assert "dynamic_tiles" in layout.validation.tile_capabilities
+    assert "point" in layout.validation.readback_capabilities
+
+
+def test_select_projected_array_names_accepts_zarr_v2_array_dimensions() -> None:
+    metadata = {
+        "spectral_cube": {
+            "shape": [1, 3, 128, 256],
+            "attributes": {"_ARRAY_DIMENSIONS": ["time", "spectral", "y", "x"]},
+        },
+        "spectral": {
+            "shape": [3],
+            "attributes": {"_ARRAY_DIMENSIONS": ["spectral"]},
+        },
+        "x": {
+            "shape": [256],
+            "attributes": {"_ARRAY_DIMENSIONS": ["x"]},
+        },
+        "y": {
+            "shape": [128],
+            "attributes": {"_ARRAY_DIMENSIONS": ["y"]},
         },
     }
 
@@ -75,6 +112,34 @@ def test_select_projected_layout_accepts_direct_3d_variables() -> None:
     assert layout.data_array_name == "EVI"
     assert layout.band_array_name is None
     assert layout.variable_array_names == {"EVI": "EVI", "NDVI": "NDVI"}
+    assert layout.validation.adapter_name == "projected-3d-time-variable"
+
+
+def test_select_projected_layout_accepts_zarr_v2_direct_3d_variables() -> None:
+    metadata = {
+        "NDVI": {
+            "shape": [2, 128, 256],
+            "attributes": {"_ARRAY_DIMENSIONS": ["time", "y", "x"]},
+        },
+        "EVI": {
+            "shape": [2, 128, 256],
+            "attributes": {"_ARRAY_DIMENSIONS": ["time", "y", "x"]},
+        },
+        "x": {
+            "shape": [256],
+            "attributes": {"_ARRAY_DIMENSIONS": ["x"]},
+        },
+        "y": {
+            "shape": [128],
+            "attributes": {"_ARRAY_DIMENSIONS": ["y"]},
+        },
+    }
+
+    layout = _select_projected_layout(metadata)
+
+    assert layout.data_array_name == "EVI"
+    assert layout.band_array_name is None
+    assert layout.variable_array_names == {"EVI": "EVI", "NDVI": "NDVI"}
 
 
 def test_select_projected_layout_accepts_static_2d_variables() -> None:
@@ -102,6 +167,7 @@ def test_select_projected_layout_accepts_static_2d_variables() -> None:
     assert layout.data_array_name == "DEM"
     assert layout.band_array_name is None
     assert layout.variable_array_names == {"DEM": "DEM", "slope": "slope"}
+    assert layout.validation.adapter_name == "projected-2d-static-variable"
 
 
 def test_select_projected_layout_reports_unsupported_layout() -> None:
@@ -114,6 +180,108 @@ def test_select_projected_layout_reports_unsupported_layout() -> None:
 
     with pytest.raises(ValueError, match="supported projected layout"):
         _select_projected_layout(metadata)
+
+
+def test_layout_validation_reports_lat_lon_style_as_named_unsupported_adapter() -> None:
+    metadata = {
+        "temperature": {
+            "shape": [2, 128, 256],
+            "dimension_names": ["time", "lat", "lon"],
+        },
+        "lat": {"shape": [128], "dimension_names": ["lat"]},
+        "lon": {"shape": [256], "dimension_names": ["lon"]},
+    }
+
+    result = validate_projected_layout(metadata)
+    validation = result.to_validation()
+
+    assert result.accepted is False
+    assert validation.adapter_name == "geographic-lat-lon"
+    assert validation.accepted_dimensions == ["lat/lon", "time/lat/lon"]
+    assert validation.issues[0].code == "unsupported_dimension_order"
+    assert "project-specific lat/lon adapter" in validation.issues[0].remediation
+
+
+def test_layout_adapter_registry_accepts_project_specific_extension() -> None:
+    class SceneAdapter:
+        contract = LayoutAdapterContract(
+            name="project-scene-yx",
+            priority=200,
+            accepted_dimensions=("scene/y/x",),
+            required_metadata=("scene coordinate array", "x coordinate array", "y coordinate array"),
+            crs_transform_conventions=("project-specific CRS",),
+            tile_capabilities=("dynamic_tiles",),
+            readback_capabilities=("bbox",),
+        )
+
+        def validate(self, metadata: dict[str, dict]) -> LayoutAdapterResult | None:
+            node = metadata.get("scene_cube")
+            if node is None:
+                return None
+            if node.get("dimension_names") != ["scene", "y", "x"]:
+                return None
+            return LayoutAdapterResult(
+                contract=self.contract,
+                accepted=True,
+                data_array_name="scene_cube",
+                variable_array_names={"scene_cube": "scene_cube"},
+                matched_dimensions=("scene", "y", "x"),
+            )
+
+    registry = LayoutAdapterRegistry([SceneAdapter()])
+    result = validate_projected_layout(
+        {
+            "scene_cube": {
+                "shape": [3, 128, 256],
+                "dimension_names": ["scene", "y", "x"],
+            }
+        },
+        registry=registry,
+    )
+
+    assert result.accepted is True
+    assert result.to_validation().adapter_name == "project-scene-yx"
+
+
+def test_build_catalog_index_records_unsupported_layout_diagnostics(monkeypatch) -> None:
+    class Store:
+        path = "cubes/ambiguous.zarr"
+        zarr_format = 3
+        consolidated = True
+
+    class Connector:
+        def list_zarr_stores(self, *, prefix: str, limit: int) -> list[Store]:
+            assert prefix == "cubes"
+            assert limit == 10000
+            return [Store()]
+
+    monkeypatch.setattr(
+        "app.core.dataset_catalog._read_dataset_metadata",
+        lambda **_kwargs: (
+            {"zarr_format": 3},
+            {
+                "value": {
+                    "shape": [128, 256],
+                    "dimension_names": ["row", "column"],
+                }
+            },
+        ),
+    )
+
+    diagnostics: list[dict[str, object]] = []
+    catalog = build_catalog_index(
+        settings=SimpleNamespace(oci_prefix="cubes", oci_zarr_path=""),
+        connector=Connector(),  # type: ignore[arg-type]
+        diagnostics=diagnostics,
+    )
+
+    assert catalog == {}
+    assert diagnostics[0]["store_path"] == "cubes/ambiguous.zarr"
+    assert diagnostics[0]["status"] == "unsupported"
+    assert diagnostics[0]["adapter_name"] == "unsupported-ambiguous-dimensions"
+    issues = diagnostics[0]["issues"]
+    assert isinstance(issues, list)
+    assert issues[0]["code"] == "unsupported_dimension_order"
 
 
 class _StubConnector:

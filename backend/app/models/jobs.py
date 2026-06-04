@@ -26,6 +26,7 @@ class BrowseGenerationJobRecord(BaseModel):
     job_id: str
     job_type: Literal["browse_generation"] = "browse_generation"
     dataset_id: str
+    request_fingerprint: str
     status: JobStatus
     created_at: datetime
     started_at: datetime | None = None

@@ -15,7 +15,8 @@ frontend/
 │   ├── components/
 │   │   ├── DeckRasterOverlay.tsx
 │   │   ├── MapView.tsx
-│   │   └── Sidebar.tsx
+│   │   ├── Sidebar.tsx
+│   │   └── TileDebugOverlay.tsx
 │   ├── api/
 │   │   └── endpoints.ts
 │   ├── hooks/
@@ -24,10 +25,13 @@ frontend/
 │   │   ├── useDatasetInvalidation.ts
 │   │   ├── useDatasets.ts
 │   │   ├── useDebouncedValue.ts
+│   │   ├── useShareableUrlState.ts
 │   │   └── useTilePrefetch.ts
 │   ├── lib/
+│   │   ├── displayRange.ts
 │   │   ├── gpuRaster.ts
-│   │   └── multiscale.ts
+│   │   ├── multiscale.ts
+│   │   └── temporal.ts
 │   ├── store/
 │   │   └── mapStore.ts
 │   ├── styles.css
@@ -48,12 +52,21 @@ current MapLibre raster fallback.
 `src/App.tsx` loads datasets and variables through TanStack Query, selects the
 first available dataset/variable, and syncs default display range/colormap from
 the selected variable metadata. It also subscribes to `/ws/datasets` and shows a
-compact dataset-sync status chip over the map.
+compact dataset-sync status chip over the map. `useShareableUrlState` hydrates
+valid deep-link parameters before normal defaults win, keeps the URL synchronized
+with the active view through `history.replaceState`, and reports stale shared
+parameters as non-blocking sidebar warnings. API failures caused by expired or
+unavailable OCI auth surface as a compact, dismissible storage-session issue so
+operators do not have to infer the problem from blank map state alone.
 
 `src/components/Sidebar.tsx` exposes dataset, render mode, variable/composite,
-time, colormap, and range controls. Composite mode is shown only when the
-selected dataset advertises `composite_styles`; colormap/range controls continue
-to apply to single-band rendering.
+time, playback, colormap, and display-range controls. Display-range edits stay
+in local draft state until the user applies a valid `min < max` pair, resets to
+auto, or chooses a metadata/viewport percentile preset. It can also narrow the dataset dropdown to
+records intersecting the current MapLibre viewport by calling
+`GET /api/datasets?bbox=...`. Composite mode is shown only when the selected
+dataset advertises `composite_styles`; scalar colormap/range controls are
+disabled in composite mode because RGB composites use their band stretches.
 
 `src/components/MapView.tsx`:
 
@@ -66,9 +79,18 @@ to apply to single-band rendering.
   sidecars;
 - falls back to browser-native or server-rendered tiles when GPU rendering is
   not ready, unsupported, too large, or fails;
+- publishes debounced viewport bounds for browser-native reads and optional
+  dataset-list filtering;
 - debounces viewport-driven prefetch work so it does not run on every move
   frame;
 - shows guards when the current zoom is below the data/detail zoom;
+- renders a single-band colorbar legend from `/api/colormaps/{name}/palette`
+  with the active display min/max labels;
+- samples sanitized tile response headers through the existing prefetch path and
+  shows compact tile issue banners for budget, auth/session, repeated failure,
+  browser-GPU fallback, and missing optimized-artifact states;
+- renders an opt-in `?debug=1` diagnostics overlay with recent server tile
+  samples and browser-native/GPU fallback status;
 - tracks tile loading through MapLibre `dataloading`, `idle`, and `error`
   events.
 
@@ -81,9 +103,31 @@ to apply to single-band rendering.
 - render mode, either `band` or `composite`;
 - active composite style id;
 - time index;
+- temporal playback state, speed, and loop preference;
 - colormap;
 - vmin/vmax;
+- display range mode, either `auto`, `seeded`, or `manual`;
 - current map view state.
+- whether the first map camera was restored from a shared URL.
+
+The frontend distinguishes manual display ranges from tile-header seeded ranges.
+`setRangeFromTileHeaders` can populate a seeded range only while the range mode
+is not manual. Resetting the sidebar range returns to auto mode and removes
+explicit `vmin`/`vmax` from TileJSON/tile URL construction until a later seed or
+manual apply.
+
+Temporal controls use dataset `time_values` as timestamp labels when available.
+The user can scrub, step backward/forward, play/pause, choose a conservative
+speed, and toggle loop behavior. Playback is disabled when only one time step is
+available or when an OCI dataset is renderable only through direct dynamic
+tiles; manual scrubbing remains available so users can inspect a specific step.
+
+Share URLs preserve dataset, variable or composite style, render mode, time
+index, colormap, display range, and map camera (`lon`, `lat`, `zoom`, `pitch`,
+and `bearing`). The copy command builds a clean same-origin URL and omits
+private `api_key` query values by default. Set `VITE_SHARE_API_KEY_IN_URL=true`
+only for environments that explicitly want the frontend API key embedded in
+shared URLs.
 
 Dataset metadata types include optional `native_resolution_m`, `crs_wkt`, and
 `crs_authority` fields. The current UI does not render CRS details directly, but
@@ -110,9 +154,41 @@ serving-profile, and TileJSON query roots in TanStack Query.
 - `/api/datasets/{dataset_id}/serving-profile`
 - `/api/tilejson/{dataset_id}/{variable}`
 - `/api/tiles/{dataset_id}/{variable}/{z}/{x}/{y}`
+- `/api/query/point`
+- `/api/query/bbox`
+- `/api/query/range`
 - `/api/colormaps`
 - `/api/colormaps/{name}/palette`
 - `/ws/datasets`
+
+`GET /api/query/range` is requested only on explicit user action from the range
+panel. With the current viewport bbox it samples a bounded source window and
+returns min/max, p02/p98, and histogram counts; without a bbox it can return
+metadata-level stats. The sidebar applies sampled p02/p98 only after the request
+completes successfully.
+
+The sidebar tile preview labels rendered WebP tiles as visual map products and
+points scientific inspection/export workflows at the source readback APIs. This
+keeps the UI from implying that tile pixels are exact source values.
+
+## Tile error and debug UI
+
+`src/hooks/useTilePrefetch.ts` reports sanitized tile diagnostics while it warms
+nearby URLs. The records include HTTP status, XYZ indices, cache status,
+representation, execution path, timing headers, object-read counts, byte-range
+counts, chunk counts, and direct-budget headers. Query strings, API keys, OCI
+object paths, and credentials are not stored or rendered by the frontend debug
+surface.
+
+`MapView` combines those sampled server-tile diagnostics with MapLibre errors
+and browser-GPU failure state. Normal users see at most one compact,
+dismissible banner when a likely actionable issue occurs: direct tile compute
+budget exceeded, storage auth/session failure, repeated tile failures,
+browser-GPU fallback, or missing browse/multiscale artifacts that force server
+tiles. Developers can append `?debug=1` to show the map overlay with recent
+tile samples plus browser-native and browser-GPU status. The overlay remains
+hidden by default and is preserved when the shareable URL sync rewrites map
+state.
 
 ## Browser-native multiscale status
 
@@ -227,10 +303,18 @@ changes. Prefetch uses a bounded queue: `32` queued tiles and `3` in-flight
 requests by default, reduced to `8` queued tiles and `1` in-flight request for
 save-data, 2G/slow-2G, or low-memory devices.
 
+While temporal playback is active, the hook may also prefetch the next time
+step with a reduced radius-1 queue and one in-flight request. That adjacent-time
+prefetch is enabled only for synthetic data, browser multiscale/GPU-ready
+datasets, or browse-covered OCI datasets. Direct-only OCI serving does not
+start playback-driven speculative tile work.
+
 The first center-tile response seeds `vmin`/`vmax` from `X-Data-Vmin` and
-`X-Data-Vmax` when no explicit range is already set. MapLibre still owns visible
+`X-Data-Vmax` when no manual range is already set. MapLibre still owns visible
 tile loading; the prefetch hook only warms nearby URLs after the viewport
-settles and never blocks visible raster requests.
+settles and never blocks visible raster requests. Manual text edits do not
+change TileJSON or tile URLs until Apply, Reset auto, or a range preset commits
+state.
 
 ## Vite proxy
 

@@ -988,7 +988,7 @@ def decode_direct_tile_budget_detail(body: bytes) -> dict[str, Any] | None:
 
 
 def timed_json_record(result: TimedHttpResult, name: str) -> dict[str, Any]:
-    return {
+    record = {
         "name": name,
         "url": result.url,
         "elapsed_ms": round(result.elapsed_ms, 3),
@@ -996,6 +996,16 @@ def timed_json_record(result: TimedHttpResult, name: str) -> dict[str, Any]:
         "content_type": result.response.headers.get("content-type"),
         "body_bytes": len(result.response.body),
     }
+    manifest_source = result.response.headers.get("x-dataset-manifest-source")
+    manifest_status = result.response.headers.get("x-dataset-manifest-status")
+    manifest_generated_at = result.response.headers.get("x-dataset-manifest-generated-at")
+    if manifest_source is not None:
+        record["dataset_manifest_source"] = manifest_source
+    if manifest_status is not None:
+        record["dataset_manifest_status"] = manifest_status
+    if manifest_generated_at is not None:
+        record["dataset_manifest_generated_at"] = manifest_generated_at
+    return record
 
 
 def header_value(result: TimedHttpResult, name: str) -> str | None:

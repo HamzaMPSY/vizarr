@@ -4,6 +4,7 @@ from typing import Iterable
 
 from app.models.dataset import DatasetBounds
 from app.models.plans import Representation
+from app.index.spatial_index import bounds_intersect_bbox
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,7 @@ class PlannerIndex:
                 continue
             if style is not None and record.representation == "browse" and record.style is not None and record.style != style:
                 continue
-            if bbox is not None and record.bbox_wgs84 is not None and not _bboxes_intersect(record.bbox_wgs84, bbox):
+            if bbox is not None and record.bbox_wgs84 is not None and not bounds_intersect_bbox(record.bbox_wgs84, bbox):
                 continue
             if start is not None and end is not None and record.time_start and record.time_end:
                 if record.time_end < start or record.time_start > end:
@@ -63,13 +64,3 @@ class PlannerIndex:
             matches.append(record)
 
         return matches
-
-
-def _bboxes_intersect(bounds: DatasetBounds, bbox: tuple[float, float, float, float]) -> bool:
-    west, south, east, north = bbox
-    return not (
-        east < bounds.west
-        or west > bounds.east
-        or north < bounds.south
-        or south > bounds.north
-    )
